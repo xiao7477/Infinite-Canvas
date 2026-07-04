@@ -260,3 +260,111 @@ GET  /api/codex-agent/file/view?path=...   静态文件服务（暴露 Codex 生
 **当前正在做：阶段 1（最小可运行版）**
 
 等用户 fork 完 GitHub 仓库 → 配置 git remote → 推送到自己的 fork
+
+---
+
+## 8. 实际进展（2026-07-04 ~ 2026-07-05）
+
+### 8.1 已完成阶段
+
+| 阶段 | commit | 内容 | 验证 |
+|---|---|---|---|
+| 1 | `60bc1dd` | 3 个状态端点（status / sessions/list / file/view） | ✅ curl 200 |
+| 2 | `e9254ef` | CodexAppServerSession 完整实现（spawn / JSON-RPC / SSE） + board/open + turn + close | ✅ GPT-5.5 流式回显 |
+| 3.1 | `3f5f7d4` | 侧栏 UI 极简版（误装到 gpt-chat.html） | ❌ |
+| 3.2 | `160c51a` | 移回 canvas.html + smart-canvas.html | ✅ |
+| 3.3 | `05e2555` | UI 修复（主题色 + 按钮缩小 + 侧栏下移）+ 历史回放 | ✅ |
+| 3.4 | `88cffb9` | 附件功能（画布节点读取 + URL 粘入 + base64 data URL 转换） | ✅ GPT-5.5 看到 logo.png 描述 "Minimal white dot" |
+| 3.5 | `fffa337` | 选项目自动 replay 最新历史 | ✅ |
+| 3.6 | `a717dce` | 深色模式显式样式（不依赖 CSS 变量继承） | ✅ |
+| 3.7 | `6794d86` | alert 改 inline 提示 | ✅ |
+
+**8 个 commit，全部已推送到** `git@github.com:xiao7477/Infinite-Canvas.git` **的** `feature/codex-agent` **分支**。
+
+### 8.2 当前可用的能力
+
+- ✅ 选项目（自动接上次对话）
+- ✅ 跟 Codex 流式聊天（thinking / agentMessage / tool / image 块渲染）
+- ✅ 选画布图节点 / 粘 URL → Codex 看图（base64 data URL）
+- ✅ 切历史会话（从 `~/.codex/sessions/` 读 jsonl 回放）
+- ✅ 白天/黑夜主题（侧栏正确跟随）
+- ✅ 新对话 / 关闭 session
+
+### 8.3 关键技术发现
+
+**Codex app-server 协议**（实测 codex 0.142.5）：
+
+1. **image item 用 `url` 字段，不是 `path`**
+   ```json
+   {"type": "image", "url": "..."}  // ✅
+   {"type": "image", "path": "..."}  // ❌ 报错 missing field url
+   ```
+
+2. **url 必须是 inline base64 data URL，**不**接受 `file://` 或 HTTP URL**
+   ```
+   ❌ file:///path/to/img.png      → "Invalid 'image_url'"
+   ❌ http://127.0.0.1:3000/...    → "remote image URLs are not supported; use an inline data URL instead"
+   ✅ data:image/png;base64,iVBORw...  → 成功
+   ```
+
+3. **后端 helper**：`_to_inline_data_url(url, client)` 自动把 `file://` / 本地路径 / HTTP URL 转 base64 data URL
+
+4. **Codex 桌面客户端把 thinking 也当 `agent_message` 发出**（不是单独的 reasoning 事件）—— 切历史时会看到"我会用一下...技能"这种声明
+
+### 8.4 关键设计决策
+
+| 决策 | 选择 | 理由 |
+|---|---|---|
+| 会话存档 | **不发明，用 Codex 自己的** `~/.codex/sessions/` | 用户偏好"和工具本身一致"；保证 Codex 软件和画布的聊天连续 |
+| Codex 进程 | **每个项目一个 `codex app-server` 子进程** | 会话独立；切项目 = 换进程 |
+| UI 接入 | **追加新文件 + 改 2 个画布 html 末尾** | 不动 canvas.js / smart-canvas.js；原作者更新冲突接近 0 |
+| 深色模式 | **显式 `body.theme-dark` 覆盖** | 之前用 `var(--card, #fff)` fallback，深色下白底漏出 |
+| 画布联动 | **从 DOM 读 `.node.selected` 里 `<img>`** | 不动画布代码；用 `getAttribute('data-id')` 反查 |
+
+### 8.5 当前文件清单（实际）
+
+| 文件 | 行数 | 状态 |
+|---|---|---|
+| `main.py` | 16255 → 16897 (+642) | 末尾追加 codex-agent 模块 |
+| `static/canvas.html` | 356 → 359 (+3) | 末尾加 `<link>` + `<script>` |
+| `static/smart-canvas.html` | 442 → 445 (+3) | 同上 |
+| `static/css/codex-agent-panel.css` | 391（新建） | 完整样式 + dark 显式覆盖 |
+| `static/js/codex-agent-panel.js` | 651（新建） | 完整 IIFE |
+| `docs/agent-mode-design.md` | 261 → ~400（本文档） | 规划 + 实际进展 |
+
+**未动**：canvas.js (14552) / smart-canvas.js (16797) / gpt-chat.html (1658) / 其他 12 个 .html / data/ / requirements.txt
+
+### 8.6 跟原作者更新的兼容性
+
+| 改动 | 冲突概率 |
+|---|---|
+| main.py 末尾追加 642 行 | 极低 |
+| canvas.html / smart-canvas.html 末尾 +3 行 | 极低 |
+| 新建 2 个独立文件 | 0 |
+| 改 docs/agent-mode-design.md | 低 |
+
+预计 merge upstream 平均每月 1-2 次，冲突处理 < 5 分钟。
+
+### 8.7 下一步可推
+
+1. **A. 让 Codex 在项目目录生图**
+   - 后端 turn 端点已支持 image block 渲染
+   - 需要测 `$imagegen` skill 触发 + 解析 imageGeneration item
+   - 然后调用 main.py 现有 addImageNode API 把图加到画布
+
+2. **B. 技能列表**
+   - 读 `~/.codex/skills/.system/` + `<project>/.agents/skills/`
+   - 加 `/api/codex-agent/skills/list` 端点
+   - 前端 Composer 加"⚡ 技能"按钮
+
+3. **C. 演示 merge upstream 流程**
+   - `git fetch upstream && git merge upstream/main`
+   - 验证冲突少 + 容易解决
+
+4. **D. 拖拽调整侧栏宽度**（UX 改进）
+
+### 8.8 已知限制
+
+- Codex image 必须 inline base64（最大文件大小受 OpenAI API 限制，~20MB）
+- Codex 桌面客户端把 thinking 当 agentMessage 发出，前端区分困难
+- 画布联动只能读选中节点（不能调 addImageNode 添加节点，因为 canvas.js 没暴露全局 API）
