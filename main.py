@@ -16585,6 +16585,92 @@ async def codex_agent_turn(payload: CodexAgentTurnRequest):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+@app.get("/api/codex-agent/threads/replay")
+async def codex_agent_threads_replay(session_id: str = ""):
+    """
+    从 ~/.codex/sessions/ 读历史 jsonl，回放为消息列表（用于切换历史会话时显示）。
+    session_id 可以是：
+      - 完整 UUID（最常见）
+      - 部分字符串（会做包含匹配）
+    返回：{ messages: [{role, blocks: [...]}, ...], session_id, rollout_path }
+    """
+    if not session_id:
+        raise HTTPException(status_code=400, detail="缺少 session_id")
+
+    sd = CODEX_AGENT_HOME / "sessions"
+    if not sd.exists():
+        return {"messages": [], "session_id": session_id, "rollout_path": ""}
+
+    # 找匹配的文件
+    target = None
+    needle = session_id.strip()
+    for path in sd.rglob("*.jsonl"):
+        if needle in path.stem:
+            target = path
+            break
+
+    if not target:
+        return {"messages": [], "session_id": session_id, "rollout_path": "",
+                "note": "no matching rollout file found"}
+
+    messages: List[Dict[str, Any]] = []
+    current_bot: Optional[Dict[str, Any]] = None
+    session_meta_id = ""
+
+    try:
+        with open(target, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                ptype = str(obj.get("type", ""))
+                payload = obj.get("payload", {}) or {}
+
+                if ptype == "session_meta":
+                    session_meta_id = str(payload.get("session_id", ""))
+
+                elif ptype == "response_item":
+                    rp = payload.get("payload", payload)  # 兼容嵌套
+                    role = str(rp.get("role", ""))
+                    content = rp.get("content", [])
+                    if role == "user" and isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") == "input_text":
+                                txt = str(c.get("text", ""))
+                                if txt and "<environment_context>" not in txt and "<app-context>" not in txt and "<permissions instructions>" not in txt and "<collaboration_mode>" not in txt and "<skills_instructions>" not in txt and "<plugins_instructions>" not in txt:
+                                    messages.append({"role": "user", "blocks": [{"type": "text", "text": txt}]})
+                                    current_bot = None
+                                    break
+                    # 注意：assistant role 的 response_item 里也有 output_text，
+                    # 但我们改用 event_msg.agent_message 解析（更精确），避免重复。
+
+                elif ptype == "event_msg":
+                    etype = str(payload.get("type", ""))
+                    if etype == "agent_message":
+                        if current_bot is None:
+                            current_bot = {"role": "bot", "blocks": []}
+                            messages.append(current_bot)
+                        txt = str(payload.get("message") or payload.get("text") or "")
+                        if txt:
+                            current_bot["blocks"].append({"type": "text", "text": txt})
+                    elif etype in ("agent_reasoning", "agent_reasoning_section_break"):
+                        if current_bot is None:
+                            current_bot = {"role": "bot", "blocks": []}
+                            messages.append(current_bot)
+                        txt = str(payload.get("text") or "")
+                        if txt:
+                            current_bot["blocks"].append({"type": "thinking", "text": txt})
+    except Exception as e:
+        return {"messages": messages, "session_id": session_meta_id,
+                "rollout_path": str(target), "error": str(e)}
+
+    return {"messages": messages, "session_id": session_meta_id, "rollout_path": str(target)}
+
+
 def _codex_cli_resolve() -> Dict[str, Any]:
     """检测 codex CLI 是否安装 + 版本。"""
     info: Dict[str, Any] = {"found": False, "path": "", "version": ""}
