@@ -16266,7 +16266,12 @@ CODEX_AGENT_HOME = _Path(os.environ.get("CODEX_HOME") or (_Path.home() / ".codex
 class CodexAppServerSession:
     """
     单个项目目录对应一个 codex app-server 子进程（JSON-RPC over stdio）。
-    阶段 1：搭骨架，start/send_message 留 TODO。
+    阶段 2：完整实现。
+    协议（参考 cameo codex.rs）：
+      - initialize → initialized
+      - thread/start 或 thread/resume
+      - turn/start { threadId, input: [{type,text/path}] }
+      - 事件流：item/started, item/updated, item/completed, turn/completed
     """
 
     def __init__(self, project_dir: str):
@@ -16274,13 +16279,68 @@ class CodexAppServerSession:
         self.proc = None  # type: ignore
         self.thread_id: Optional[str] = None
         self._reader_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
+        self._next_id = 1
+        self._pending: Dict[int, asyncio.Future] = {}
+        self._event_queues: List[asyncio.Queue] = []
+        self._lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
 
-    async def start(self) -> str:
-        """启动 codex app-server 子进程，cwd = project_dir。返回 threadId。"""
-        raise HTTPException(status_code=501, detail="codex app-server 启动逻辑在阶段 2 实现")
+    async def start(self, thread_id: Optional[str] = None) -> str:
+        """启动 codex app-server + 握手 + 创建/恢复 thread。返回 threadId。"""
+        async with self._lock:
+            if self.proc is not None and self.proc.returncode is None:
+                return self.thread_id or ""
+
+            cli = shutil.which("codex") or "/opt/homebrew/bin/codex"
+            env = {**os.environ, "PWD": self.project_dir}
+
+            self.proc = await asyncio.create_subprocess_exec(
+                cli, "app-server",
+                cwd=self.project_dir,
+                env=env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            self._reader_task = asyncio.create_task(self._reader_loop())
+            self._stderr_task = asyncio.create_task(self._stderr_drain())
+
+            # initialize
+            await self._request("initialize", {
+                "clientInfo": {
+                    "name": "Infinite-Canvas",
+                    "title": None,
+                    "version": "0.1.0",
+                },
+                "capabilities": None,
+            }, timeout=15)
+
+            # initialized 通知
+            await self._notify("initialized", {})
+
+            # thread/start 或 thread/resume
+            if thread_id:
+                resp = await self._request("thread/resume", {
+                    "threadId": thread_id,
+                    "model": None,
+                }, timeout=30)
+            else:
+                resp = await self._request("thread/start", {
+                    "cwd": self.project_dir,
+                    "model": None,
+                }, timeout=30)
+
+            self.thread_id = (
+                resp.get("thread", {}).get("id")
+                or resp.get("id")
+                or thread_id
+                or ""
+            )
+            return self.thread_id
 
     async def stop(self):
-        """关闭子进程。"""
         if self.proc and self.proc.returncode is None:
             try:
                 self.proc.terminate()
@@ -16291,15 +16351,238 @@ class CodexAppServerSession:
                 except Exception:
                     pass
             self.proc = None
+        for task in (self._reader_task, self._stderr_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
-    async def send_user_message(self, text: str, image_paths=None, on_event=None):
-        """发 user message 到当前 thread；on_event 是流式回调。"""
-        raise HTTPException(status_code=501, detail="send_user_message 在阶段 2 实现")
+    async def send_user_message(self, text: str, image_paths=None, timeout: int = 300):
+        """
+        发 user message 到 thread，async generator 每个事件一次。
+        事件格式：{"method": "item/started", "params": {...}}
+        终止事件：{"method": "turn/completed" | "fatal" | "error", ...}
+        """
+        user_content = [{"type": "text", "text": text}]
+        for p in (image_paths or []):
+            user_content.append({"type": "image", "path": p})
+
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self._event_queues.append(queue)
+        try:
+            await self._request("turn/start", {
+                "threadId": self.thread_id,
+                "input": user_content,
+            }, timeout=30)
+
+            while True:
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    yield {"method": "turn/timeout", "params": {}}
+                    break
+
+                method = msg.get("method", "")
+                if method in ("turn/completed", "fatal", "error"):
+                    yield msg
+                    break
+                yield msg
+        finally:
+            try:
+                self._event_queues.remove(queue)
+            except ValueError:
+                pass
+
+    async def _request(self, method: str, params: dict, timeout: int = 30) -> dict:
+        async with self._write_lock:
+            mid = self._next_id
+            self._next_id += 1
+            fut: asyncio.Future = asyncio.get_event_loop().create_future()
+            self._pending[mid] = fut
+
+            msg = {"jsonrpc": "2.0", "id": mid, "method": method, "params": params}
+            line = (json.dumps(msg) + "\n").encode("utf-8")
+            self.proc.stdin.write(line)
+            await self.proc.stdin.drain()
+
+        try:
+            resp = await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(mid, None)
+            raise HTTPException(status_code=504, detail=f"Codex request timeout: {method}")
+
+        if "error" in resp:
+            err = resp["error"]
+            if isinstance(err, dict):
+                msg_text = err.get("message") or json.dumps(err, ensure_ascii=False)
+            else:
+                msg_text = str(err)
+            raise HTTPException(status_code=502, detail=f"Codex error [{method}]: {msg_text}")
+
+        return resp.get("result", {})
+
+    async def _notify(self, method: str, params: dict):
+        async with self._write_lock:
+            msg = {"jsonrpc": "2.0", "method": method, "params": params}
+            line = (json.dumps(msg) + "\n").encode("utf-8")
+            self.proc.stdin.write(line)
+            await self.proc.stdin.drain()
+
+    async def _reader_loop(self):
+        try:
+            while True:
+                line = await self.proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line.decode("utf-8"))
+                except Exception:
+                    continue
+
+                if "id" in msg:
+                    mid = msg["id"]
+                    fut = self._pending.pop(mid, None)
+                    if fut and not fut.done():
+                        fut.set_result(msg)
+                else:
+                    for q in self._event_queues:
+                        try:
+                            q.put_nowait(msg)
+                        except asyncio.QueueFull:
+                            pass
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            for q in self._event_queues:
+                try:
+                    q.put_nowait({"method": "fatal", "params": {"error": str(e)}})
+                except Exception:
+                    pass
+
+    async def _stderr_drain(self):
+        try:
+            while True:
+                line = await self.proc.stderr.readline()
+                if not line:
+                    break
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 # 项目目录 → session 的运行时映射表
 _codex_agent_sessions: Dict[str, CodexAppServerSession] = {}
 _codex_agent_lock = Lock()
+
+
+# === 阶段 2：Pydantic models + 路由 ===
+
+class CodexAgentBoardOpenRequest(BaseModel):
+    project_dir: str
+    thread_id: Optional[str] = None
+
+
+class CodexAgentBoardCloseRequest(BaseModel):
+    project_dir: str
+
+
+class CodexAgentTurnRequest(BaseModel):
+    project_dir: str
+    text: str
+    attachments: Optional[List[str]] = None  # URL 或本地路径列表
+
+
+@app.post("/api/codex-agent/board/open")
+async def codex_agent_board_open(payload: CodexAgentBoardOpenRequest):
+    """打开（或复用）一个项目目录的 Codex session。"""
+    project_dir = payload.project_dir
+    if not project_dir or not os.path.isdir(project_dir):
+        raise HTTPException(status_code=400, detail=f"项目目录不存在: {project_dir}")
+
+    with _codex_agent_lock:
+        sess = _codex_agent_sessions.get(project_dir)
+        if sess is None:
+            sess = CodexAppServerSession(project_dir)
+            _codex_agent_sessions[project_dir] = sess
+
+    try:
+        thread_id = await sess.start(thread_id=payload.thread_id)
+    except HTTPException:
+        with _codex_agent_lock:
+            _codex_agent_sessions.pop(project_dir, None)
+        raise
+    except Exception as e:
+        with _codex_agent_lock:
+            _codex_agent_sessions.pop(project_dir, None)
+        raise HTTPException(status_code=500, detail=f"启动 Codex session 失败: {e}")
+
+    return {
+        "project_dir": project_dir,
+        "thread_id": thread_id,
+        "is_new": payload.thread_id is None,
+    }
+
+
+@app.post("/api/codex-agent/board/close")
+async def codex_agent_board_close(payload: CodexAgentBoardCloseRequest):
+    """关闭一个项目目录的 Codex session。"""
+    with _codex_agent_lock:
+        sess = _codex_agent_sessions.pop(payload.project_dir, None)
+    if sess:
+        await sess.stop()
+    return {"ok": True}
+
+
+@app.post("/api/codex-agent/turn")
+async def codex_agent_turn(payload: CodexAgentTurnRequest):
+    """
+    发送 user message 到 Codex session，事件流以 SSE 推回。
+    每个 event 是 {"method": "item/started" | "item/updated" | "item/completed" | "turn/completed" | "error", "params": {...}}
+    最终一条：{"method": "done"}
+    """
+    sess = _codex_agent_sessions.get(payload.project_dir)
+    if not sess or not sess.thread_id:
+        raise HTTPException(status_code=400, detail=f"项目 session 未打开: {payload.project_dir}")
+
+    # 处理 attachments：本地路径直接用，HTTP URL 下载到 <project>/.codex-refs/
+    refs: List[str] = []
+    ref_errors: List[str] = []
+    if payload.attachments:
+        refs_dir = _Path(payload.project_dir) / ".codex-refs"
+        refs_dir.mkdir(exist_ok=True)
+        async with httpx.AsyncClient() as client:
+            for url in payload.attachments:
+                try:
+                    if url.startswith("file://"):
+                        refs.append(url[len("file://"):])
+                    elif url.startswith("/"):
+                        refs.append(url)
+                    else:
+                        fn = f"ref-{uuid.uuid4().hex[:8]}.bin"
+                        dest = refs_dir / fn
+                        r = await client.get(url, timeout=30)
+                        r.raise_for_status()
+                        dest.write_bytes(r.content)
+                        refs.append(str(dest))
+                except Exception as e:
+                    ref_errors.append(f"{url}: {e}")
+
+    async def event_stream():
+        for err in ref_errors:
+            data = json.dumps({"method": "error", "params": {"message": f"ref download failed: {err}"}}, ensure_ascii=False)
+            yield f"data: {data}\n\n"
+        try:
+            async for event in sess.send_user_message(payload.text, refs):
+                data = json.dumps(event, ensure_ascii=False)
+                yield f"data: {data}\n\n"
+        except Exception as e:
+            err = {"method": "error", "params": {"message": str(e)}}
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+        finally:
+            yield "data: {\"method\":\"done\"}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 def _codex_cli_resolve() -> Dict[str, Any]:
