@@ -75,7 +75,7 @@
       </div>
       <div class="cm-foot">
         <div class="cm-attach">
-          <button class="cm-attach-btn" id="cm-attach-canvas" title="读取画布里选中的图片节点">📎 画布选中 (0)</button>
+          <button class="cm-attach-btn" id="cm-attach-canvas" title="已点选则加已选；否则加画布里所有图">🎨 画布图 (0)</button>
           <button class="cm-attach-btn" id="cm-attach-url" title="粘贴图 URL 或本地路径">＋ URL</button>
           <span class="cm-attach-list" id="cm-attach-list"></span>
         </div>
@@ -314,14 +314,27 @@
 
   // ---------------- 附件管理 ----------------
   function onAttachFromCanvas() {
-    // 读画布里 .node.selected 节点的 <img src>
+    // 优先读 .node.selected（用户已点选的）；没有就 fallback 到所有 .image-node
+    // 这样不依赖用户必须先点中 — 导进画布的图一键就能用
+    let targets = Array.from(document.querySelectorAll('.node.selected'));
+    let mode = 'selected';
+    if (targets.length === 0) {
+      // fallback：所有 image-node
+      targets = Array.from(document.querySelectorAll('.image-node'));
+      mode = 'all';
+      if (targets.length === 0) {
+        showHint('画布里没图节点（先导图）');
+        return;
+      }
+    }
+
     let count = 0;
-    document.querySelectorAll('.node.selected').forEach(el => {
+    let skippedNoImg = 0;
+    targets.forEach(el => {
       const img = el.querySelector('img');
-      if (!img) return;
-      let src = safeStr(img.src);
+      if (!img) { skippedNoImg++; return; }
+      const src = safeStr(img.src);
       if (!src || src.startsWith('data:')) return;
-      // 相对路径补全成绝对 URL（后端 httpx 需要完整 URL）
       try {
         const abs = new URL(src, window.location.origin).href;
         if (!state.attachments.find(a => a.url === abs)) {
@@ -330,8 +343,13 @@
         }
       } catch {}
     });
+
     if (count === 0) {
-      showHint('画布里没选中图片节点（先点选带 <img> 的节点）');
+      showHint(`找到 ${targets.length} 个节点但都没 <img>（${{selected:'已选', all:'画布所有'}[mode]}）`);
+    } else if (mode === 'all' && skippedNoImg) {
+      showHint(`已加 ${count} 张图（${skippedNoImg} 个非图片节点跳过）`);
+    } else {
+      showHint(`已加 ${count} 张图`);
     }
     renderAttach();
   }
@@ -362,7 +380,7 @@
   function renderAttach() {
     const list = $('#cm-attach-list');
     const btn = $('#cm-attach-canvas');
-    if (btn) btn.textContent = `📎 画布选中 (${state.attachments.length})`;
+    if (btn) btn.textContent = `🎨 画布图 (${state.attachments.length})`;
     if (!list) return;
     list.innerHTML = state.attachments.map((a, i) =>
       `<span class="cm-attach-badge" title="${escapeAttr(a.url)}">${escapeHtml(a.name)}<span class="cm-attach-x" data-i="${i}">×</span></span>`
