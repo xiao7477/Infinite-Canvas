@@ -16246,6 +16246,275 @@ def run_workflow(name: str, payload: WorkflowRunRequest):
     )
     return generate(req)
 
+
+# ============================================================
+# Codex Agent 模块（独立模块，追加在 main.py 末尾，不动现有代码）
+# 设计目标：作为本地 Codex CLI 的前端壳
+# 会话存档 → 读 ~/.codex/sessions/（Codex 自己管）
+# Skills    → 读 ~/.codex/skills/.system/ + <project>/.agents/skills/
+# 生成图   → Codex 直接写到 cwd，画布后端只做事件转发
+# 文档：docs/agent-mode-design.md
+# ============================================================
+
+from pathlib import Path as _Path  # main.py 顶部没用到 pathlib，这里局部 import
+
+
+# Codex home 目录（用环境变量 CODEX_HOME 兜底，默认 ~/.codex）
+CODEX_AGENT_HOME = _Path(os.environ.get("CODEX_HOME") or (_Path.home() / ".codex"))
+
+
+class CodexAppServerSession:
+    """
+    单个项目目录对应一个 codex app-server 子进程（JSON-RPC over stdio）。
+    阶段 1：搭骨架，start/send_message 留 TODO。
+    """
+
+    def __init__(self, project_dir: str):
+        self.project_dir = str(project_dir)
+        self.proc = None  # type: ignore
+        self.thread_id: Optional[str] = None
+        self._reader_task: Optional[asyncio.Task] = None
+
+    async def start(self) -> str:
+        """启动 codex app-server 子进程，cwd = project_dir。返回 threadId。"""
+        raise HTTPException(status_code=501, detail="codex app-server 启动逻辑在阶段 2 实现")
+
+    async def stop(self):
+        """关闭子进程。"""
+        if self.proc and self.proc.returncode is None:
+            try:
+                self.proc.terminate()
+                await asyncio.wait_for(self.proc.wait(), timeout=3)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+
+    async def send_user_message(self, text: str, image_paths=None, on_event=None):
+        """发 user message 到当前 thread；on_event 是流式回调。"""
+        raise HTTPException(status_code=501, detail="send_user_message 在阶段 2 实现")
+
+
+# 项目目录 → session 的运行时映射表
+_codex_agent_sessions: Dict[str, CodexAppServerSession] = {}
+_codex_agent_lock = Lock()
+
+
+def _codex_cli_resolve() -> Dict[str, Any]:
+    """检测 codex CLI 是否安装 + 版本。"""
+    info: Dict[str, Any] = {"found": False, "path": "", "version": ""}
+    cli = shutil.which("codex")
+    if not cli:
+        # 常见 fallback（npm-global / .local/bin）
+        for cand in [
+            str(_Path.home() / ".local/bin/codex"),
+            str(_Path.home() / ".npm-global/bin/codex"),
+            "/usr/local/bin/codex",
+        ]:
+            if os.path.exists(cand) and os.access(cand, os.X_OK):
+                cli = cand
+                break
+    if not cli:
+        return info
+    info["found"] = True
+    info["path"] = cli
+    try:
+        out = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=5)
+        ver_text = (out.stdout or out.stderr or "").strip()
+        info["version"] = ver_text.split("\n")[0] if ver_text else ""
+    except Exception as e:
+        info["version"] = f"(检测失败: {e})"
+    return info
+
+
+@app.get("/api/codex-agent/status")
+async def codex_agent_status():
+    """
+    检测 Codex CLI 状态 + home 目录。
+    返回：
+      {
+        found, path, version,           # CLI 状态
+        home, home_exists,                # Codex home
+        auth_file_exists,                 # 登录态（auth.json）
+        sessions_dir_exists,              # 会话存档目录
+        skills_dir_exists,                # 系统 skills 目录
+        sessions_count_hint,              # ~/.codex/sessions/ 下 jsonl 总数（粗估）
+        active_sessions,                  # 当前激活的 app-server 进程列表
+      }
+    """
+    cli = _codex_cli_resolve()
+    home = CODEX_AGENT_HOME
+    auth_file = home / "auth.json"
+    sessions_dir = home / "sessions"
+    skills_dir = home / "skills"
+    return {
+        **cli,
+        "home": str(home),
+        "home_exists": home.exists(),
+        "auth_file_exists": auth_file.exists(),
+        "sessions_dir_exists": sessions_dir.exists(),
+        "skills_dir_exists": skills_dir.exists(),
+        "sessions_count_hint": _codex_agent_sessions_count_quick(),
+        "active_sessions": list(_codex_agent_sessions.keys()),
+    }
+
+
+def _codex_agent_sessions_count_quick() -> int:
+    """粗估 ~/.codex/sessions/ 下 jsonl 文件总数。"""
+    sd = CODEX_AGENT_HOME / "sessions"
+    if not sd.exists():
+        return 0
+    try:
+        return sum(1 for _ in sd.rglob("*.jsonl"))
+    except Exception:
+        return -1
+
+
+@app.get("/api/codex-agent/sessions/list")
+async def codex_agent_sessions_list(project_dir: str = ""):
+    """
+    扫 ~/.codex/sessions/，按 cwd（项目目录）分组列出所有 session。
+    返回：
+      {
+        by_project: { cwd: [ {session_id, started_at, cwd, model, preview, rollout_path}, ... ] },
+        total: int,
+        home: str,
+      }
+    """
+    sd = CODEX_AGENT_HOME / "sessions"
+    if not sd.exists():
+        return {"by_project": {}, "total": 0, "home": str(sd)}
+
+    by_project: Dict[str, list] = {}
+    total = 0
+
+    try:
+        for path in sd.rglob("*.jsonl"):
+            total += 1
+            try:
+                meta = _codex_session_meta_quick(path)
+            except Exception:
+                continue
+            cwd = meta.get("cwd") or "(unknown)"
+            if project_dir and cwd != project_dir:
+                continue
+            by_project.setdefault(cwd, []).append(meta)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"扫描会话失败: {e}")
+
+    for k in by_project:
+        by_project[k].sort(key=lambda x: x.get("started_at", ""), reverse=True)
+
+    return {"by_project": by_project, "total": total, "home": str(sd)}
+
+
+def _codex_session_meta_quick(path: _Path) -> Dict[str, Any]:
+    """
+    快速读一个 rollout jsonl 提取元数据（cwd / model / preview）。
+    完整解析由阶段 2/3 的 thread/resume 流程处理。
+    """
+    meta: Dict[str, Any] = {
+        "session_id": "",
+        "rollout_path": str(path),
+        "started_at": "",
+        "cwd": "",
+        "model": "",
+        "preview": "",
+    }
+
+    # 文件名格式: rollout-2026-07-04T21-05-37-019f2d3c-...jsonl
+    # 文件名中冒号不能用作时间分隔，所以是横线 "21-05-37"，需要转成冒号 "21:05:37"
+    name = path.stem
+    if name.startswith("rollout-"):
+        iso_part = name[len("rollout-"):]
+        if len(iso_part) >= 19:
+            date_part = iso_part[:10]               # 2026-07-04
+            time_part = iso_part[11:19].replace("-", ":")  # 21-05-37 → 21:05:37
+            meta["started_at"] = f"{date_part} {time_part}Z"
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 50:  # 只扫前 50 行
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                ptype = obj.get("type", "")
+                payload = obj.get("payload", {}) or {}
+
+                if ptype == "session_meta" and not meta["session_id"]:
+                    meta["session_id"] = payload.get("session_id", "")
+
+                if ptype == "turn_context" and not meta["cwd"]:
+                    meta["cwd"] = payload.get("cwd", "")
+                    meta["model"] = payload.get("model", "")
+
+                if ptype == "response_item" and not meta["preview"]:
+                    role = payload.get("role", "")
+                    content = payload.get("content", [])
+                    if role == "user" and isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") == "input_text":
+                                txt = c.get("text", "")
+                                # 跳过 system / 环境上下文
+                                if txt and "<environment_context>" not in txt and "<" not in txt[:5]:
+                                    meta["preview"] = txt[:120]
+                                    break
+    except Exception:
+        pass
+
+    return meta
+
+
+@app.get("/api/codex-agent/file/view")
+async def codex_agent_file_view(path: str):
+    """
+    暴露本地文件给前端（用于显示 Codex 生成的图）。
+    安全防护：
+      1. 路径必须存在且是文件
+      2. 文件大小 ≤ 20MB
+      3. mime 必须在白名单（图片 / 文本 / 视频）
+    """
+    if not path:
+        raise HTTPException(status_code=400, detail="缺少 path 参数")
+
+    try:
+        p = _Path(path).resolve()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"路径非法: {e}")
+
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
+    if not p.is_file():
+        raise HTTPException(status_code=400, detail="不是文件")
+
+    try:
+        size = p.stat().st_size
+    except OSError:
+        raise HTTPException(status_code=400, detail="无法读取文件信息")
+    if size > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="文件过大（>20MB）")
+
+    mime, _ = mimetypes.guess_type(str(p))
+    allowed_prefixes = ("image/", "text/", "video/")
+    if mime and not any(mime.startswith(pfx) for pfx in allowed_prefixes):
+        raise HTTPException(status_code=415, detail=f"不支持的文件类型: {mime}")
+
+    return FileResponse(str(p))
+
+
+# ============================================================
+# Codex Agent 模块结束
+# ============================================================
+
+
 if __name__ == "__main__":
     import uvicorn
     # 关闭服务端协议级 WebSocket ping：部分客户端（如 PS UXP 面板）不会自动回 pong，
