@@ -16367,7 +16367,11 @@ class CodexAppServerSession:
         """
         user_content = [{"type": "text", "text": text}]
         for p in (image_paths or []):
-            user_content.append({"type": "image", "path": p})
+            # Codex app-server 期望 image item 用 `url` 字段（file:// 或 http(s)://）
+            url = p
+            if p.startswith("/"):
+                url = "file://" + p
+            user_content.append({"type": "image", "url": url})
 
         queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._event_queues.append(queue)
@@ -16476,6 +16480,54 @@ _codex_agent_sessions: Dict[str, CodexAppServerSession] = {}
 _codex_agent_lock = Lock()
 
 
+async def _to_inline_data_url(url: str, client: Optional[httpx.AsyncClient] = None) -> str:
+    """
+    把任意形式的"图片源"转成 Codex app-server 期望的 inline data URL：
+    - 已经是 data: URL → 直接返回
+    - file://path 或 本地绝对路径 → 读文件 + base64 + 加 mime 前缀
+    - http(s)://URL → 用 httpx 下载 + base64
+
+    Codex app-server 明确不支持 remote image URL（只接受 data URL）。
+    """
+    if not url:
+        raise ValueError("empty url")
+    if url.startswith("data:"):
+        return url
+
+    if url.startswith("file://"):
+        local = url[len("file://"):]
+    elif url.startswith("/"):
+        local = url
+    elif url.startswith("http://") or url.startswith("https://"):
+        # 下载
+        c = client or httpx.AsyncClient()
+        try:
+            r = await c.get(url, timeout=30, follow_redirects=True)
+            r.raise_for_status()
+            content = r.content
+        finally:
+            if client is None:
+                await c.aclose()
+        mime, _ = mimetypes.guess_type(url)
+        if not mime:
+            mime = "image/png"
+        b64 = base64.b64encode(content).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+    else:
+        raise ValueError(f"unsupported url: {url}")
+
+    # 本地文件
+    if not os.path.isfile(local):
+        raise FileNotFoundError(local)
+    with open(local, "rb") as f:
+        content = f.read()
+    mime, _ = mimetypes.guess_type(local)
+    if not mime:
+        mime = "image/png"
+    b64 = base64.b64encode(content).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
 # === 阶段 2：Pydantic models + 路由 ===
 
 class CodexAgentBoardOpenRequest(BaseModel):
@@ -16545,26 +16597,16 @@ async def codex_agent_turn(payload: CodexAgentTurnRequest):
     if not sess or not sess.thread_id:
         raise HTTPException(status_code=400, detail=f"项目 session 未打开: {payload.project_dir}")
 
-    # 处理 attachments：本地路径直接用，HTTP URL 下载到 <project>/.codex-refs/
+    # 处理 attachments：把所有形式（file:// / 本地路径 / HTTP URL）转成
+    # Codex app-server 期望的 inline data URL（base64），因为 Codex 明确不支持 remote URL。
     refs: List[str] = []
     ref_errors: List[str] = []
     if payload.attachments:
-        refs_dir = _Path(payload.project_dir) / ".codex-refs"
-        refs_dir.mkdir(exist_ok=True)
         async with httpx.AsyncClient() as client:
             for url in payload.attachments:
                 try:
-                    if url.startswith("file://"):
-                        refs.append(url[len("file://"):])
-                    elif url.startswith("/"):
-                        refs.append(url)
-                    else:
-                        fn = f"ref-{uuid.uuid4().hex[:8]}.bin"
-                        dest = refs_dir / fn
-                        r = await client.get(url, timeout=30)
-                        r.raise_for_status()
-                        dest.write_bytes(r.content)
-                        refs.append(str(dest))
+                    data_url = await _to_inline_data_url(url, client)
+                    refs.append(data_url)
                 except Exception as e:
                     ref_errors.append(f"{url}: {e}")
 

@@ -157,6 +157,12 @@
     line-height: 1.5;
     word-wrap: break-word;
 }
+.cm-msg-attach {
+    align-self: flex-end;
+    font-size: 10px;
+    color: var(--faint, #94a3b8);
+    padding: 0 4px 2px 0;
+}
 .cm-msg-bot {
     align-self: flex-start;
     background: var(--soft, #f8fafc);
@@ -229,6 +235,64 @@
     border-top: 1px solid var(--line, #e8edf3);
     background: var(--soft-2, #f1f5f9);
     flex-shrink: 0;
+}
+.cm-attach {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 6px;
+    align-items: center;
+}
+.cm-attach-btn {
+    padding: 3px 8px;
+    background: var(--card, #fff);
+    color: var(--text, #111827);
+    border: 1px solid var(--line, #e8edf3);
+    border-radius: 4px;
+    font-size: 10px;
+    cursor: pointer;
+}
+.cm-attach-btn:hover:not(:disabled) {
+    background: var(--soft, #f8fafc);
+    border-color: var(--muted, #94a3b8);
+}
+.cm-attach-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.cm-attach-list {
+    display: contents;
+}
+.cm-attach-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 4px 2px 8px;
+    background: var(--card, #fff);
+    color: var(--text, #111827);
+    border: 1px solid var(--line, #e8edf3);
+    border-radius: 10px;
+    font-size: 10px;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.cm-attach-x {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    line-height: 14px;
+    text-align: center;
+    border-radius: 50%;
+    background: var(--faint, #94a3b8);
+    color: var(--card, #fff);
+    cursor: pointer;
+    font-size: 9px;
+    flex-shrink: 0;
+}
+.cm-attach-x:hover {
+    background: #ef4444;
 }
 .cm-input {
     width: 100%;

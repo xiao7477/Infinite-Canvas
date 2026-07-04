@@ -22,6 +22,7 @@
     messages: [],         // [{role, blocks: [...]}]
     projects: [],
     sessions: [],
+    attachments: [],      // [{url, name}] 待发给 Codex 的图附件
     projPopOpen: false,
     histPopOpen: false,
   };
@@ -73,6 +74,11 @@
         <div class="cm-empty">选择一个项目文件夹，<br>然后开始和 Codex 对话。</div>
       </div>
       <div class="cm-foot">
+        <div class="cm-attach">
+          <button class="cm-attach-btn" id="cm-attach-canvas" title="读取画布里选中的图片节点">📎 画布选中 (0)</button>
+          <button class="cm-attach-btn" id="cm-attach-url" title="粘贴图 URL 或本地路径">＋ URL</button>
+          <span class="cm-attach-list" id="cm-attach-list"></span>
+        </div>
         <textarea class="cm-input" id="cm-input" placeholder="输入消息，回车发送（Shift+Enter 换行）" disabled></textarea>
         <div class="cm-foot-row">
           <span class="cm-foot-hint" id="cm-hint">未选项目</span>
@@ -88,6 +94,8 @@
     $('#cm-history').addEventListener('click', toggleHistPop);
     $('#cm-send').addEventListener('click', onSend);
     $('#cm-input').addEventListener('keydown', onInputKey);
+    $('#cm-attach-canvas').addEventListener('click', onAttachFromCanvas);
+    $('#cm-attach-url').addEventListener('click', onAttachFromUrl);
     document.addEventListener('click', onDocClick);
   }
 
@@ -293,6 +301,69 @@
     }
   }
 
+  // ---------------- 附件管理 ----------------
+  function onAttachFromCanvas() {
+    // 读画布里 .node.selected 节点的 <img src>
+    let count = 0;
+    document.querySelectorAll('.node.selected').forEach(el => {
+      const img = el.querySelector('img');
+      if (!img) return;
+      let src = safeStr(img.src);
+      if (!src || src.startsWith('data:')) return;
+      // 相对路径补全成绝对 URL（后端 httpx 需要完整 URL）
+      try {
+        const abs = new URL(src, window.location.origin).href;
+        if (!state.attachments.find(a => a.url === abs)) {
+          state.attachments.push({ url: abs, name: shortPath(src) });
+          count++;
+        }
+      } catch {}
+    });
+    if (count === 0) {
+      alert('画布里没选中任何图片节点（选中节点需有 <img>）');
+    }
+    renderAttach();
+  }
+
+  function onAttachFromUrl() {
+    const u = prompt('输入图 URL 或本地绝对路径：');
+    if (!u) return;
+    const url = u.trim();
+    if (!url) return;
+    // 相对路径补全
+    let final = url;
+    if (url.startsWith('/') || (!url.startsWith('http') && !url.startsWith('file://'))) {
+      try { final = new URL(url, window.location.origin).href; } catch {}
+    }
+    if (state.attachments.find(a => a.url === final)) {
+      alert('已附加');
+      return;
+    }
+    state.attachments.push({ url: final, name: shortPath(url) });
+    renderAttach();
+  }
+
+  function removeAttach(idx) {
+    state.attachments.splice(idx, 1);
+    renderAttach();
+  }
+
+  function renderAttach() {
+    const list = $('#cm-attach-list');
+    const btn = $('#cm-attach-canvas');
+    if (btn) btn.textContent = `📎 画布选中 (${state.attachments.length})`;
+    if (!list) return;
+    list.innerHTML = state.attachments.map((a, i) =>
+      `<span class="cm-attach-badge" title="${escapeAttr(a.url)}">${escapeHtml(a.name)}<span class="cm-attach-x" data-i="${i}">×</span></span>`
+    ).join('');
+    list.querySelectorAll('.cm-attach-x').forEach(x => {
+      x.addEventListener('click', e => {
+        e.stopPropagation();
+        removeAttach(parseInt(x.getAttribute('data-i'), 10));
+      });
+    });
+  }
+
   // ---------------- 发消息 → SSE ----------------
   function onInputKey(e) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSend(); }
@@ -303,7 +374,15 @@
     const text = input.value.trim();
     if (!text || !state.projectDir || state.status === 'busy') return;
 
+    // 收集 attachments（深拷贝后清空）
+    const attachUrls = state.attachments.map(a => a.url);
+    state.attachments = [];
+    renderAttach();
+
     state.messages.push({ role: 'user', blocks: [{ type: 'text', text: safeStr(text) }] });
+    if (attachUrls.length) {
+      state.messages[state.messages.length - 1].blocks.push({ type: 'attach', count: attachUrls.length });
+    }
     renderBody();
     input.value = '';
 
@@ -324,7 +403,7 @@
       const r = await fetch('/api/codex-agent/turn', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_dir: state.projectDir, text, attachments: [] }),
+        body: JSON.stringify({ project_dir: state.projectDir, text, attachments: attachUrls }),
       });
       if (!r.ok) {
         const d = await r.json().catch(() => ({}));
@@ -481,7 +560,14 @@
 
   function renderMessage(msg) {
     if (msg.role === 'user') {
-      return `<div class="cm-msg"><div class="cm-msg-user">${escapeHtml(safeStr(msg.blocks[0]?.text))}</div></div>`;
+      const userBlock = msg.blocks.find(b => b.type === 'text');
+      const attachBlock = msg.blocks.find(b => b.type === 'attach');
+      let html = '';
+      if (attachBlock) {
+        html += `<div class="cm-msg-attach">📎 ${escapeHtml(safeStr(attachBlock.count))} 个附件</div>`;
+      }
+      html += `<div class="cm-msg-user">${escapeHtml(safeStr(userBlock?.text))}</div>`;
+      return `<div class="cm-msg">${html}</div>`;
     }
     return `<div class="cm-msg">${msg.blocks.map(renderBlock).join('')}</div>`;
   }
