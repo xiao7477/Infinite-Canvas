@@ -177,6 +177,17 @@
       state.threadId = d.thread_id;
       state.status = 'ready';
       await loadSessions(dir);
+      // 自动接上最近的会话历史（不点历史也能看到）
+      if (state.sessions.length > 0 && state.sessions[0].session_id) {
+        try {
+          const rr = await fetch('/api/codex-agent/threads/replay?session_id=' + encodeURIComponent(state.sessions[0].session_id));
+          if (rr.ok) {
+            const dd = await rr.json();
+            state.messages = dd.messages || [];
+            renderBody();
+          }
+        } catch {}
+      }
     } catch (e) {
       console.error('selectProject failed', e);
       state.status = 'error';
