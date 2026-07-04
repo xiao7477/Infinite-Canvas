@@ -314,20 +314,12 @@
 
   // ---------------- 附件管理 ----------------
   function onAttachFromCanvas() {
-    // 优先读 .node.selected（用户已点选的）；没有就 fallback 到所有 .image-node
-    // 这样不依赖用户必须先点中 — 导进画布的图一键就能用
-    let targets = Array.from(document.querySelectorAll('.node.selected'));
-    let mode = 'selected';
+    // 只读 .node.selected — 依赖画布原生框选/点选工作流
+    const targets = Array.from(document.querySelectorAll('.node.selected'));
     if (targets.length === 0) {
-      // fallback：所有 image-node
-      targets = Array.from(document.querySelectorAll('.image-node'));
-      mode = 'all';
-      if (targets.length === 0) {
-        showHint('画布里没图节点（先导图）');
-        return;
-      }
+      showHint('画布里没选中节点（先在画布里点选/框选）');
+      return;
     }
-
     let count = 0;
     let skippedNoImg = 0;
     targets.forEach(el => {
@@ -338,16 +330,13 @@
       try {
         const abs = new URL(src, window.location.origin).href;
         if (!state.attachments.find(a => a.url === abs)) {
-          state.attachments.push({ url: abs, name: shortPath(src) });
+          state.attachments.push({ url: abs, name: extractName(src) });
           count++;
         }
       } catch {}
     });
-
     if (count === 0) {
-      showHint(`找到 ${targets.length} 个节点但都没 <img>（${{selected:'已选', all:'画布所有'}[mode]}）`);
-    } else if (mode === 'all' && skippedNoImg) {
-      showHint(`已加 ${count} 张图（${skippedNoImg} 个非图片节点跳过）`);
+      showHint(`已选 ${targets.length} 个节点但没 <img>（可能不是图片节点）`);
     } else {
       showHint(`已加 ${count} 张图`);
     }
@@ -380,14 +369,18 @@
   function renderAttach() {
     const list = $('#cm-attach-list');
     const btn = $('#cm-attach-canvas');
-    if (btn) btn.textContent = `🎨 画布图 (${state.attachments.length})`;
+    if (btn) btn.textContent = `🎯 画布已选 (${state.attachments.length})`;
     if (!list) return;
     list.innerHTML = state.attachments.map((a, i) =>
-      `<span class="cm-attach-badge" title="${escapeAttr(a.url)}">${escapeHtml(a.name)}<span class="cm-attach-x" data-i="${i}">×</span></span>`
+      `<div class="cm-attach-thumb" data-i="${i}" title="${escapeAttr(a.name)} · ${escapeAttr(a.url)}">
+        <img src="${escapeAttr(a.url)}" alt="${escapeAttr(a.name)}" loading="lazy">
+        <span class="cm-attach-x" data-i="${i}" title="移除">×</span>
+      </div>`
     ).join('');
     list.querySelectorAll('.cm-attach-x').forEach(x => {
       x.addEventListener('click', e => {
         e.stopPropagation();
+        e.preventDefault();
         removeAttach(parseInt(x.getAttribute('data-i'), 10));
       });
     });
@@ -654,6 +647,19 @@
     if (!p) return '';
     if (p.length <= 32) return p;
     return '…' + p.slice(-30);
+  }
+
+  function extractName(url) {
+    if (!url) return 'image';
+    try {
+      const u = new URL(url, window.location.origin);
+      const p = u.pathname;
+      const last = p.split('/').filter(Boolean).pop() || 'image';
+      // 去掉常见的扩展名前缀（如 ai_ref_xxxxx.png）—— 直接用最后一段
+      return decodeURIComponent(last).slice(0, 40);
+    } catch {
+      return shortPath(url);
+    }
   }
 
   function onDocClick(e) {
