@@ -331,7 +331,7 @@
       } catch {}
     });
     if (count === 0) {
-      alert('画布里没选中任何图片节点（选中节点需有 <img>）');
+      showHint('画布里没选中图片节点（先点选带 <img> 的节点）');
     }
     renderAttach();
   }
@@ -378,6 +378,20 @@
   // ---------------- 发消息 → SSE ----------------
   function onInputKey(e) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSend(); }
+  }
+
+  // 临时提示（不弹窗，用底部 hint 区）
+  let hintTimer = null;
+  function showHint(msg, ms = 4000) {
+    const hint = $('#cm-hint');
+    if (!hint) return;
+    hint.textContent = msg;
+    hint.style.color = '#f59e0b';
+    if (hintTimer) clearTimeout(hintTimer);
+    hintTimer = setTimeout(() => {
+      hint.style.color = '';
+      setStatusUI();
+    }, ms);
   }
 
   async function onSend() {
