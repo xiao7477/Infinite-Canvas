@@ -17065,8 +17065,6 @@ async def _codex_agent_prepare_local_image(ref: Any, project_dir: str, client: O
 
 
 def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]]) -> str:
-    if not refs:
-        return ""
     lines = [
         "<canvas_agent_context>",
         f"project_dir: {project_dir}",
@@ -17074,9 +17072,15 @@ def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]]) 
         "当用户说“这张图/选中的图/这些素材/放到项目目录/重命名/整理”时，优先指这些 ref。",
         "这些素材按用户在输入框附件区的顺序排列：图一/第一张=ref_1，图二/第二张=ref_2，依此类推。",
         "local_path 是本机临时缓存文件，仅用于本轮读取；如果要保存文件，请把 local_path 复制到 project_dir 或用户指定的子目录，不要把缓存目录当作最终目录。",
-        "完成文件操作后，请明确回复保存后的路径。不要声称已经操作画布，除非你生成了图片文件并由前端自动放回画布。",
+        "完成文件操作后，请明确回复保存后的路径。",
+        "如果用户要求你把图片、视频、提示词、文本或循环节点放回画布，请在回复末尾输出一个 fenced 代码块，语言名必须是 canvas_agent_action。",
+        "前端会读取并执行该动作块，然后把动作块从聊天正文里隐藏。不要把动作块当作普通说明。",
+        "动作块 JSON 示例：{\"actions\":[{\"type\":\"add_media\",\"items\":[{\"path\":\"/absolute/path/to/image.png\",\"name\":\"图名\",\"kind\":\"image\"}]},{\"type\":\"add_prompt\",\"items\":[{\"title\":\"Prompt\",\"text\":\"提示词内容\"}]}]}",
+        "支持的 type: add_media/add_image/add_video/add_prompt/add_text/add_loop/add_nodes。media item 可用 path 或 url；本机绝对路径会由前端转成可预览地址。",
         "selected_refs:",
     ]
+    if not refs:
+        lines.append("(none)")
     for index, ref in enumerate(refs, 1):
         ref_id = str(ref.get("refId") or ref.get("ref_id") or f"ref_{index}")
         lines.extend([

@@ -5935,6 +5935,200 @@ function pasteAssetsFromInbox(){
     toast(`已粘贴 ${created.length} 个素材到画布`);
     return true;
 }
+function smartAgentSelectionBounds(){
+    const selected = selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean);
+    if(!selected.length) return null;
+    const rects = selected.map(nodeRect);
+    const left = Math.min(...rects.map(r => r.x));
+    const top = Math.min(...rects.map(r => r.y));
+    const right = Math.max(...rects.map(r => r.x + r.width));
+    const bottom = Math.max(...rects.map(r => r.y + r.height));
+    return {x:left, y:top, width:right - left, height:bottom - top, right, bottom};
+}
+function smartAgentGridPoint(index, total, options={}){
+    const cellX = Number(options.cellX) || 360;
+    const cellY = Number(options.cellY) || 330;
+    const cols = Math.max(1, Number(options.cols) || Math.ceil(Math.sqrt(Math.max(1, total))));
+    const baseRect = smartAgentSelectionBounds();
+    const center = viewportCenter();
+    const baseX = Number.isFinite(Number(options.x))
+        ? Number(options.x)
+        : (baseRect ? baseRect.right + 220 : center.x);
+    const baseY = Number.isFinite(Number(options.y))
+        ? Number(options.y)
+        : (baseRect ? baseRect.y : center.y);
+    const row = Math.floor(index / cols);
+    const col = index % cols;
+    return {x:Math.round(baseX + col * cellX), y:Math.round(baseY + row * cellY)};
+}
+function smartAgentNodeSummary(node){
+    const rect = nodeRect(node);
+    return {
+        id:node.id,
+        type:node.type || 'smart-image',
+        title:node.title || '',
+        x:Math.round(Number(node.x) || 0),
+        y:Math.round(Number(node.y) || 0),
+        width:Math.round(rect.width || 0),
+        height:Math.round(rect.height || 0),
+        text:node.text || '',
+        images:(node.images || []).map((img, index) => ({
+            index,
+            url:img.url || '',
+            name:img.name || '',
+            kind:mediaKindForItem(img)
+        }))
+    };
+}
+function smartAgentMediaItem(item){
+    const source = item || {};
+    const rawUrl = source.url || source.path || source.src || '';
+    const url = String(rawUrl || '').startsWith('/')
+        || String(rawUrl || '').startsWith('http://')
+        || String(rawUrl || '').startsWith('https://')
+        || String(rawUrl || '').startsWith('data:')
+        ? String(rawUrl || '')
+        : `/api/codex-agent/file/view?path=${encodeURIComponent(String(rawUrl || ''))}`;
+    const image = assetNodeImageFromItem({
+        ...source,
+        url,
+        name:source.name || smartImageNameFromUrl(url) || 'asset',
+        kind:source.kind || source.mediaKind || assetMediaKind(source)
+    });
+    if(source.prompt) image.prompt = String(source.prompt || '');
+    return image;
+}
+function installSmartCanvasAgentApi(){
+    window.SmartCanvasAgentApi = {
+        kind:'smart',
+        getContext(){
+            return {
+                canvasId,
+                title:canvas?.title || '',
+                viewport:{...viewport},
+                selectedNodeIds:selectedNodeIds(),
+                selectedImage:{...selectedImage},
+                selectedNodes:selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean).map(smartAgentNodeSummary)
+            };
+        },
+        getSelectedAssets(){
+            const selected = selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean);
+            const refs = [];
+            selected.forEach(node => {
+                (node.images || []).forEach((img, index) => {
+                    if(!img?.url) return;
+                    refs.push({
+                        refId:`ref_${refs.length + 1}`,
+                        url:img.url,
+                        name:img.name || smartImageNameFromUrl(img.url) || `图${refs.length + 1}`,
+                        kind:mediaKindForItem(img),
+                        nodeId:node.id,
+                        imageIndex:index,
+                        nodeTitle:node.title || '',
+                        canvasKind:'smart'
+                    });
+                });
+            });
+            if(selectedImage.nodeId && selectedImage.index >= 0){
+                const node = nodes.find(n => n.id === selectedImage.nodeId);
+                const img = node?.images?.[selectedImage.index];
+                if(img?.url && !refs.some(ref => ref.url === img.url)){
+                    refs.unshift({
+                        refId:'ref_1',
+                        url:img.url,
+                        name:img.name || smartImageNameFromUrl(img.url) || '图1',
+                        kind:mediaKindForItem(img),
+                        nodeId:node.id,
+                        imageIndex:selectedImage.index,
+                        nodeTitle:node.title || '',
+                        canvasKind:'smart'
+                    });
+                }
+            }
+            refs.forEach((ref, index) => { ref.refId = `ref_${index + 1}`; });
+            return refs;
+        },
+        getAllAssets(){
+            const refs = [];
+            nodes.forEach(node => {
+                (node.images || []).forEach((img, index) => {
+                    if(!img?.url) return;
+                    refs.push({
+                        refId:`ref_${refs.length + 1}`,
+                        url:img.url,
+                        name:img.name || smartImageNameFromUrl(img.url) || `图${refs.length + 1}`,
+                        kind:mediaKindForItem(img),
+                        nodeId:node.id,
+                        imageIndex:index,
+                        nodeTitle:node.title || '',
+                        canvasKind:'smart'
+                    });
+                });
+            });
+            return refs;
+        },
+        addMediaNodes(items=[], options={}){
+            const list = (Array.isArray(items) ? items : [items]).filter(item => item && (item.url || item.path || item.src));
+            if(!list.length) return [];
+            pushUndo();
+            const created = [];
+            list.forEach((item, index) => {
+                const point = smartAgentGridPoint(index, list.length, options);
+                const node = createImageNodeAt(point, [smartAgentMediaItem(item)], {skipUndo:true, select:false});
+                if(node) created.push(node);
+            });
+            selectedId = created.length === 1 ? created[0].id : '';
+            selectedIds = created.length > 1 ? created.map(node => node.id) : [];
+            selectedImage = {nodeId:'', index:-1};
+            render();
+            scheduleSave();
+            toast(`已由 Agent 添加 ${created.length} 个素材节点`);
+            return created.map(smartAgentNodeSummary);
+        },
+        addPromptNodes(items=[], options={}){
+            const list = (Array.isArray(items) ? items : [items]).map(item => typeof item === 'string' ? {text:item} : item).filter(item => item && (item.text || item.title));
+            if(!list.length) return [];
+            pushUndo();
+            const created = [];
+            list.forEach((item, index) => {
+                const point = smartAgentGridPoint(index, list.length, {...options, cellX:Number(options.cellX) || 360, cellY:Number(options.cellY) || 280});
+                const node = createPromptNode(point.x, point.y, {skipUndo:true, select:false});
+                node.title = item.title || 'Prompt';
+                node.text = String(item.text || '');
+                created.push(node);
+            });
+            selectedId = created.length === 1 ? created[0].id : '';
+            selectedIds = created.length > 1 ? created.map(node => node.id) : [];
+            selectedImage = {nodeId:'', index:-1};
+            render();
+            scheduleSave();
+            toast(`已由 Agent 添加 ${created.length} 个提示词节点`);
+            return created.map(smartAgentNodeSummary);
+        },
+        addLoopNodes(items=[], options={}){
+            const list = (Array.isArray(items) ? items : [items]).map(item => typeof item === 'string' ? {variablePrompt:item} : item).filter(Boolean);
+            if(!list.length) return [];
+            pushUndo();
+            const created = [];
+            list.forEach((item, index) => {
+                const point = smartAgentGridPoint(index, list.length, {...options, cellX:Number(options.cellX) || 380, cellY:Number(options.cellY) || 230});
+                const node = createLoopNode(point.x, point.y, {skipUndo:true, select:false});
+                if(item.title) node.title = String(item.title);
+                if(item.count) node.count = Math.max(1, Number(item.count) || 1);
+                if(item.variablePrompt) node.variablePrompt = String(item.variablePrompt);
+                created.push(node);
+            });
+            selectedId = created.length === 1 ? created[0].id : '';
+            selectedIds = created.length > 1 ? created.map(node => node.id) : [];
+            selectedImage = {nodeId:'', index:-1};
+            render();
+            scheduleSave();
+            toast(`已由 Agent 添加 ${created.length} 个循环节点`);
+            return created.map(smartAgentNodeSummary);
+        }
+    };
+}
+installSmartCanvasAgentApi();
 function duplicateForAltDrag(node, preserveConnections=false){
     const ids = (isNodeSelected(node.id) ? selectedNodeIds() : [node.id]);
     const sourceNodes = ids.map(id => nodes.find(n => n.id === id)).filter(Boolean);

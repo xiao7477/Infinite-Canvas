@@ -40,6 +40,7 @@
   let currentToolId = null;
   let busyTimer = null;
   const addedImagePaths = new Set();
+  const executedCanvasActionKeys = new Set();
   const panelSizeKey = 'codex-agent-panel-size-v1';
 
   // ---------------- 工具：安全字符串化 ----------------
@@ -425,6 +426,11 @@
 
   // ---------------- 附件管理 ----------------
   function selectedCanvasAssets() {
+    const nativeApi = window.SmartCanvasAgentApi;
+    if (nativeApi && typeof nativeApi.getSelectedAssets === 'function') {
+      const items = nativeApi.getSelectedAssets() || [];
+      if (items.length) return items;
+    }
     const selectors = [
       '.node.selected',
       '.image-node.selected',
@@ -468,6 +474,11 @@
   }
 
   function allCanvasAssets() {
+    const nativeApi = window.SmartCanvasAgentApi;
+    if (nativeApi && typeof nativeApi.getAllAssets === 'function') {
+      const items = nativeApi.getAllAssets() || [];
+      if (items.length) return items;
+    }
     const seen = new Set();
     const items = [];
     const mediaEls = Array.from(document.querySelectorAll('.image-node img,.image-node video,.image-node audio,.node img,.node video,.node audio,.thumb-item img,.image-wrap img,.thumb-item video,.image-wrap video'));
@@ -503,9 +514,11 @@
     getSelectedAssets: selectedCanvasAssets,
     getAllAssets: allCanvasAssets,
     getContext() {
+      const nativeContext = window.SmartCanvasAgentApi?.getContext?.();
       const selectedAssets = selectedCanvasAssets();
       return {
         canvasKind: canvasKind(),
+        native: nativeContext || null,
         selectedAssets,
         selectedCount: selectedAssets.length,
         url: location.href,
@@ -514,6 +527,15 @@
     },
     addImageNodeFromPath(path, prompt = '') {
       return addGeneratedImageToCanvas(path, prompt);
+    },
+    addMediaNodes(items, options = {}) {
+      return addMediaNodesToCanvas(items, options);
+    },
+    addPromptNodes(items, options = {}) {
+      return addPromptNodesToCanvas(items, options);
+    },
+    addLoopNodes(items, options = {}) {
+      return addLoopNodesToCanvas(items, options);
     },
   };
   window.CanvasAgentBridge = CanvasAgentBridge;
@@ -551,6 +573,10 @@
   function addUploadedAssetToCanvas(item) {
     try {
       if (!item || !item.url) return false;
+      if (window.SmartCanvasAgentApi?.addMediaNodes) {
+        const created = window.SmartCanvasAgentApi.addMediaNodes([item], { cols: 1 });
+        return Array.isArray(created) ? created.length > 0 : Boolean(created);
+      }
       if (typeof window.appendImagesToSmartNode === 'function') {
         window.appendImagesToSmartNode([item], '', { forceNew: true });
         return true;
@@ -583,6 +609,62 @@
       console.warn('addUploadedAssetToCanvas failed', e);
     }
     return false;
+  }
+
+  function canvasUrlForPath(pathOrUrl) {
+    const raw = safeStr(pathOrUrl).trim();
+    if (!raw) return '';
+    if (/^(https?:|data:|\/)/i.test(raw)) return raw;
+    return '/api/codex-agent/file/view?path=' + encodeURIComponent(raw);
+  }
+
+  function normalizeCanvasMediaItem(item) {
+    if (!item) return null;
+    const data = typeof item === 'string' ? { url: item } : { ...item };
+    const raw = safeStr(data.url || data.path || data.src).trim();
+    if (!raw) return null;
+    const url = canvasUrlForPath(raw);
+    return {
+      ...data,
+      url,
+      name: data.name || extractName(raw) || extractName(url) || 'asset',
+      kind: data.kind || mediaKindFromUrl(raw, 'image'),
+    };
+  }
+
+  function addMediaNodesToCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items]).map(normalizeCanvasMediaItem).filter(Boolean);
+    if (!list.length) return [];
+    if (window.SmartCanvasAgentApi?.addMediaNodes) {
+      return window.SmartCanvasAgentApi.addMediaNodes(list, options) || [];
+    }
+    const created = [];
+    list.forEach(item => {
+      if (addUploadedAssetToCanvas(item)) created.push(item);
+    });
+    return created;
+  }
+
+  function addPromptNodesToCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items])
+      .map(item => typeof item === 'string' ? { text: item } : item)
+      .filter(item => item && (item.text || item.title));
+    if (!list.length) return [];
+    if (window.SmartCanvasAgentApi?.addPromptNodes) {
+      return window.SmartCanvasAgentApi.addPromptNodes(list, options) || [];
+    }
+    return [];
+  }
+
+  function addLoopNodesToCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items])
+      .map(item => typeof item === 'string' ? { variablePrompt: item } : item)
+      .filter(Boolean);
+    if (!list.length) return [];
+    if (window.SmartCanvasAgentApi?.addLoopNodes) {
+      return window.SmartCanvasAgentApi.addLoopNodes(list, options) || [];
+    }
+    return [];
   }
 
   function normalizeAttachmentRefs() {
@@ -742,12 +824,15 @@
   async function onInputPaste(e) {
     const clipboard = e.clipboardData;
     if (!clipboard) return;
-    const files = Array.from(clipboard.files || []).filter(file => file && file.type && file.type.startsWith('image/'));
+    // Agent 输入框自己接管粘贴，避免事件继续冒泡到画布的全局 paste 逻辑，
+    // 否则图片会被 Agent 和画布各上传/放置一次。
+    e.stopPropagation();
+    const files = uniqueClipboardFiles(Array.from(clipboard.files || []).filter(file => file && file.type && file.type.startsWith('image/')));
     const itemFiles = Array.from(clipboard.items || [])
       .filter(item => item.kind === 'file' && String(item.type || '').startsWith('image/'))
       .map(item => item.getAsFile?.())
       .filter(Boolean);
-    const imageFiles = [...files, ...itemFiles].filter((file, index, arr) => arr.findIndex(f => f.name === file.name && f.size === file.size && f.type === file.type) === index);
+    const imageFiles = files.length ? files : uniqueClipboardFiles(itemFiles);
 
     if (imageFiles.length) {
       e.preventDefault();
@@ -768,6 +853,23 @@
     }
   }
 
+  function uniqueClipboardFiles(files) {
+    const seen = new Set();
+    const out = [];
+    files.forEach(file => {
+      const key = [
+        safeStr(file.name),
+        safeStr(file.type),
+        safeStr(file.size),
+        safeStr(file.lastModified),
+      ].join('|');
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(file);
+    });
+    return out;
+  }
+
   async function uploadPastedImages(files, pasteRange = null) {
     if (!files.length) return;
     setBusy('正在粘贴图片');
@@ -782,14 +884,15 @@
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(safeStr(data.detail) || `HTTP ${r.status}`);
       const uploaded = Array.isArray(data.files) ? data.files : [];
-      uploaded.forEach(item => {
-        const asset = {
+      const assets = uploaded.map(item => ({
           url: item.url,
           name: item.name || extractName(item.url),
           kind: item.kind || 'image',
           canvasKind: canvasKind(),
-        };
-        addUploadedAssetToCanvas(asset);
+      }));
+      if (assets.length === 1) addUploadedAssetToCanvas(assets[0]);
+      else if (assets.length > 1) addMediaNodesToCanvas(assets);
+      assets.forEach(asset => {
         addAttachment(asset);
         const index = state.attachments.findIndex(a => a.url === new URL(asset.url, window.location.origin).href);
         $('#cm-input')?.focus();
@@ -1037,6 +1140,8 @@
         if (blk.type === 'text') {
           blk.text = safeStr(item.text) || blk.text;
           blk.streaming = false;
+          executeCanvasActionsFromText(blk.text, botMsg);
+          blk.text = stripCanvasActionBlocks(blk.text);
         } else if (blk.type === 'image') {
           blk.path = safeStr(item.savedPath) || safeStr(item.path) || blk.path;
           blk.status = 'done';
@@ -1104,6 +1209,81 @@
     return false;
   }
 
+  function extractCanvasActionBlocks(text) {
+    const raw = safeStr(text);
+    const blocks = [];
+    raw.replace(/```(?:canvas_agent_action|canvas-agent-action)\s*([\s\S]*?)```/gi, (_, body) => {
+      blocks.push(body.trim());
+      return '';
+    });
+    raw.replace(/<canvas_agent_action>([\s\S]*?)<\/canvas_agent_action>/gi, (_, body) => {
+      blocks.push(body.trim());
+      return '';
+    });
+    return blocks;
+  }
+
+  function stripCanvasActionBlocks(text) {
+    return safeStr(text)
+      .replace(/```(?:canvas_agent_action|canvas-agent-action)\s*[\s\S]*?```/gi, '')
+      .replace(/<canvas_agent_action>[\s\S]*?<\/canvas_agent_action>/gi, '')
+      .trim();
+  }
+
+  function executeCanvasActionsFromText(text, botMsg) {
+    const blocks = extractCanvasActionBlocks(text);
+    if (!blocks.length) return;
+    let totalCreated = 0;
+    blocks.forEach(raw => {
+      const key = raw;
+      if (executedCanvasActionKeys.has(key)) return;
+      executedCanvasActionKeys.add(key);
+      let payload = null;
+      try { payload = JSON.parse(raw); } catch (e) {
+        botMsg.blocks.push({ type: 'error', text: '画布动作 JSON 解析失败：' + safeStr(e.message || e) });
+        return;
+      }
+      const actions = Array.isArray(payload) ? payload : (Array.isArray(payload.actions) ? payload.actions : [payload]);
+      actions.forEach(action => {
+        const created = executeCanvasAction(action || {});
+        totalCreated += Array.isArray(created) ? created.length : (created ? 1 : 0);
+      });
+    });
+    if (totalCreated > 0) {
+      botMsg.blocks.push({ type: 'tool', text: `已执行画布动作，新增 ${totalCreated} 个节点`, status: 'done' });
+      showHint(`已执行画布动作，新增 ${totalCreated} 个节点`);
+    }
+  }
+
+  function executeCanvasAction(action) {
+    const type = safeStr(action.type || action.action).toLowerCase().replace(/-/g, '_');
+    const options = action.options || {};
+    if (type === 'add_media' || type === 'add_image' || type === 'add_video' || type === 'add_media_nodes') {
+      const items = action.items || action.media || action.images || action.videos || [action];
+      return addMediaNodesToCanvas(items, options);
+    }
+    if (type === 'add_prompt' || type === 'add_text' || type === 'add_prompt_nodes') {
+      const items = action.items || action.prompts || action.texts || [action];
+      return addPromptNodesToCanvas(items, options);
+    }
+    if (type === 'add_loop' || type === 'add_loop_nodes') {
+      const items = action.items || action.loops || [action];
+      return addLoopNodesToCanvas(items, options);
+    }
+    if (type === 'add_nodes') {
+      const nodes = Array.isArray(action.nodes) ? action.nodes : [];
+      const created = [];
+      const media = nodes.filter(node => ['image', 'video', 'media', 'smart-image'].includes(safeStr(node.type).toLowerCase()));
+      const prompts = nodes.filter(node => ['prompt', 'text', 'smart-prompt'].includes(safeStr(node.type).toLowerCase()));
+      const loops = nodes.filter(node => ['loop', 'smart-loop'].includes(safeStr(node.type).toLowerCase()));
+      created.push(...addMediaNodesToCanvas(media, options));
+      created.push(...addPromptNodesToCanvas(prompts, options));
+      created.push(...addLoopNodesToCanvas(loops, options));
+      return created;
+    }
+    return [];
+  }
+
   // ---------------- 渲染 ----------------
   function setStatusUI() {
     const dot = $('#cm-status');
@@ -1129,12 +1309,22 @@
     send.disabled = !enabled;
 
     const hint = $('#cm-hint');
+    hint.classList.toggle('cm-foot-hint-busy', state.status === 'busy');
     if (!state.projectDir) hint.textContent = '未选项目';
     else if (state.status === 'busy') {
       const elapsed = state.busyStartedAt ? formatElapsed(Date.now() - state.busyStartedAt) : '00:00';
-      hint.textContent = `${elapsed} · ${state.busyLabel || '正在思考'}`;
+      hint.innerHTML = renderBusyHint(elapsed, state.busyLabel || '正在思考');
     }
     else hint.textContent = `thread: ${(state.threadId || '').slice(0, 8)}…`;
+  }
+
+  function renderBusyHint(elapsed, label) {
+    return `<span class="cm-busy-pill" aria-label="${escapeAttr(`${elapsed} · ${label}`)}">
+      <span class="cm-busy-pulse" aria-hidden="true"></span>
+      <span class="cm-busy-time">${escapeHtml(elapsed)}</span>
+      <span class="cm-busy-label">${escapeHtml(label)}</span>
+      <span class="cm-busy-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+    </span>`;
   }
 
   function renderBody() {
@@ -1144,6 +1334,7 @@
       return;
     }
     body.innerHTML = state.messages.map(renderMessage).join('');
+    bindCodeCopyButtons(body);
     body.scrollTop = body.scrollHeight;
   }
 
@@ -1217,7 +1408,7 @@
   function renderBlock(b) {
     const type = b.type;
     if (type === 'text') {
-      return `<div class="cm-msg-bot">${escapeHtml(safeStr(b.text))}${b.streaming ? ' ▍' : ''}</div>`;
+      return `<div class="cm-msg-bot cm-md">${renderMarkdown(safeStr(b.text))}${b.streaming ? '<span class="cm-stream-caret"> ▍</span>' : ''}</div>`;
     }
     if (type === 'thinking') {
       const t = safeStr(b.text);
@@ -1247,6 +1438,232 @@
       return `<div class="cm-msg-error">❌ ${escapeHtml(safeStr(b.text))}</div>`;
     }
     return '';
+  }
+
+  function bindCodeCopyButtons(root) {
+    root.querySelectorAll('.cm-code-copy').forEach(btn => {
+      btn.addEventListener('click', async e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const box = btn.closest('.cm-code-block');
+        const code = box?.querySelector('code')?.innerText || '';
+        if (!code) return;
+        copyTextFromButton(btn, code);
+      });
+    });
+    root.querySelectorAll('.cm-code-expand').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const box = btn.closest('.cm-code-block');
+        const code = box?.querySelector('code')?.innerText || '';
+        const label = box?.querySelector('.cm-code-lang')?.innerText || 'code';
+        if (code) openCodeModal(code, label);
+      });
+    });
+  }
+
+  async function copyTextFromButton(btn, text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyButtonState(btn, '已复制');
+    } catch {
+      if (fallbackCopyText(text)) setCopyButtonState(btn, '已复制');
+      else setCopyButtonState(btn, '复制失败');
+    }
+  }
+
+  function setCopyButtonState(btn, text) {
+    const old = btn.textContent;
+    btn.textContent = text;
+    btn.disabled = true;
+    setTimeout(() => {
+      btn.textContent = old || '复制';
+      btn.disabled = false;
+    }, 1200);
+  }
+
+  function fallbackCopyText(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch {
+      ok = false;
+    }
+    ta.remove();
+    return ok;
+  }
+
+  function renderMarkdown(text) {
+    const raw = safeStr(text).replace(/\r\n/g, '\n');
+    if (!raw.trim()) return '';
+
+    const parts = [];
+    const re = /```([^\n`]*)\n?([\s\S]*?)```/g;
+    let last = 0;
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+      if (m.index > last) parts.push(renderMarkdownText(raw.slice(last, m.index)));
+      parts.push(renderCodeBlock(m[2] || '', m[1] || ''));
+      last = re.lastIndex;
+    }
+    if (last < raw.length) parts.push(renderMarkdownText(raw.slice(last)));
+    return parts.join('');
+  }
+
+  function renderCodeBlock(code, lang) {
+    const label = safeStr(lang).trim().split(/\s+/)[0] || 'code';
+    return `<div class="cm-code-block">
+      <div class="cm-code-head">
+        <span class="cm-code-lang">${escapeHtml(label)}</span>
+        <span class="cm-code-actions">
+          <button type="button" class="cm-code-expand" title="放大查看">放大</button>
+          <button type="button" class="cm-code-copy">复制</button>
+        </span>
+      </div>
+      <pre><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>
+    </div>`;
+  }
+
+  function openCodeModal(code, label = 'code') {
+    const modal = ensureCodeModal();
+    modal.querySelector('.cm-code-modal-title').textContent = safeStr(label) || 'code';
+    modal.querySelector('.cm-code-modal-code').textContent = safeStr(code);
+    modal.classList.add('cm-code-modal-open');
+    modal.setAttribute('aria-hidden', 'false');
+  }
+
+  function closeCodeModal() {
+    const modal = document.querySelector('.cm-code-modal');
+    if (!modal) return;
+    modal.classList.remove('cm-code-modal-open');
+    modal.setAttribute('aria-hidden', 'true');
+  }
+
+  function ensureCodeModal() {
+    let modal = document.querySelector('.cm-code-modal');
+    if (modal) return modal;
+    modal = document.createElement('div');
+    modal.className = 'cm-code-modal';
+    modal.setAttribute('aria-hidden', 'true');
+    modal.innerHTML = `
+      <div class="cm-code-modal-backdrop"></div>
+      <div class="cm-code-modal-dialog" role="dialog" aria-modal="true" aria-label="代码块内容">
+        <div class="cm-code-modal-head">
+          <span class="cm-code-modal-title">code</span>
+          <span class="cm-code-modal-actions">
+            <button type="button" class="cm-code-modal-copy">复制</button>
+            <button type="button" class="cm-code-modal-close" title="关闭">×</button>
+          </span>
+        </div>
+        <pre class="cm-code-modal-pre"><code class="cm-code-modal-code"></code></pre>
+      </div>`;
+    document.body.appendChild(modal);
+    modal.querySelector('.cm-code-modal-backdrop').addEventListener('click', closeCodeModal);
+    modal.querySelector('.cm-code-modal-close').addEventListener('click', closeCodeModal);
+    modal.querySelector('.cm-code-modal-copy').addEventListener('click', () => {
+      const btn = modal.querySelector('.cm-code-modal-copy');
+      const code = modal.querySelector('.cm-code-modal-code')?.innerText || '';
+      if (code) copyTextFromButton(btn, code);
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && modal.classList.contains('cm-code-modal-open')) closeCodeModal();
+    });
+    return modal;
+  }
+
+  function renderMarkdownText(text) {
+    const src = safeStr(text).trim();
+    if (!src) return '';
+    const lines = src.split('\n');
+    const html = [];
+
+    for (let i = 0; i < lines.length;) {
+      const line = lines[i];
+      if (!line.trim()) { i++; continue; }
+
+      const heading = line.match(/^(#{1,4})\s+(.+)$/);
+      if (heading) {
+        const level = heading[1].length;
+        html.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+        i++;
+        continue;
+      }
+
+      if (/^\s*>\s?/.test(line)) {
+        const quote = [];
+        while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+          quote.push(lines[i].replace(/^\s*>\s?/, ''));
+          i++;
+        }
+        html.push(`<blockquote>${renderInlineMarkdown(quote.join('\n')).replace(/\n/g, '<br>')}</blockquote>`);
+        continue;
+      }
+
+      if (/^\s*[-*]\s+/.test(line)) {
+        const items = [];
+        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+          items.push(`<li>${renderInlineMarkdown(lines[i].replace(/^\s*[-*]\s+/, ''))}</li>`);
+          i++;
+        }
+        html.push(`<ul>${items.join('')}</ul>`);
+        continue;
+      }
+
+      if (/^\s*\d+\.\s+/.test(line)) {
+        const items = [];
+        while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+          items.push(`<li>${renderInlineMarkdown(lines[i].replace(/^\s*\d+\.\s+/, ''))}</li>`);
+          i++;
+        }
+        html.push(`<ol>${items.join('')}</ol>`);
+        continue;
+      }
+
+      const para = [line];
+      i++;
+      while (
+        i < lines.length &&
+        lines[i].trim() &&
+        !/^(#{1,4})\s+/.test(lines[i]) &&
+        !/^\s*>\s?/.test(lines[i]) &&
+        !/^\s*[-*]\s+/.test(lines[i]) &&
+        !/^\s*\d+\.\s+/.test(lines[i])
+      ) {
+        para.push(lines[i]);
+        i++;
+      }
+      html.push(`<p>${renderInlineMarkdown(para.join('\n')).replace(/\n/g, '<br>')}</p>`);
+    }
+
+    return html.join('');
+  }
+
+  function renderInlineMarkdown(text) {
+    const codeSpans = [];
+    let html = escapeHtml(safeStr(text)).replace(/`([^`\n]+)`/g, (_, code) => {
+      const key = `@@CM_CODE_${codeSpans.length}@@`;
+      codeSpans.push(`<code>${code}</code>`);
+      return key;
+    });
+
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+    html = html.replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    html = html.replace(/(^|[\s(])_([^_\n]+)_/g, '$1<em>$2</em>');
+
+    codeSpans.forEach((code, i) => {
+      html = html.replace(`@@CM_CODE_${i}@@`, code);
+    });
+    return html;
   }
 
   function shortPath(p) {
