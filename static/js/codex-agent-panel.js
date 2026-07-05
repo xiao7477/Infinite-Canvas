@@ -22,9 +22,15 @@
     messages: [],         // [{role, blocks: [...]}]
     projects: [],
     sessions: [],
-    attachments: [],      // [{url, name}] 待发给 Codex 的图附件
+    attachments: [],      // [{url, name, kind, nodeId, imageIndex, canvasKind}] 待发给 Codex 的素材附件
     projPopOpen: false,
     histPopOpen: false,
+    mentionOpen: false,
+    mentionItems: [],
+    mentionQuery: '',
+    mentionStart: -1,
+    busyStartedAt: 0,
+    busyLabel: '',
   };
 
   let currentAgentMsgId = null;
@@ -32,6 +38,9 @@
   let currentReasoningId = null;
   let currentReasoningText = '';
   let currentToolId = null;
+  let busyTimer = null;
+  const addedImagePaths = new Set();
+  const panelSizeKey = 'codex-agent-panel-size-v1';
 
   // ---------------- 工具：安全字符串化 ----------------
   function safeStr(v, fallback = '') {
@@ -44,6 +53,28 @@
     return safeStr(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
   function escapeAttr(s) { return escapeHtml(safeStr(s)); }
+
+  function mediaKindFromUrl(url, fallback = 'image') {
+    const clean = safeStr(url).split('?', 1)[0].split('#', 1)[0].toLowerCase();
+    if (/\.(mp4|mov|webm|m4v|avi|mkv)$/.test(clean)) return 'video';
+    if (/\.(mp3|wav|m4a|aac|ogg|flac)$/.test(clean)) return 'audio';
+    return fallback || 'image';
+  }
+
+  function canvasKind() {
+    if (document.querySelector('.image-node')) return 'smart';
+    if (document.querySelector('.node')) return 'classic';
+    return 'unknown';
+  }
+
+  function nodeTitleFromEl(nodeEl) {
+    if (!nodeEl) return '';
+    const title =
+      nodeEl.querySelector('.node-title,.smart-node-title,.image-name-badge,.node-name,.current-canvas-title')?.textContent ||
+      nodeEl.getAttribute('title') ||
+      '';
+    return safeStr(title).trim().slice(0, 80);
+  }
 
   // ---------------- 注入 UI ----------------
   function inject() {
@@ -70,16 +101,17 @@
       </div>
       <div class="cm-popover" id="cm-proj-pop"></div>
       <div class="cm-popover" id="cm-hist-pop"></div>
+      <div class="cm-mention-pop" id="cm-mention-pop"></div>
+      <div class="cm-resize-handle" id="cm-resize" title="从左下角拖拽调整窗口大小"></div>
       <div class="cm-body" id="cm-body">
         <div class="cm-empty">选择一个项目文件夹，<br>然后开始和 Codex 对话。</div>
       </div>
       <div class="cm-foot">
         <div class="cm-attach">
-          <button class="cm-attach-btn" id="cm-attach-canvas" title="已点选则加已选；否则加画布里所有图">🎨 画布图 (0)</button>
-          <button class="cm-attach-btn" id="cm-attach-url" title="粘贴图 URL 或本地路径">＋ URL</button>
+          <button class="cm-attach-btn" id="cm-attach-canvas" title="添加画布已选素材">🎯 <span id="cm-attach-count">0</span></button>
           <span class="cm-attach-list" id="cm-attach-list"></span>
         </div>
-        <textarea class="cm-input" id="cm-input" placeholder="输入消息，回车发送（Shift+Enter 换行）" disabled></textarea>
+        <div class="cm-input cm-input-disabled" id="cm-input" contenteditable="false" data-placeholder="输入消息，回车发送（Shift+Enter 换行）"></div>
         <div class="cm-foot-row">
           <span class="cm-foot-hint" id="cm-hint">未选项目</span>
           <button class="cm-send" id="cm-send" disabled>发送</button>
@@ -94,8 +126,10 @@
     $('#cm-history').addEventListener('click', toggleHistPop);
     $('#cm-send').addEventListener('click', onSend);
     $('#cm-input').addEventListener('keydown', onInputKey);
+    $('#cm-input').addEventListener('input', onInputMention);
+    $('#cm-input').addEventListener('paste', onInputPaste);
     $('#cm-attach-canvas').addEventListener('click', onAttachFromCanvas);
-    $('#cm-attach-url').addEventListener('click', onAttachFromUrl);
+    initPanelResize();
     document.addEventListener('click', onDocClick);
   }
 
@@ -103,6 +137,87 @@
     state.open = !state.open;
     $('#cm-panel').classList.toggle('cm-open', state.open);
     if (state.open) loadProjects();
+  }
+
+  function initPanelResize() {
+    const panel = $('#cm-panel');
+    const handle = $('#cm-resize');
+    try {
+      const saved = JSON.parse(localStorage.getItem(panelSizeKey) || '{}');
+      if (saved.width) panel.style.width = `${saved.width}px`;
+      if (saved.height) panel.style.height = `${saved.height}px`;
+    } catch {}
+    if (!handle) return;
+    handle.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      const rect = panel.getBoundingClientRect();
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const startWidth = rect.width;
+      const startHeight = rect.height;
+      const minWidth = 320;
+      const minHeight = 420;
+      const maxWidth = Math.max(minWidth, window.innerWidth - 32);
+      const maxHeight = Math.max(minHeight, window.innerHeight - rect.top - 16);
+      handle.setPointerCapture?.(e.pointerId);
+      document.body.classList.add('cm-resizing');
+
+      const onMove = (ev) => {
+        const width = Math.max(minWidth, Math.min(maxWidth, startWidth + (startX - ev.clientX)));
+        const height = Math.max(minHeight, Math.min(maxHeight, startHeight + (ev.clientY - startY)));
+        panel.style.width = `${Math.round(width)}px`;
+        panel.style.height = `${Math.round(height)}px`;
+      };
+      const onUp = () => {
+        document.removeEventListener('pointermove', onMove);
+        document.removeEventListener('pointerup', onUp);
+        document.body.classList.remove('cm-resizing');
+        const next = panel.getBoundingClientRect();
+        try {
+          localStorage.setItem(panelSizeKey, JSON.stringify({
+            width: Math.round(next.width),
+            height: Math.round(next.height),
+          }));
+        } catch {}
+      };
+      document.addEventListener('pointermove', onMove);
+      document.addEventListener('pointerup', onUp, { once: true });
+    });
+  }
+
+  function formatElapsed(ms) {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const mm = String(Math.floor(total / 60)).padStart(2, '0');
+    const ss = String(total % 60).padStart(2, '0');
+    return `${mm}:${ss}`;
+  }
+
+  function setBusy(label = '正在思考') {
+    if (!state.busyStartedAt) state.busyStartedAt = Date.now();
+    state.busyLabel = label;
+    state.status = 'busy';
+    if (!busyTimer) {
+      busyTimer = setInterval(setStatusUI, 1000);
+    }
+    setStatusUI();
+  }
+
+  function updateBusy(label) {
+    if (state.status === 'busy') {
+      state.busyLabel = label || state.busyLabel || '正在思考';
+      setStatusUI();
+    }
+  }
+
+  function finishBusy(status = 'ready') {
+    state.status = status;
+    state.busyStartedAt = 0;
+    state.busyLabel = '';
+    if (busyTimer) {
+      clearInterval(busyTimer);
+      busyTimer = null;
+    }
+    setStatusUI();
   }
 
   // ---------------- 项目下拉 ----------------
@@ -163,8 +278,7 @@
 
   // ---------------- 选项目 / 新对话 ----------------
   async function selectProject(dir) {
-    state.status = 'busy';
-    setStatusUI();
+    setBusy('正在打开项目');
     try {
       const r = await fetch('/api/codex-agent/board/open', {
         method: 'POST',
@@ -175,7 +289,7 @@
       if (!r.ok) throw new Error(d.detail || 'board/open failed');
       state.projectDir = d.project_dir;
       state.threadId = d.thread_id;
-      state.status = 'ready';
+      updateBusy('正在加载历史');
       await loadSessions(dir);
       // 自动接上最近的会话历史（不点历史也能看到）
       if (state.sessions.length > 0 && state.sessions[0].session_id) {
@@ -188,12 +302,12 @@
           }
         } catch {}
       }
+      finishBusy('ready');
     } catch (e) {
       console.error('selectProject failed', e);
-      state.status = 'error';
       alert('启动 Codex 失败：' + e.message);
+      finishBusy('error');
     }
-    setStatusUI();
     renderProjPop();
   }
 
@@ -206,8 +320,7 @@
         body: JSON.stringify({ project_dir: state.projectDir }),
       });
     } catch {}
-    state.status = 'busy';
-    setStatusUI();
+    setBusy('正在新建会话');
     try {
       const r = await fetch('/api/codex-agent/board/open', {
         method: 'POST',
@@ -217,14 +330,13 @@
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || 'board/open failed');
       state.threadId = d.thread_id;
-      state.status = 'ready';
       state.messages = [];
       renderBody();
+      finishBusy('ready');
     } catch (e) {
-      state.status = 'error';
       alert('新对话失败：' + e.message);
+      finishBusy('error');
     }
-    setStatusUI();
   }
 
   // ---------------- 历史下拉 ----------------
@@ -269,8 +381,7 @@
 
   async function switchSession(sessionId) {
     if (!sessionId) return;
-    state.status = 'busy';
-    setStatusUI();
+    setBusy('正在恢复会话');
     try {
       // 1. resume thread
       const r = await fetch('/api/codex-agent/board/open', {
@@ -281,15 +392,15 @@
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || 'board/open (resume) failed');
       state.threadId = d.thread_id;
-      state.status = 'ready';
       // 2. replay 历史
+      updateBusy('正在加载历史');
       await replaySession(sessionId);
+      finishBusy('ready');
     } catch (e) {
       console.error('switchSession failed', e);
-      state.status = 'error';
       alert('恢复会话失败：' + e.message);
+      finishBusy('error');
     }
-    setStatusUI();
   }
 
   async function replaySession(sessionId) {
@@ -313,70 +424,228 @@
   }
 
   // ---------------- 附件管理 ----------------
+  function selectedCanvasAssets() {
+    const selectors = [
+      '.node.selected',
+      '.image-node.selected',
+      '.thumb-item.image-selected',
+      '.image-wrap.image-selected',
+    ];
+    const roots = Array.from(document.querySelectorAll(selectors.join(',')));
+    const seen = new Set();
+    const items = [];
+    roots.forEach(root => {
+      const nodeEl = root.closest('.image-node,.node') || root;
+      const mediaEls = [];
+      if (root.matches('img,video,audio')) mediaEls.push(root);
+      mediaEls.push(...Array.from(root.querySelectorAll('img,video,audio')));
+      mediaEls.forEach(media => {
+        const src = safeStr(
+          media.dataset.originalSrc ||
+          media.dataset.sourceUrl ||
+          media.dataset.url ||
+          media.currentSrc ||
+          media.src
+        );
+        if (!src || src.startsWith('data:') || seen.has(src)) return;
+        seen.add(src);
+        const itemRoot = media.closest('[data-image-index]') || root;
+        const indexRaw = itemRoot?.dataset?.imageIndex;
+        const kind = media.tagName === 'VIDEO' ? 'video' : media.tagName === 'AUDIO' ? 'audio' : mediaKindFromUrl(src, 'image');
+        items.push({
+          refId: `ref_${items.length + 1}`,
+          url: src,
+          name: media.dataset.name || itemRoot?.dataset?.name || extractName(src),
+          kind,
+          nodeId: nodeEl?.dataset?.id || itemRoot?.dataset?.refNodeId || '',
+          imageIndex: indexRaw === undefined || indexRaw === '' ? '' : Number(indexRaw),
+          nodeTitle: nodeTitleFromEl(nodeEl),
+          canvasKind: canvasKind(),
+        });
+      });
+    });
+    return items;
+  }
+
+  function allCanvasAssets() {
+    const seen = new Set();
+    const items = [];
+    const mediaEls = Array.from(document.querySelectorAll('.image-node img,.image-node video,.image-node audio,.node img,.node video,.node audio,.thumb-item img,.image-wrap img,.thumb-item video,.image-wrap video'));
+    mediaEls.forEach(media => {
+      const src = safeStr(
+        media.dataset.originalSrc ||
+        media.dataset.sourceUrl ||
+        media.dataset.url ||
+        media.currentSrc ||
+        media.src
+      );
+      if (!src || src.startsWith('data:') || seen.has(src)) return;
+      seen.add(src);
+      const root = media.closest('.thumb-item,.image-wrap,.image-node,.node') || media;
+      const nodeEl = media.closest('.image-node,.node') || root;
+      const indexRaw = root?.dataset?.imageIndex ?? root?.dataset?.refImageIndex;
+      const kind = media.tagName === 'VIDEO' ? 'video' : media.tagName === 'AUDIO' ? 'audio' : mediaKindFromUrl(src, 'image');
+      items.push({
+        refId: `ref_${items.length + 1}`,
+        url: src,
+        name: media.dataset.name || root?.dataset?.name || extractName(src),
+        kind,
+        nodeId: nodeEl?.dataset?.id || root?.dataset?.refNodeId || '',
+        imageIndex: indexRaw === undefined || indexRaw === '' ? '' : Number(indexRaw),
+        nodeTitle: nodeTitleFromEl(nodeEl),
+        canvasKind: canvasKind(),
+      });
+    });
+    return items;
+  }
+
+  const CanvasAgentBridge = {
+    getSelectedAssets: selectedCanvasAssets,
+    getAllAssets: allCanvasAssets,
+    getContext() {
+      const selectedAssets = selectedCanvasAssets();
+      return {
+        canvasKind: canvasKind(),
+        selectedAssets,
+        selectedCount: selectedAssets.length,
+        url: location.href,
+        title: document.title || '',
+      };
+    },
+    addImageNodeFromPath(path, prompt = '') {
+      return addGeneratedImageToCanvas(path, prompt);
+    },
+  };
+  window.CanvasAgentBridge = CanvasAgentBridge;
+
   function onAttachFromCanvas() {
-    // 只读 .node.selected — 依赖画布原生框选/点选工作流
-    const targets = Array.from(document.querySelectorAll('.node.selected'));
-    if (targets.length === 0) {
+    const assets = CanvasAgentBridge.getSelectedAssets();
+    if (assets.length === 0) {
       showHint('画布里没选中节点（先在画布里点选/框选）');
       return;
     }
     let count = 0;
-    let skippedNoImg = 0;
-    targets.forEach(el => {
-      const img = el.querySelector('img');
-      if (!img) { skippedNoImg++; return; }
-      const src = safeStr(img.src);
-      if (!src || src.startsWith('data:')) return;
-      try {
-        const abs = new URL(src, window.location.origin).href;
-        if (!state.attachments.find(a => a.url === abs)) {
-          state.attachments.push({ url: abs, name: extractName(src) });
-          count++;
-        }
-      } catch {}
+    assets.forEach(item => {
+      if (addAttachment(item)) count++;
     });
     if (count === 0) {
-      showHint(`已选 ${targets.length} 个节点但没 <img>（可能不是图片节点）`);
+      showHint(`已选 ${assets.length} 个素材，但都已经在附件里`);
     } else {
-      showHint(`已加 ${count} 张图`);
+      showHint(`已加 ${count} 个画布素材`);
     }
-    renderAttach();
   }
 
-  function onAttachFromUrl() {
-    const u = prompt('输入图 URL 或本地绝对路径：');
-    if (!u) return;
-    const url = u.trim();
-    if (!url) return;
-    // 相对路径补全
-    let final = url;
-    if (url.startsWith('/') || (!url.startsWith('http') && !url.startsWith('file://'))) {
-      try { final = new URL(url, window.location.origin).href; } catch {}
+  function addAttachment(item) {
+    try {
+      const abs = new URL(item.url, window.location.origin).href;
+      const existed = state.attachments.find(a => a.url === abs);
+      if (existed) return false;
+      state.attachments.push({ ...item, url: abs, refId: `ref_${state.attachments.length + 1}` });
+      renderAttach();
+      return true;
+    } catch {
+      return false;
     }
-    if (state.attachments.find(a => a.url === final)) {
-      alert('已附加');
-      return;
+  }
+
+  function addUploadedAssetToCanvas(item) {
+    try {
+      if (!item || !item.url) return false;
+      if (typeof window.appendImagesToSmartNode === 'function') {
+        window.appendImagesToSmartNode([item], '', { forceNew: true });
+        return true;
+      }
+      if (typeof window.addNode === 'function' && typeof window.uid === 'function') {
+        const p = typeof window.defaultPoint === 'function' ? window.defaultPoint(160, 40) : { x: 0, y: 0 };
+        window.addNode({
+          id: window.uid(item.kind === 'video' ? 'vid' : 'img'),
+          type: item.kind === 'video' ? 'video' : 'image',
+          x: p.x,
+          y: p.y,
+          url: item.url,
+          name: item.name || extractName(item.url),
+          mediaKind: item.kind || 'image',
+        });
+        return true;
+      }
+      if (typeof window.addImageNode === 'function' && item.kind !== 'video') {
+        const node = window.addImageNode();
+        if (node) {
+          node.url = item.url;
+          node.name = item.name || extractName(item.url);
+          node.mediaKind = 'image';
+          if (typeof window.render === 'function') window.render();
+          if (typeof window.scheduleSave === 'function') window.scheduleSave();
+          return true;
+        }
+      }
+    } catch (e) {
+      console.warn('addUploadedAssetToCanvas failed', e);
     }
-    state.attachments.push({ url: final, name: shortPath(url) });
-    renderAttach();
+    return false;
+  }
+
+  function normalizeAttachmentRefs() {
+    state.attachments.forEach((item, index) => {
+      item.refId = `ref_${index + 1}`;
+    });
   }
 
   function removeAttach(idx) {
     state.attachments.splice(idx, 1);
+    normalizeAttachmentRefs();
+    renderAttach();
+  }
+
+  function moveAttach(fromIdx, toIdx) {
+    if (fromIdx === toIdx || fromIdx < 0 || toIdx < 0 || fromIdx >= state.attachments.length || toIdx >= state.attachments.length) return;
+    const [item] = state.attachments.splice(fromIdx, 1);
+    state.attachments.splice(toIdx, 0, item);
+    normalizeAttachmentRefs();
     renderAttach();
   }
 
   function renderAttach() {
     const list = $('#cm-attach-list');
     const btn = $('#cm-attach-canvas');
-    if (btn) btn.textContent = `🎯 画布已选 (${state.attachments.length})`;
+    const count = $('#cm-attach-count');
+    if (count) count.textContent = String(state.attachments.length);
     if (!list) return;
-    list.innerHTML = state.attachments.map((a, i) =>
-      `<div class="cm-attach-thumb" data-i="${i}" title="${escapeAttr(a.name)} · ${escapeAttr(a.url)}">
-        <img src="${escapeAttr(a.url)}" alt="${escapeAttr(a.name)}" loading="lazy">
+    list.innerHTML = state.attachments.map((a, i) => {
+      const kind = safeStr(a.kind || mediaKindFromUrl(a.url));
+      const preview = attachmentPreviewHtml(a, kind, 'cm-attach-kind');
+      return `<div class="cm-attach-thumb" data-i="${i}" draggable="true" title="图${i + 1} · ${escapeAttr(a.name)} · ${escapeAttr(a.url)}">
+        ${preview}
+        <span class="cm-attach-index">${i + 1}</span>
         <span class="cm-attach-x" data-i="${i}" title="移除">×</span>
-      </div>`
-    ).join('');
+      </div>`;
+    }).join('');
+    list.querySelectorAll('.cm-attach-thumb').forEach(thumb => {
+      thumb.addEventListener('dragstart', e => {
+        const i = thumb.getAttribute('data-i');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', i);
+        thumb.classList.add('cm-attach-dragging');
+      });
+      thumb.addEventListener('dragend', () => {
+        thumb.classList.remove('cm-attach-dragging');
+      });
+      thumb.addEventListener('dragover', e => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        thumb.classList.add('cm-attach-drop');
+      });
+      thumb.addEventListener('dragleave', () => {
+        thumb.classList.remove('cm-attach-drop');
+      });
+      thumb.addEventListener('drop', e => {
+        e.preventDefault();
+        thumb.classList.remove('cm-attach-drop');
+        const from = Number(e.dataTransfer.getData('text/plain'));
+        const to = Number(thumb.getAttribute('data-i'));
+        moveAttach(from, to);
+      });
+    });
     list.querySelectorAll('.cm-attach-x').forEach(x => {
       x.addEventListener('click', e => {
         e.stopPropagation();
@@ -386,9 +655,228 @@
     });
   }
 
+  function attachmentPreviewHtml(item, kind = '', fallbackClass = 'cm-attach-kind') {
+    const mediaKind = safeStr(kind || item.kind || mediaKindFromUrl(item.url));
+    const url = escapeAttr(item.url);
+    const name = escapeAttr(item.name);
+    if (mediaKind === 'image') {
+      return `<img src="${url}" alt="${name}" loading="lazy">`;
+    }
+    if (mediaKind === 'video') {
+      return `<video src="${url}" muted playsinline preload="metadata"></video><span class="cm-video-badge">▶</span>`;
+    }
+    return `<span class="${fallbackClass}">${escapeHtml(mediaKind.toUpperCase().slice(0, 5))}</span>`;
+  }
+
+  function inputText() {
+    const input = $('#cm-input');
+    return safeStr(input?.innerText || '').replace(/\u00a0/g, ' ');
+  }
+
+  function clearInput() {
+    const input = $('#cm-input');
+    if (input) input.innerHTML = '';
+  }
+
+  function inputCaretPrefix() {
+    const input = $('#cm-input');
+    const sel = window.getSelection();
+    if (!input || !sel || sel.rangeCount === 0) return inputText();
+    const range = sel.getRangeAt(0);
+    if (!input.contains(range.startContainer)) return inputText();
+    const prefix = range.cloneRange();
+    prefix.selectNodeContents(input);
+    prefix.setEnd(range.startContainer, range.startOffset);
+    return safeStr(prefix.toString()).replace(/\u00a0/g, ' ');
+  }
+
+  function deleteCharsBeforeCaret(count) {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount || count <= 0) return false;
+    try {
+      sel.modify('extend', 'backward', 'character');
+      for (let i = 1; i < count; i++) sel.modify('extend', 'backward', 'character');
+      sel.getRangeAt(0).deleteContents();
+      sel.collapseToEnd();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function insertInputToken(text) {
+    const safe = escapeHtml(text);
+    const html = `<span class="cm-input-token" contenteditable="false" data-token-text="${escapeAttr(text)}">${safe}</span>&nbsp;`;
+    document.execCommand('insertHTML', false, html);
+  }
+
+  function restoreInputRange(range) {
+    const input = $('#cm-input');
+    if (!range || !input) return false;
+    try {
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function insertPlainText(text) {
+    document.execCommand('insertText', false, safeStr(text));
+  }
+
   // ---------------- 发消息 → SSE ----------------
   function onInputKey(e) {
+    if (state.mentionOpen) {
+      if (e.key === 'Escape') { e.preventDefault(); closeMentionPicker(); return; }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        const first = state.mentionItems[0];
+        if (first) { e.preventDefault(); pickMentionItem(first); return; }
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSend(); }
+  }
+
+  async function onInputPaste(e) {
+    const clipboard = e.clipboardData;
+    if (!clipboard) return;
+    const files = Array.from(clipboard.files || []).filter(file => file && file.type && file.type.startsWith('image/'));
+    const itemFiles = Array.from(clipboard.items || [])
+      .filter(item => item.kind === 'file' && String(item.type || '').startsWith('image/'))
+      .map(item => item.getAsFile?.())
+      .filter(Boolean);
+    const imageFiles = [...files, ...itemFiles].filter((file, index, arr) => arr.findIndex(f => f.name === file.name && f.size === file.size && f.type === file.type) === index);
+
+    if (imageFiles.length) {
+      e.preventDefault();
+      const sel = window.getSelection();
+      const input = $('#cm-input');
+      const range = sel && sel.rangeCount && input?.contains(sel.getRangeAt(0).startContainer)
+        ? sel.getRangeAt(0).cloneRange()
+        : null;
+      await uploadPastedImages(imageFiles, range);
+      return;
+    }
+
+    const text = clipboard.getData('text/plain');
+    if (text) {
+      e.preventDefault();
+      insertPlainText(text);
+      onInputMention();
+    }
+  }
+
+  async function uploadPastedImages(files, pasteRange = null) {
+    if (!files.length) return;
+    setBusy('正在粘贴图片');
+    try {
+      const form = new FormData();
+      files.forEach((file, index) => {
+        const ext = file.type === 'image/jpeg' ? 'jpg' : file.type === 'image/webp' ? 'webp' : file.type === 'image/gif' ? 'gif' : 'png';
+        const name = file.name || `pasted-${Date.now()}-${index + 1}.${ext}`;
+        form.append('files', file, name);
+      });
+      const r = await fetch('/api/ai/upload', { method: 'POST', body: form });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(safeStr(data.detail) || `HTTP ${r.status}`);
+      const uploaded = Array.isArray(data.files) ? data.files : [];
+      uploaded.forEach(item => {
+        const asset = {
+          url: item.url,
+          name: item.name || extractName(item.url),
+          kind: item.kind || 'image',
+          canvasKind: canvasKind(),
+        };
+        addUploadedAssetToCanvas(asset);
+        addAttachment(asset);
+        const index = state.attachments.findIndex(a => a.url === new URL(asset.url, window.location.origin).href);
+        $('#cm-input')?.focus();
+        restoreInputRange(pasteRange);
+        insertInputToken(`@图${index >= 0 ? index + 1 : state.attachments.length}`);
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount) pasteRange = sel.getRangeAt(0).cloneRange();
+      });
+      showHint(uploaded.length ? `已粘贴 ${uploaded.length} 张图片` : '剪贴板图片为空');
+    } catch (err) {
+      console.error('uploadPastedImages failed', err);
+      showHint('粘贴图片失败：' + safeStr(err.message || err), 6000);
+    } finally {
+      finishBusy('ready');
+      $('#cm-input')?.focus();
+    }
+  }
+
+  function onInputMention() {
+    const before = inputCaretPrefix();
+    const match = before.match(/@([^\s@]*)$/);
+    if (!match) {
+      closeMentionPicker();
+      return;
+    }
+    state.mentionStart = before.length - match[1].length - 1;
+    state.mentionQuery = match[1].toLowerCase();
+    const candidates = state.attachments;
+    state.mentionItems = candidates
+      .filter(item => {
+        const hay = `${item.name || ''} ${item.nodeTitle || ''} ${item.kind || ''}`.toLowerCase();
+        return !state.mentionQuery || hay.includes(state.mentionQuery);
+      })
+      .slice(0, 24);
+    renderMentionPicker();
+  }
+
+  function renderMentionPicker() {
+    const pop = $('#cm-mention-pop');
+    if (!pop) return;
+    state.mentionOpen = true;
+    pop.classList.add('cm-mention-open');
+    if (!state.mentionItems.length) {
+      pop.innerHTML = '<div class="cm-mention-empty">输入框上方还没有附件</div>';
+      return;
+    }
+    pop.innerHTML = state.mentionItems.map((item, i) => {
+      const kind = safeStr(item.kind || mediaKindFromUrl(item.url));
+      const attachIndex = state.attachments.findIndex(a => a.url === item.url);
+      const label = `图${attachIndex >= 0 ? attachIndex + 1 : i + 1}`;
+      const media = attachmentPreviewHtml(item, kind, 'cm-mention-kind');
+      return `<button class="cm-mention-item" type="button" data-i="${i}">
+        <span class="cm-mention-thumb">${media}</span>
+        <span class="cm-mention-label">${escapeHtml(label)}</span>
+      </button>`;
+    }).join('');
+    pop.querySelectorAll('.cm-mention-item').forEach(btn => {
+      btn.addEventListener('mousedown', e => e.preventDefault());
+      btn.addEventListener('click', () => {
+        const item = state.mentionItems[Number(btn.getAttribute('data-i'))];
+        if (item) pickMentionItem(item);
+      });
+    });
+  }
+
+  function pickMentionItem(item) {
+    const input = $('#cm-input');
+    const index = state.attachments.findIndex(a => a.url === item.url);
+    const token = `@图${index >= 0 ? index + 1 : 1} `;
+    input.focus();
+    deleteCharsBeforeCaret(state.mentionQuery.length + 1);
+    insertInputToken(token.trim());
+    addAttachment(item);
+    closeMentionPicker();
+    input.focus();
+  }
+
+  function closeMentionPicker() {
+    state.mentionOpen = false;
+    state.mentionItems = [];
+    state.mentionQuery = '';
+    state.mentionStart = -1;
+    const pop = $('#cm-mention-pop');
+    if (pop) {
+      pop.classList.remove('cm-mention-open');
+      pop.innerHTML = '';
+    }
   }
 
   // 临时提示（不弹窗，用底部 hint 区）
@@ -407,27 +895,30 @@
 
   async function onSend() {
     const input = $('#cm-input');
-    const text = input.value.trim();
+    const text = inputText().trim();
     if (!text || !state.projectDir || state.status === 'busy') return;
 
     // 收集 attachments（深拷贝后清空）
-    const attachUrls = state.attachments.map(a => a.url);
+    const attachments = state.attachments.map((a, index) => ({
+      ...a,
+      refId: a.refId || `ref_${index + 1}`,
+    }));
     state.attachments = [];
     renderAttach();
 
     state.messages.push({ role: 'user', blocks: [{ type: 'text', text: safeStr(text) }] });
-    if (attachUrls.length) {
-      state.messages[state.messages.length - 1].blocks.push({ type: 'attach', count: attachUrls.length });
+    if (attachments.length) {
+      state.messages[state.messages.length - 1].blocks.push({ type: 'attach', items: attachments });
     }
     renderBody();
-    input.value = '';
+    clearInput();
 
     const botMsg = { role: 'bot', blocks: [] };
     state.messages.push(botMsg);
     renderBody();
+    closeMentionPicker();
 
-    state.status = 'busy';
-    setStatusUI();
+    setBusy(attachments.length ? '正在准备选中素材' : '正在发送');
 
     currentAgentMsgId = null;
     currentAgentText = '';
@@ -439,12 +930,13 @@
       const r = await fetch('/api/codex-agent/turn', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_dir: state.projectDir, text, attachments: attachUrls }),
+        body: JSON.stringify({ project_dir: state.projectDir, text, attachments }),
       });
       if (!r.ok) {
         const d = await r.json().catch(() => ({}));
         throw new Error(safeStr(d.detail) || `HTTP ${r.status}`);
       }
+      updateBusy('等待 Codex 响应');
       const reader = r.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
@@ -463,8 +955,7 @@
       botMsg.blocks.push({ type: 'error', text: safeStr(e.message || e) });
       renderBody();
     }
-    state.status = 'ready';
-    setStatusUI();
+    finishBusy('ready');
   }
 
   function parseSSEBlock(block, botMsg) {
@@ -487,28 +978,34 @@
       const type = safeStr(item.type);
 
       if (type === 'agentMessage') {
+        updateBusy('正在回复');
         currentAgentMsgId = item.id;
         currentAgentText = safeStr(item.text);
         botMsg.blocks.push({ type: 'text', text: currentAgentText, id: item.id, streaming: true });
       } else if (type === 'reasoning') {
+        updateBusy('正在读取/思考');
         currentReasoningId = item.id;
         currentReasoningText = safeStr(item.summary) || safeStr(item.text);
         botMsg.blocks.push({ type: 'thinking', text: currentReasoningText, id: item.id });
       } else if (type === 'commandExecution') {
+        updateBusy('正在执行命令');
         currentToolId = item.id;
         botMsg.blocks.push({
           type: 'tool', text: `🔧 ${safeStr(item.command) || '(命令)'}`,
           status: 'running', id: item.id,
         });
       } else if (type === 'imageGeneration') {
+        updateBusy('正在生成图片');
         botMsg.blocks.push({
           type: 'image', path: safeStr(item.savedPath) || safeStr(item.path) || '',
           prompt: safeStr(item.prompt), status: 'generating', id: item.id,
         });
       } else if (type === 'todoList' || type === 'plan') {
+        updateBusy('正在更新计划');
         const items = Array.isArray(item.items) ? item.items : [];
         botMsg.blocks.push({ type: 'todo', items });
       } else if (type === 'mcpToolCall' || type === 'webSearch' || type === 'fileChange') {
+        updateBusy(type === 'fileChange' ? '正在改文件' : '正在调用工具');
         const label = safeStr(item.name) || safeStr(item.query) || safeStr(item.path) || '';
         botMsg.blocks.push({ type: 'tool', text: `🔧 ${type}: ${label}`, status: 'running', id: item.id });
       }
@@ -516,16 +1013,19 @@
     } else if (method === 'item/agentMessage/delta' || method === 'item/reasoning/summaryTextDelta' || method === 'item/reasoning/textDelta') {
       const delta = safeStr(params.delta);
       if (method === 'item/agentMessage/delta') {
+        updateBusy('正在回复');
         currentAgentText += delta;
         const blk = botMsg.blocks.find(b => b.id === currentAgentMsgId && b.type === 'text');
         if (blk) blk.text = currentAgentText;
       } else {
+        updateBusy('正在读取/思考');
         currentReasoningText += delta;
         const blk = botMsg.blocks.find(b => b.id === currentReasoningId && b.type === 'thinking');
         if (blk) blk.text = currentReasoningText;
       }
       renderBody();
     } else if (method === 'item/commandExecution/outputDelta') {
+      updateBusy('正在执行命令');
       const out = safeStr(params.delta);
       const blk = botMsg.blocks.find(b => b.id === currentToolId && b.type === 'tool');
       if (blk) blk.text += out ? '\n' + out : '';
@@ -540,19 +1040,68 @@
         } else if (blk.type === 'image') {
           blk.path = safeStr(item.savedPath) || safeStr(item.path) || blk.path;
           blk.status = 'done';
+          addGeneratedImageToCanvas(blk.path, blk.prompt);
         } else if (blk.type === 'tool') {
           blk.status = 'done';
         }
       }
+      if (safeStr(item.type) === 'imageGeneration') {
+        const path = safeStr(item.savedPath) || safeStr(item.path);
+        if (path) addGeneratedImageToCanvas(path, safeStr(item.prompt));
+      }
       renderBody();
     } else if (method === 'turn/completed') {
+      updateBusy('完成');
       botMsg.blocks.forEach(b => { if (b.streaming) b.streaming = false; });
       renderBody();
     } else if (method === 'error' || method === 'fatal' || method === 'turn/timeout') {
+      updateBusy('请求异常');
       const errText = safeStr(params.message) || safeStr(params.error) || JSON.stringify(params || {});
       botMsg.blocks.push({ type: 'error', text: errText });
       renderBody();
     }
+  }
+
+  function addGeneratedImageToCanvas(path, prompt = '') {
+    path = safeStr(path);
+    if (!path || addedImagePaths.has(path)) return false;
+    const url = '/api/codex-agent/file/view?path=' + encodeURIComponent(path);
+    const name = extractName(path) || extractName(url) || 'codex-image.png';
+    const item = { url, name, kind: 'image', prompt: safeStr(prompt) };
+
+    try {
+      if (typeof window.appendImagesToSmartNode === 'function') {
+        window.appendImagesToSmartNode([item], '', { forceNew: true });
+        addedImagePaths.add(path);
+        showHint('已把生成图片放到智能画布');
+        return true;
+      }
+      if (typeof window.addNode === 'function' && typeof window.uid === 'function') {
+        const p = typeof window.defaultPoint === 'function' ? window.defaultPoint(160, 40) : { x: 0, y: 0 };
+        window.addNode({ id: window.uid('img'), type: 'image', x: p.x, y: p.y, url, name, mediaKind: 'image' });
+        addedImagePaths.add(path);
+        showHint('已把生成图片放到画布');
+        return true;
+      }
+      if (typeof window.addImageNode === 'function') {
+        const node = window.addImageNode();
+        if (node) {
+          node.url = url;
+          node.name = name;
+          node.mediaKind = 'image';
+          if (typeof window.render === 'function') window.render();
+          if (typeof window.scheduleSave === 'function') window.scheduleSave();
+          addedImagePaths.add(path);
+          showHint('已把生成图片放到画布');
+          return true;
+        }
+      }
+    } catch (e) {
+      console.warn('addGeneratedImageToCanvas failed', e);
+      showHint('生成图已完成，但自动放入画布失败');
+      return false;
+    }
+    return false;
   }
 
   // ---------------- 渲染 ----------------
@@ -575,12 +1124,16 @@
     const input = $('#cm-input');
     const send = $('#cm-send');
     const enabled = !!state.projectDir && state.status !== 'busy';
-    input.disabled = !state.projectDir;
+    input.contentEditable = state.projectDir ? 'true' : 'false';
+    input.classList.toggle('cm-input-disabled', !state.projectDir);
     send.disabled = !enabled;
 
     const hint = $('#cm-hint');
     if (!state.projectDir) hint.textContent = '未选项目';
-    else if (state.status === 'busy') hint.textContent = 'Codex 正在思考…';
+    else if (state.status === 'busy') {
+      const elapsed = state.busyStartedAt ? formatElapsed(Date.now() - state.busyStartedAt) : '00:00';
+      hint.textContent = `${elapsed} · ${state.busyLabel || '正在思考'}`;
+    }
     else hint.textContent = `thread: ${(state.threadId || '').slice(0, 8)}…`;
   }
 
@@ -598,14 +1151,67 @@
     if (msg.role === 'user') {
       const userBlock = msg.blocks.find(b => b.type === 'text');
       const attachBlock = msg.blocks.find(b => b.type === 'attach');
+      const normalized = normalizeUserDisplayText(safeStr(userBlock?.text));
+      const attachItems = (attachBlock?.items && attachBlock.items.length) ? attachBlock.items : normalized.refs;
       let html = '';
-      if (attachBlock) {
-        html += `<div class="cm-msg-attach">📎 ${escapeHtml(safeStr(attachBlock.count))} 个附件</div>`;
+      if (attachBlock || attachItems.length) {
+        html += renderMessageAttachments(attachItems || [], attachBlock?.count || attachItems.length || 0);
       }
-      html += `<div class="cm-msg-user">${escapeHtml(safeStr(userBlock?.text))}</div>`;
+      html += `<div class="cm-msg-user">${escapeHtml(normalized.text)}</div>`;
       return `<div class="cm-msg">${html}</div>`;
     }
     return `<div class="cm-msg">${msg.blocks.map(renderBlock).join('')}</div>`;
+  }
+
+  function normalizeUserDisplayText(text) {
+    const raw = safeStr(text);
+    const refs = [];
+    if (!raw.includes('canvas_agent_context')) return { text: raw, refs };
+
+    const refRe = /-\s*id:\s*([^\n]+)([\s\S]*?)(?=\n-\s*id:|\n<\/canvas_agent_context>|$)/g;
+    let m;
+    while ((m = refRe.exec(raw)) !== null) {
+      const block = m[2] || '';
+      const get = (key) => {
+        const hit = block.match(new RegExp(`\\n\\s*${key}:\\s*([^\\n]*)`));
+        return hit ? hit[1].trim() : '';
+      };
+      const sourcePath = get('source_path');
+      const localPath = get('local_path');
+      const path = sourcePath || localPath;
+      refs.push({
+        refId: m[1].trim(),
+        name: get('name') || extractName(path),
+        kind: get('kind') || mediaKindFromUrl(path),
+        url: path ? `/api/codex-agent/file/view?path=${encodeURIComponent(path)}` : '',
+        source_path: sourcePath,
+        local_path: localPath,
+        canvasKind: get('canvas_kind'),
+        nodeId: get('node_id'),
+        imageIndex: get('image_index'),
+        nodeTitle: get('node_title'),
+      });
+    }
+
+    let clean = raw.replace(/<canvas_agent_context>[\s\S]*?<\/canvas_agent_context>/g, '').trim();
+    clean = clean.replace(/^用户请求：\s*/u, '').trim();
+    if (!clean && raw.includes('用户请求：')) clean = raw.split('用户请求：').pop().trim();
+    return { text: clean || raw, refs };
+  }
+
+  function renderMessageAttachments(items, fallbackCount = 0) {
+    if (!Array.isArray(items) || !items.length) {
+      return `<div class="cm-msg-attach">📎 ${escapeHtml(safeStr(fallbackCount))} 个附件</div>`;
+    }
+    const thumbs = items.map((a, i) => {
+      const kind = safeStr(a.kind || mediaKindFromUrl(a.url));
+      const preview = attachmentPreviewHtml(a, kind, 'cm-attach-kind');
+      return `<span class="cm-msg-attach-thumb" title="图${i + 1} · ${escapeAttr(a.name)}">
+        ${preview}
+        <span class="cm-msg-attach-index">${i + 1}</span>
+      </span>`;
+    }).join('');
+    return `<div class="cm-msg-attach-list">${thumbs}</div>`;
   }
 
   function renderBlock(b) {
@@ -677,6 +1283,13 @@
       if (!pop.contains(e.target) && !btn.contains(e.target)) {
         state.histPopOpen = false;
         renderHistPop();
+      }
+    }
+    if (state.mentionOpen) {
+      const pop = $('#cm-mention-pop');
+      const input = $('#cm-input');
+      if (pop && !pop.contains(e.target) && input && !input.contains(e.target)) {
+        closeMentionPicker();
       }
     }
   }

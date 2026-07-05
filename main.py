@@ -16671,6 +16671,7 @@ class CodexAppServerSession:
         self._next_id = 1
         self._pending: Dict[int, asyncio.Future] = {}
         self._event_queues: List[asyncio.Queue] = []
+        self._stderr_tail: List[str] = []
         self._lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
 
@@ -16747,19 +16748,21 @@ class CodexAppServerSession:
                 except (asyncio.CancelledError, Exception):
                     pass
 
-    async def send_user_message(self, text: str, image_paths=None, timeout: int = 300):
+    async def send_user_message(self, text: str, image_paths=None, timeout: int = 900):
         """
         发 user message 到 thread，async generator 每个事件一次。
         事件格式：{"method": "item/started", "params": {...}}
         终止事件：{"method": "turn/completed" | "fatal" | "error", ...}
         """
-        user_content = [{"type": "text", "text": text}]
+        user_content = [{"type": "text", "text": text, "text_elements": []}]
         for p in (image_paths or []):
-            # Codex app-server 期望 image item 用 `url` 字段（file:// 或 http(s)://）
-            url = p
-            if p.startswith("/"):
-                url = "file://" + p
-            user_content.append({"type": "image", "url": url})
+            if isinstance(p, dict):
+                p = p.get("local_path") or p.get("path") or ""
+            if not p:
+                continue
+            # Codex app-server 对本地参考图的稳定输入类型是 localImage。
+            # 这里传给 Codex 的必须是后端已经落盘的绝对路径。
+            user_content.append({"type": "localImage", "path": p})
 
         queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._event_queues.append(queue)
@@ -16767,7 +16770,13 @@ class CodexAppServerSession:
             await self._request("turn/start", {
                 "threadId": self.thread_id,
                 "input": user_content,
-            }, timeout=30)
+                "cwd": self.project_dir,
+                "summary": "auto",
+                "personality": "friendly",
+                "model": None,
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "workspaceWrite"},
+            }, timeout=180)
 
             while True:
                 try:
@@ -16803,7 +16812,10 @@ class CodexAppServerSession:
             resp = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             self._pending.pop(mid, None)
-            raise HTTPException(status_code=504, detail=f"Codex request timeout: {method}")
+            detail = f"Codex request timeout: {method}"
+            if self._stderr_tail:
+                detail += " | stderr: " + " ".join(self._stderr_tail[-3:])[:500]
+            raise HTTPException(status_code=504, detail=detail)
 
         if "error" in resp:
             err = resp["error"]
@@ -16859,6 +16871,10 @@ class CodexAppServerSession:
                 line = await self.proc.stderr.readline()
                 if not line:
                     break
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    self._stderr_tail.append(text)
+                    self._stderr_tail = self._stderr_tail[-20:]
         except (asyncio.CancelledError, Exception):
             pass
 
@@ -16866,6 +16882,278 @@ class CodexAppServerSession:
 # 项目目录 → session 的运行时映射表
 _codex_agent_sessions: Dict[str, CodexAppServerSession] = {}
 _codex_agent_lock = Lock()
+_codex_agent_refs_last_cleanup = 0.0
+
+
+def _codex_agent_ref_ttl_seconds() -> Optional[float]:
+    raw = str(os.environ.get("CODEX_AGENT_REF_TTL_HOURS") or "168").strip()
+    try:
+        hours = float(raw)
+    except ValueError:
+        hours = 168.0
+    if hours <= 0:
+        return None
+    return hours * 3600
+
+
+def _codex_agent_cleanup_refs(cache_root: _Path) -> None:
+    global _codex_agent_refs_last_cleanup
+    ttl = _codex_agent_ref_ttl_seconds()
+    if ttl is None:
+        return
+    now = time.time()
+    if now - _codex_agent_refs_last_cleanup < 3600:
+        return
+    _codex_agent_refs_last_cleanup = now
+    if not cache_root.exists():
+        return
+    cutoff = now - ttl
+    try:
+        for path in cache_root.rglob("*"):
+            try:
+                if path.is_file() or path.is_symlink():
+                    if path.stat().st_mtime < cutoff:
+                        path.unlink()
+            except Exception as exc:
+                print(f"Codex Agent refs 缓存清理文件失败: {path}: {exc}")
+        for path in sorted((p for p in cache_root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+            except Exception as exc:
+                print(f"Codex Agent refs 缓存清理目录失败: {path}: {exc}")
+    except Exception as exc:
+        print(f"Codex Agent refs 缓存清理失败: {exc}")
+
+
+def _codex_agent_refs_dir(project_dir: str) -> _Path:
+    project_key = hashlib.sha1(str(_Path(project_dir).resolve()).encode("utf-8")).hexdigest()[:16]
+    cache_root = _Path(os.environ.get("CODEX_AGENT_REF_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "infinite-canvas-codex-agent", "refs"))
+    _codex_agent_cleanup_refs(cache_root)
+    refs_dir = cache_root / project_key
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    return refs_dir
+
+
+def _codex_agent_safe_suffix(source: str, content_type: str = "") -> str:
+    clean = str(source or "").split("?", 1)[0].split("#", 1)[0]
+    suffix = os.path.splitext(clean)[1].lower()
+    if suffix and re.match(r"^\.[a-z0-9]{1,8}$", suffix):
+        return suffix
+    guessed = mimetypes.guess_extension(content_type or "") or ""
+    return guessed if guessed and re.match(r"^\.[a-z0-9]{1,8}$", guessed.lower()) else ".png"
+
+
+def _codex_agent_local_path_from_url(raw: str) -> Optional[str]:
+    """把本应用自己的资源 URL 映射成本地文件，避免服务端再经 LAN IP 下载自己。"""
+    try:
+        parsed = urllib.parse.urlparse(raw)
+    except Exception:
+        return None
+
+    path = urllib.parse.unquote(parsed.path or "")
+    query = urllib.parse.parse_qs(parsed.query or "")
+    candidates: List[str] = []
+
+    if path.startswith("/assets/"):
+        rel = path[len("/assets/"):].lstrip("/")
+        candidates.append(os.path.join(ASSETS_DIR, rel))
+    elif path.startswith("/output/"):
+        rel = path[len("/output/"):].lstrip("/")
+        candidates.append(os.path.join(OUTPUT_DIR, rel))
+    elif path == "/api/view":
+        filename = (query.get("filename") or [""])[0]
+        kind = (query.get("type") or ["input"])[0]
+        subfolder = (query.get("subfolder") or [""])[0]
+        if filename:
+            safe_name = os.path.basename(filename)
+            if kind == "output":
+                candidates.append(os.path.join(OUTPUT_OUTPUT_DIR, subfolder, safe_name))
+            else:
+                candidates.append(os.path.join(OUTPUT_INPUT_DIR, subfolder, safe_name))
+
+    base_dirs = [_Path(ASSETS_DIR).resolve(), _Path(OUTPUT_DIR).resolve()]
+    for candidate in candidates:
+        try:
+            p = _Path(candidate).resolve()
+        except Exception:
+            continue
+        if p.is_file() and any(p == base or base in p.parents for base in base_dirs):
+            return str(p)
+    return None
+
+
+def _codex_agent_attachment_value(item: Any) -> Dict[str, Any]:
+    if isinstance(item, dict):
+        data = dict(item)
+        data["url"] = str(data.get("url") or data.get("src") or data.get("path") or "").strip()
+        return data
+    return {"url": str(item or "").strip()}
+
+
+def _codex_agent_media_kind_from_ref(ref: Dict[str, Any], path: str = "") -> str:
+    kind = str(ref.get("kind") or ref.get("mediaKind") or "").strip().lower()
+    if kind in {"image", "video", "audio"}:
+        return kind
+    target = (path or str(ref.get("url") or "")).split("?", 1)[0].split("#", 1)[0].lower()
+    if re.search(r"\.(mp4|mov|webm|m4v|avi|mkv)$", target):
+        return "video"
+    if re.search(r"\.(mp3|wav|m4a|aac|ogg|flac)$", target):
+        return "audio"
+    return "image"
+
+
+async def _codex_agent_prepare_local_image(ref: Any, project_dir: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
+    """
+    把画布里的图片引用准备成 Codex app-server 可读的本地绝对路径。
+    这比直接传 remote URL 更稳，也和 Codex `localImage` 输入类型对齐。
+    """
+    ref_data = _codex_agent_attachment_value(ref)
+    ref_url = str(ref_data.get("url") or "").strip()
+    if not ref_url:
+        raise ValueError("empty ref")
+
+    refs_dir = _codex_agent_refs_dir(project_dir)
+    raw = ref_url
+
+    if raw.startswith("data:"):
+        if ";base64," not in raw:
+            raise ValueError("data URL 缺少 base64 数据")
+        header, encoded = raw.split(";base64,", 1)
+        mime = header[5:].split(";", 1)[0] if header.startswith("data:") else "image/png"
+        suffix = _codex_agent_safe_suffix("", mime)
+        target = refs_dir / f"ref-{uuid.uuid4().hex}{suffix}"
+        with open(target, "wb") as f:
+            f.write(base64.b64decode(encoded))
+        local_path = str(target)
+        return {**ref_data, "url": ref_url, "local_path": local_path, "kind": _codex_agent_media_kind_from_ref(ref_data, local_path)}
+
+    if raw.startswith("file://"):
+        local = urllib.parse.unquote(raw[len("file://"):])
+    elif raw.startswith("http://") or raw.startswith("https://"):
+        local_hit = _codex_agent_local_path_from_url(raw)
+        if local_hit:
+            local = local_hit
+        else:
+            c = client or httpx.AsyncClient()
+            try:
+                r = await c.get(raw, timeout=30, follow_redirects=True)
+                r.raise_for_status()
+                suffix = _codex_agent_safe_suffix(raw, r.headers.get("content-type", ""))
+                target = refs_dir / f"ref-{uuid.uuid4().hex}{suffix}"
+                with open(target, "wb") as f:
+                    f.write(r.content)
+                local_path = str(target)
+                return {**ref_data, "url": ref_url, "local_path": local_path, "kind": _codex_agent_media_kind_from_ref(ref_data, local_path)}
+            finally:
+                if client is None:
+                    await c.aclose()
+    elif raw.startswith("/"):
+        local = _codex_agent_local_path_from_url(raw) or raw
+    else:
+        raise ValueError(f"unsupported ref: {raw}")
+
+    local_path = _Path(local).expanduser().resolve()
+    if not local_path.is_file():
+        raise FileNotFoundError(str(local_path))
+    suffix = _codex_agent_safe_suffix(str(local_path), mimetypes.guess_type(str(local_path))[0] or "")
+    target = refs_dir / f"ref-{uuid.uuid4().hex}{suffix}"
+    shutil.copyfile(str(local_path), str(target))
+    local_out = str(target)
+    return {**ref_data, "url": ref_url, "source_path": str(local_path), "local_path": local_out, "kind": _codex_agent_media_kind_from_ref(ref_data, local_out)}
+
+
+def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]]) -> str:
+    if not refs:
+        return ""
+    lines = [
+        "<canvas_agent_context>",
+        f"project_dir: {project_dir}",
+        "你正在 Infinite-Canvas 的 Agent 面板中。下面是用户从当前画布选择并附加给你的素材。",
+        "当用户说“这张图/选中的图/这些素材/放到项目目录/重命名/整理”时，优先指这些 ref。",
+        "这些素材按用户在输入框附件区的顺序排列：图一/第一张=ref_1，图二/第二张=ref_2，依此类推。",
+        "local_path 是本机临时缓存文件，仅用于本轮读取；如果要保存文件，请把 local_path 复制到 project_dir 或用户指定的子目录，不要把缓存目录当作最终目录。",
+        "完成文件操作后，请明确回复保存后的路径。不要声称已经操作画布，除非你生成了图片文件并由前端自动放回画布。",
+        "selected_refs:",
+    ]
+    for index, ref in enumerate(refs, 1):
+        ref_id = str(ref.get("refId") or ref.get("ref_id") or f"ref_{index}")
+        lines.extend([
+            f"- id: {ref_id}",
+            f"  name: {ref.get('name') or os.path.basename(str(ref.get('local_path') or 'asset'))}",
+            f"  kind: {ref.get('kind') or 'image'}",
+            f"  local_path: {ref.get('local_path') or ''}",
+            f"  source_path: {ref.get('source_path') or ''}",
+            f"  canvas_kind: {ref.get('canvasKind') or ref.get('canvas_kind') or ''}",
+            f"  node_id: {ref.get('nodeId') or ref.get('node_id') or ''}",
+            f"  image_index: {ref.get('imageIndex') if ref.get('imageIndex') is not None else ''}",
+            f"  node_title: {ref.get('nodeTitle') or ref.get('node_title') or ''}",
+        ])
+    lines.append("</canvas_agent_context>")
+    return "\n".join(lines)
+
+
+def _codex_agent_file_view_url(path: str) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if text.startswith(("http://", "https://", "data:")):
+        return text
+    return "/api/codex-agent/file/view?path=" + urllib.parse.quote(text)
+
+
+def _codex_agent_parse_ref_context(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    raw = str(text or "")
+    refs: List[Dict[str, Any]] = []
+    if "<canvas_agent_context>" not in raw or "</canvas_agent_context>" not in raw:
+        return raw, refs
+
+    before, rest = raw.split("<canvas_agent_context>", 1)
+    ctx, after = rest.split("</canvas_agent_context>", 1)
+    current: Optional[Dict[str, Any]] = None
+    for line in ctx.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- id:"):
+            if current:
+                refs.append(current)
+            current = {"refId": stripped.split(":", 1)[1].strip()}
+            continue
+        if current is not None and ":" in stripped:
+            key, value = stripped.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "name":
+                current["name"] = value
+            elif key == "kind":
+                current["kind"] = value
+            elif key == "local_path":
+                current["local_path"] = value
+            elif key == "source_path":
+                current["source_path"] = value
+            elif key == "canvas_kind":
+                current["canvasKind"] = value
+            elif key == "node_id":
+                current["nodeId"] = value
+            elif key == "image_index":
+                current["imageIndex"] = value
+            elif key == "node_title":
+                current["nodeTitle"] = value
+    if current:
+        refs.append(current)
+
+    for index, ref in enumerate(refs, 1):
+        path = str(ref.get("source_path") or ref.get("local_path") or "").strip()
+        ref["url"] = _codex_agent_file_view_url(path)
+        ref["refId"] = str(ref.get("refId") or f"ref_{index}")
+        ref["name"] = str(ref.get("name") or os.path.basename(path) or f"图{index}")
+        ref["kind"] = str(ref.get("kind") or _codex_agent_media_kind_from_ref(ref, path) or "image")
+
+    clean = before + after
+    marker = "用户请求："
+    if marker in clean:
+        clean = clean.split(marker, 1)[1]
+    return clean.strip(), refs
 
 
 async def _to_inline_data_url(url: str, client: Optional[httpx.AsyncClient] = None) -> str:
@@ -16930,7 +17218,7 @@ class CodexAgentBoardCloseRequest(BaseModel):
 class CodexAgentTurnRequest(BaseModel):
     project_dir: str
     text: str
-    attachments: Optional[List[str]] = None  # URL 或本地路径列表
+    attachments: Optional[List[Any]] = None  # URL、本地路径，或 {url,name,nodeId,...}
 
 
 @app.post("/api/codex-agent/board/open")
@@ -16985,28 +17273,36 @@ async def codex_agent_turn(payload: CodexAgentTurnRequest):
     if not sess or not sess.thread_id:
         raise HTTPException(status_code=400, detail=f"项目 session 未打开: {payload.project_dir}")
 
-    # 处理 attachments：把所有形式（file:// / 本地路径 / HTTP URL）转成
-    # Codex app-server 期望的 inline data URL（base64），因为 Codex 明确不支持 remote URL。
-    refs: List[str] = []
+    # 处理 attachments：把所有形式（file:// / 本地路径 / HTTP URL / data URL）转成
+    # Codex app-server 稳定支持的本地 localImage 路径。
+    refs: List[Dict[str, Any]] = []
     ref_errors: List[str] = []
     if payload.attachments:
         async with httpx.AsyncClient() as client:
-            for url in payload.attachments:
+            for item in payload.attachments:
                 try:
-                    data_url = await _to_inline_data_url(url, client)
-                    refs.append(data_url)
+                    refs.append(await _codex_agent_prepare_local_image(item, payload.project_dir, client))
                 except Exception as e:
-                    ref_errors.append(f"{url}: {e}")
+                    ref_errors.append(f"{item}: {e}")
+
+    image_refs = [ref for ref in refs if str(ref.get("kind") or "image").lower() == "image"]
+    context_text = _codex_agent_ref_context_text(payload.project_dir, refs)
+    turn_text = f"{context_text}\n\n用户请求：\n{payload.text}" if context_text else payload.text
 
     async def event_stream():
         for err in ref_errors:
             data = json.dumps({"method": "error", "params": {"message": f"ref download failed: {err}"}}, ensure_ascii=False)
             yield f"data: {data}\n\n"
         try:
-            async for event in sess.send_user_message(payload.text, refs):
+            async for event in sess.send_user_message(turn_text, image_refs):
                 data = json.dumps(event, ensure_ascii=False)
                 yield f"data: {data}\n\n"
         except Exception as e:
+            if isinstance(e, HTTPException) and e.status_code == 504:
+                with _codex_agent_lock:
+                    stale = _codex_agent_sessions.pop(payload.project_dir, None)
+                if stale:
+                    await stale.stop()
             err = {"method": "error", "params": {"message": str(e)}}
             yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
         finally:
@@ -17072,7 +17368,14 @@ async def codex_agent_threads_replay(session_id: str = ""):
                             if isinstance(c, dict) and c.get("type") == "input_text":
                                 txt = str(c.get("text", ""))
                                 if txt and "<environment_context>" not in txt and "<app-context>" not in txt and "<permissions instructions>" not in txt and "<collaboration_mode>" not in txt and "<skills_instructions>" not in txt and "<plugins_instructions>" not in txt:
-                                    messages.append({"role": "user", "blocks": [{"type": "text", "text": txt}]})
+                                    clean_txt, refs = _codex_agent_parse_ref_context(txt)
+                                    blocks = []
+                                    if refs:
+                                        blocks.append({"type": "attach", "items": refs})
+                                    if clean_txt:
+                                        blocks.append({"type": "text", "text": clean_txt})
+                                    if blocks:
+                                        messages.append({"role": "user", "blocks": blocks})
                                     current_bot = None
                                     break
                     # 注意：assistant role 的 response_item 里也有 output_text，
@@ -17080,7 +17383,26 @@ async def codex_agent_threads_replay(session_id: str = ""):
 
                 elif ptype == "event_msg":
                     etype = str(payload.get("type", ""))
-                    if etype == "agent_message":
+                    if etype == "user_message":
+                        txt = str(payload.get("message") or "")
+                        clean_txt, refs = _codex_agent_parse_ref_context(txt)
+                        if clean_txt or refs:
+                            if messages and messages[-1].get("role") == "user":
+                                prev_text = ""
+                                for b in messages[-1].get("blocks") or []:
+                                    if b.get("type") == "text":
+                                        prev_text = str(b.get("text") or "")
+                                        break
+                                if prev_text == clean_txt:
+                                    continue
+                            blocks = []
+                            if refs:
+                                blocks.append({"type": "attach", "items": refs})
+                            if clean_txt:
+                                blocks.append({"type": "text", "text": clean_txt})
+                            messages.append({"role": "user", "blocks": blocks})
+                            current_bot = None
+                    elif etype == "agent_message":
                         if current_bot is None:
                             current_bot = {"role": "bot", "blocks": []}
                             messages.append(current_bot)

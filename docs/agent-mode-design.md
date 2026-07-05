@@ -140,7 +140,10 @@ GET  /api/codex-agent/file/view?path=...   静态文件服务（暴露 Codex 生
 [1] 用户在侧栏聊天框说"画一只猫"
 [2] 前端 POST /api/codex-agent/turn { text, project_dir, attachments: [选中节点图 URL] }
 [3] 后端：
-    - 把图 URL 下载到 <project_dir>/.codex-refs/xxx.png (作为 Codex 可读路径)
+    - 把图 URL 复制/下载到系统临时缓存 infinite-canvas-codex-agent/refs/<project_hash>/xxx.png (作为 Codex 可读路径)
+      - 默认位于 tempfile.gettempdir() 下，避免污染 NAS/同步盘项目目录
+      - 可用 CODEX_AGENT_REF_CACHE_DIR 指定固定缓存根目录
+      - 可用 CODEX_AGENT_REF_TTL_HOURS 调整自动清理时间，默认 168 小时
     - 启动 codex app-server (cwd = project_dir)
     - 发 thread/start → 拿 threadId
     - 发 user message (text + image refs)
@@ -189,7 +192,7 @@ GET  /api/codex-agent/file/view?path=...   静态文件服务（暴露 Codex 生
 
 ### 阶段 4：附件 + 画布节点引用（1 天）
 - [ ] Composer 附件按钮 + 选中节点 badge
-- [ ] 后端下载 ref 图到 `<project_dir>/.codex-refs/`
+- [ ] 后端下载 ref 图到系统临时缓存 `infinite-canvas-codex-agent/refs/<project_hash>/`
 - [ ] 把图路径作为 user message 的 image refs 发给 Codex
 
 ### 阶段 5：流式块渲染（1-2 天）
