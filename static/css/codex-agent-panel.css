@@ -318,11 +318,23 @@ body.cm-resizing {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 10px;
 }
+.cm-code-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
 .cm-code-lang {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+.cm-code-summary {
+    flex-shrink: 0;
+    opacity: .72;
+    font-family: var(--font-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+    font-size: 10px;
 }
 .cm-code-actions {
     display: inline-flex;
@@ -332,6 +344,7 @@ body.cm-resizing {
 }
 .cm-code-copy,
 .cm-code-expand,
+.cm-code-toggle,
 .cm-code-modal-copy,
 .cm-code-modal-close {
     border: 1px solid var(--line, #e8edf3);
@@ -343,14 +356,30 @@ body.cm-resizing {
     line-height: 1.4;
     cursor: pointer;
 }
+.cm-code-actions .cm-icon-btn {
+    width: 24px;
+    height: 24px;
+    display: inline-grid;
+    place-items: center;
+    padding: 0;
+    font-size: 13px;
+    line-height: 1;
+}
+.cm-code-toggle.cm-icon-btn {
+    font-size: 12px;
+    line-height: 1;
+    text-align: center;
+}
 .cm-code-copy:hover:not(:disabled),
 .cm-code-expand:hover:not(:disabled),
+.cm-code-toggle:hover:not(:disabled),
 .cm-code-modal-copy:hover:not(:disabled),
 .cm-code-modal-close:hover:not(:disabled) {
     background: var(--soft, #f8fafc);
 }
 .cm-code-copy:disabled,
 .cm-code-expand:disabled,
+.cm-code-toggle:disabled,
 .cm-code-modal-copy:disabled,
 .cm-code-modal-close:disabled {
     opacity: .72;
@@ -365,6 +394,12 @@ body.cm-resizing {
     white-space: pre-wrap;
     word-break: break-word;
     overflow-wrap: anywhere;
+}
+.cm-code-block.cm-code-collapsed .cm-code-head {
+    border-bottom: 0;
+}
+.cm-code-block.cm-code-collapsed pre {
+    display: none !important;
 }
 .cm-code-block pre code {
     display: block;
@@ -893,6 +928,10 @@ body.cm-resizing {
 }
 .cm-send:hover:not(:disabled) { opacity: 0.85; }
 .cm-send:disabled { opacity: 0.5; cursor: not-allowed; }
+.cm-send.cm-send-stop {
+    background: #ef4444;
+    color: #fff;
+}
 
 /* ---- 下拉浮窗 ---- */
 .cm-popover {
@@ -1161,6 +1200,8 @@ body.theme-dark .cm-code-copy,
 body.studio-theme-dark .cm-code-copy,
 body.theme-dark .cm-code-expand,
 body.studio-theme-dark .cm-code-expand,
+body.theme-dark .cm-code-toggle,
+body.studio-theme-dark .cm-code-toggle,
 body.theme-dark .cm-code-modal-copy,
 body.studio-theme-dark .cm-code-modal-copy,
 body.theme-dark .cm-code-modal-close,
@@ -1173,6 +1214,8 @@ body.theme-dark .cm-code-copy:hover:not(:disabled),
 body.studio-theme-dark .cm-code-copy:hover:not(:disabled),
 body.theme-dark .cm-code-expand:hover:not(:disabled),
 body.studio-theme-dark .cm-code-expand:hover:not(:disabled),
+body.theme-dark .cm-code-toggle:hover:not(:disabled),
+body.studio-theme-dark .cm-code-toggle:hover:not(:disabled),
 body.theme-dark .cm-code-modal-copy:hover:not(:disabled),
 body.studio-theme-dark .cm-code-modal-copy:hover:not(:disabled),
 body.theme-dark .cm-code-modal-close:hover:not(:disabled),

@@ -38,6 +38,10 @@
   let currentReasoningId = null;
   let currentReasoningText = '';
   let currentToolId = null;
+  let pendingCanvasActionPromises = [];
+  let currentTurnAbortController = null;
+  let currentStreamReader = null;
+  let turnStopRequested = false;
   let busyTimer = null;
   const addedImagePaths = new Set();
   const executedCanvasActionKeys = new Set();
@@ -214,6 +218,9 @@
     state.status = status;
     state.busyStartedAt = 0;
     state.busyLabel = '';
+    currentTurnAbortController = null;
+    currentStreamReader = null;
+    turnStopRequested = false;
     if (busyTimer) {
       clearInterval(busyTimer);
       busyTimer = null;
@@ -537,6 +544,12 @@
     addLoopNodes(items, options = {}) {
       return addLoopNodesToCanvas(items, options);
     },
+    generateImageNodes(items, options = {}) {
+      return generateImageNodesToCanvas(items, options);
+    },
+    generateVideoNodes(items, options = {}) {
+      return generateVideoNodesToCanvas(items, options);
+    },
   };
   window.CanvasAgentBridge = CanvasAgentBridge;
 
@@ -665,6 +678,126 @@
       return window.SmartCanvasAgentApi.addLoopNodes(list, options) || [];
     }
     return [];
+  }
+
+  async function generateImageNodesToCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items])
+      .map(item => typeof item === 'string' ? { prompt: item } : item)
+      .map(normalizeCanvasGenerateItem)
+      .filter(item => item && (item.prompt || item.text));
+    if (!list.length) return [];
+    if (window.SmartCanvasAgentApi?.generateImageNodes) {
+      return await window.SmartCanvasAgentApi.generateImageNodes(list, normalizeCanvasActionOptions(options)) || [];
+    }
+    throw new Error('当前画布还不支持 Agent 生图');
+  }
+
+  async function generateVideoNodesToCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items])
+      .map(item => typeof item === 'string' ? { prompt: item } : item)
+      .map(normalizeCanvasGenerateItem)
+      .filter(item => item && (item.prompt || item.text));
+    if (!list.length) return [];
+    if (window.SmartCanvasAgentApi?.generateVideoNodes) {
+      return await window.SmartCanvasAgentApi.generateVideoNodes(list, normalizeCanvasActionOptions(options)) || [];
+    }
+    throw new Error('当前画布还不支持 Agent 生视频');
+  }
+
+  function attachmentIndexFromRef(value) {
+    const text = safeStr(value).trim();
+    if (!text) return -1;
+    let m = text.match(/^@?ref[_-]?(\d+)$/i) || text.match(/^@?图\s*(\d+)$/);
+    if (m) return Math.max(0, Number(m[1]) - 1);
+    const zh = { 一:1, 二:2, 两:2, 三:3, 四:4, 五:5, 六:6, 七:7, 八:8, 九:9, 十:10 };
+    m = text.match(/^@?(?:第)?([一二两三四五六七八九十])张?图?$/);
+    if (m && zh[m[1]]) return zh[m[1]] - 1;
+    m = text.match(/^@?图([一二两三四五六七八九十])$/);
+    if (m && zh[m[1]]) return zh[m[1]] - 1;
+    return -1;
+  }
+
+  function attachmentForRef(value) {
+    const idx = attachmentIndexFromRef(value);
+    if (idx < 0) return null;
+    return currentTurnAttachments[idx] || state.attachments[idx] || null;
+  }
+
+  function normalizeCanvasReference(ref) {
+    if (!ref) return null;
+    if (typeof ref === 'string') {
+      const attachment = attachmentForRef(ref);
+      if (attachment) return { ...attachment };
+      return { url: ref, name: extractName(ref) || ref, kind: mediaKindFromUrl(ref, 'image') };
+    }
+    const data = { ...ref };
+    const raw = safeStr(data.url || data.path || data.src || data.ref || data.refId || data.ref_id).trim();
+    const attachment = attachmentForRef(raw || data.refId || data.ref_id);
+    if (attachment) {
+      const rawIsAttachmentRef = attachmentIndexFromRef(raw) >= 0;
+      return {
+        ...attachment,
+        ...data,
+        url: rawIsAttachmentRef ? attachment.url : (data.url || data.path || data.src || attachment.url),
+        name: data.name || attachment.name,
+        kind: data.kind || attachment.kind || 'image',
+      };
+    }
+    if (!raw) return null;
+    return {
+      ...data,
+      url: data.url || data.path || data.src || raw,
+      name: data.name || extractName(raw) || 'reference',
+      kind: data.kind || mediaKindFromUrl(raw, 'image'),
+    };
+  }
+
+  function normalizeCanvasReferences(refs) {
+    return (Array.isArray(refs) ? refs : [refs]).map(normalizeCanvasReference).filter(ref => ref?.url);
+  }
+
+  function referenceTokensFromText(text) {
+    const refs = [];
+    const seen = new Set();
+    safeStr(text).replace(/@?ref[_-]?(\d+)|@?图\s*(\d+)/gi, (_all, a, b) => {
+      const idx = Math.max(0, Number(a || b) - 1);
+      if (!Number.isFinite(idx) || seen.has(idx)) return '';
+      const item = currentTurnAttachments[idx] || state.attachments[idx];
+      if (item) {
+        seen.add(idx);
+        refs.push({ ...item });
+      }
+      return '';
+    });
+    return refs;
+  }
+
+  function normalizeCanvasActionOptions(options = {}) {
+    const data = options && typeof options === 'object' ? { ...options } : {};
+    const refs = normalizeCanvasReferences(data.reference_images || data.references || data.refs || []);
+    if (refs.length) {
+      data.reference_images = refs;
+      delete data.references;
+      delete data.refs;
+    }
+    return data;
+  }
+
+  function normalizeCanvasGenerateItem(item) {
+    if (!item) return null;
+    const data = { ...item };
+    const explicitRefs = normalizeCanvasReferences(data.reference_images || data.references || data.refs || data.ref || data.refId || data.ref_id || []);
+    const textRefs = explicitRefs.length ? [] : referenceTokensFromText(data.prompt || data.text || '');
+    const refs = explicitRefs.length ? explicitRefs : textRefs;
+    if (refs.length) {
+      data.reference_images = refs;
+      delete data.references;
+      delete data.refs;
+      delete data.ref;
+      delete data.refId;
+      delete data.ref_id;
+    }
+    return data;
   }
 
   function normalizeAttachmentRefs() {
@@ -984,6 +1117,7 @@
 
   // 临时提示（不弹窗，用底部 hint 区）
   let hintTimer = null;
+  let currentTurnAttachments = [];
   function showHint(msg, ms = 4000) {
     const hint = $('#cm-hint');
     if (!hint) return;
@@ -997,15 +1131,20 @@
   }
 
   async function onSend() {
+    if (state.status === 'busy') {
+      stopCurrentTurn();
+      return;
+    }
     const input = $('#cm-input');
     const text = inputText().trim();
-    if (!text || !state.projectDir || state.status === 'busy') return;
+    if (!text || !state.projectDir) return;
 
     // 收集 attachments（深拷贝后清空）
     const attachments = state.attachments.map((a, index) => ({
       ...a,
       refId: a.refId || `ref_${index + 1}`,
     }));
+    currentTurnAttachments = attachments.map(item => ({ ...item }));
     state.attachments = [];
     renderAttach();
 
@@ -1028,12 +1167,16 @@
     currentReasoningId = null;
     currentReasoningText = '';
     currentToolId = null;
+    pendingCanvasActionPromises = [];
+    turnStopRequested = false;
+    currentTurnAbortController = new AbortController();
 
     try {
       const r = await fetch('/api/codex-agent/turn', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_dir: state.projectDir, text, attachments }),
+        body: JSON.stringify({ project_dir: state.projectDir, text, attachments, canvas_context: CanvasAgentBridge.getContext() }),
+        signal: currentTurnAbortController.signal,
       });
       if (!r.ok) {
         const d = await r.json().catch(() => ({}));
@@ -1041,9 +1184,11 @@
       }
       updateBusy('等待 Codex 响应');
       const reader = r.body.getReader();
+      currentStreamReader = reader;
       const decoder = new TextDecoder();
       let buf = '';
       while (true) {
+        if (turnStopRequested) break;
         const { done, value } = await reader.read();
         if (done) break;
         buf += decoder.decode(value, { stream: true });
@@ -1054,11 +1199,28 @@
           parseSSEBlock(block, botMsg);
         }
       }
+      if (!turnStopRequested && pendingCanvasActionPromises.length) {
+        await Promise.allSettled(pendingCanvasActionPromises);
+      }
+      if (turnStopRequested) {
+        botMsg.blocks.push({ type: 'tool', text: '已停止当前回复', status: 'done' });
+        renderBody();
+      }
     } catch (e) {
-      botMsg.blocks.push({ type: 'error', text: safeStr(e.message || e) });
+      botMsg.blocks.push(turnStopRequested || e?.name === 'AbortError'
+        ? { type: 'tool', text: '已停止当前回复', status: 'done' }
+        : { type: 'error', text: safeStr(e.message || e) });
       renderBody();
     }
+    currentTurnAttachments = [];
     finishBusy('ready');
+  }
+
+  function stopCurrentTurn() {
+    turnStopRequested = true;
+    updateBusy('正在停止');
+    try { currentTurnAbortController?.abort(); } catch {}
+    try { currentStreamReader?.cancel?.(); } catch {}
   }
 
   function parseSSEBlock(block, botMsg) {
@@ -1140,8 +1302,9 @@
         if (blk.type === 'text') {
           blk.text = safeStr(item.text) || blk.text;
           blk.streaming = false;
-          executeCanvasActionsFromText(blk.text, botMsg);
-          blk.text = stripCanvasActionBlocks(blk.text);
+          const actionPromise = executeCanvasActionsFromText(blk.text, botMsg);
+          pendingCanvasActionPromises.push(actionPromise);
+          blk.text = cleanAgentDisplayText(blk.text);
         } else if (blk.type === 'image') {
           blk.path = safeStr(item.savedPath) || safeStr(item.path) || blk.path;
           blk.status = 'done';
@@ -1230,34 +1393,79 @@
       .trim();
   }
 
-  function executeCanvasActionsFromText(text, botMsg) {
+  function stripInternalContextBlocks(text) {
+    return safeStr(text)
+      .replace(/<skill\b[\s\S]*?<\/skill>/gi, '')
+      .replace(/<(?:environment_context|app-context|permissions instructions|collaboration_mode|skills_instructions|plugins_instructions)>[\s\S]*?<\/(?:environment_context|app-context|permissions instructions|collaboration_mode|skills_instructions|plugins_instructions)>/gi, '')
+      .trim();
+  }
+
+  function cleanAgentDisplayText(text) {
+    return stripInternalContextBlocks(stripCanvasActionBlocks(text));
+  }
+
+  async function executeCanvasActionsFromText(text, botMsg) {
     const blocks = extractCanvasActionBlocks(text);
     if (!blocks.length) return;
     let totalCreated = 0;
-    blocks.forEach(raw => {
+    for (const raw of blocks) {
+      if (turnStopRequested) break;
       const key = raw;
-      if (executedCanvasActionKeys.has(key)) return;
+      if (executedCanvasActionKeys.has(key)) continue;
       executedCanvasActionKeys.add(key);
       let payload = null;
       try { payload = JSON.parse(raw); } catch (e) {
         botMsg.blocks.push({ type: 'error', text: '画布动作 JSON 解析失败：' + safeStr(e.message || e) });
-        return;
+        renderBody();
+        continue;
       }
       const actions = Array.isArray(payload) ? payload : (Array.isArray(payload.actions) ? payload.actions : [payload]);
-      actions.forEach(action => {
-        const created = executeCanvasAction(action || {});
-        totalCreated += Array.isArray(created) ? created.length : (created ? 1 : 0);
-      });
-    });
+      for (const action of actions) {
+        if (turnStopRequested) break;
+        try {
+          const created = await executeCanvasAction(action || {});
+          totalCreated += Array.isArray(created) ? created.length : (created ? 1 : 0);
+        } catch (e) {
+          botMsg.blocks.push({ type: 'error', text: '画布动作执行失败：' + safeStr(e.message || e) });
+          renderBody();
+        }
+      }
+    }
     if (totalCreated > 0) {
       botMsg.blocks.push({ type: 'tool', text: `已执行画布动作，新增 ${totalCreated} 个节点`, status: 'done' });
       showHint(`已执行画布动作，新增 ${totalCreated} 个节点`);
+      renderBody();
     }
   }
 
-  function executeCanvasAction(action) {
+  async function executeCanvasAction(action) {
     const type = safeStr(action.type || action.action).toLowerCase().replace(/-/g, '_');
     const options = action.options || {};
+    if (type === 'remember_preference' || type === 'remember_preferences' || type === 'save_preference') {
+      const note = safeStr(action.note || action.text || action.content || action.preference);
+      if (!note) return [];
+      const res = await fetch('/api/codex-agent/preferences/remember', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note }),
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(text || '保存偏好失败');
+      }
+      showHint('已记住画布偏好');
+      return [];
+    }
+    if (type === 'generate_image' || type === 'generate_images' || type === 'create_image' || type === 'create_images') {
+      updateBusy('正在画布生图');
+      const items = action.items || action.prompts || action.images || [action];
+      return await generateImageNodesToCanvas(items, options);
+    }
+    if (type === 'generate_video' || type === 'generate_videos' || type === 'create_video' || type === 'create_videos') {
+      updateBusy('正在画布生视频');
+      const items = action.items || action.prompts || action.videos || [action];
+      return await generateVideoNodesToCanvas(items, options);
+    }
     if (type === 'add_media' || type === 'add_image' || type === 'add_video' || type === 'add_media_nodes') {
       const items = action.items || action.media || action.images || action.videos || [action];
       return addMediaNodesToCanvas(items, options);
@@ -1271,11 +1479,12 @@
       return addLoopNodesToCanvas(items, options);
     }
     if (type === 'add_nodes') {
-      const nodes = Array.isArray(action.nodes) ? action.nodes : [];
+      const nodes = Array.isArray(action.nodes) ? action.nodes : (Array.isArray(action.items) ? action.items : []);
       const created = [];
-      const media = nodes.filter(node => ['image', 'video', 'media', 'smart-image'].includes(safeStr(node.type).toLowerCase()));
-      const prompts = nodes.filter(node => ['prompt', 'text', 'smart-prompt'].includes(safeStr(node.type).toLowerCase()));
-      const loops = nodes.filter(node => ['loop', 'smart-loop'].includes(safeStr(node.type).toLowerCase()));
+      const nodeKind = node => safeStr(node.type || node.kind).toLowerCase().replace(/-/g, '_');
+      const media = nodes.filter(node => ['image', 'video', 'media', 'smart_image'].includes(nodeKind(node)));
+      const prompts = nodes.filter(node => ['prompt', 'text', 'smart_prompt', 'jimeng'].includes(nodeKind(node)));
+      const loops = nodes.filter(node => ['loop', 'smart_loop'].includes(nodeKind(node)));
       created.push(...addMediaNodesToCanvas(media, options));
       created.push(...addPromptNodesToCanvas(prompts, options));
       created.push(...addLoopNodesToCanvas(loops, options));
@@ -1303,10 +1512,12 @@
 
     const input = $('#cm-input');
     const send = $('#cm-send');
-    const enabled = !!state.projectDir && state.status !== 'busy';
+    const enabled = !!state.projectDir;
     input.contentEditable = state.projectDir ? 'true' : 'false';
     input.classList.toggle('cm-input-disabled', !state.projectDir);
     send.disabled = !enabled;
+    send.textContent = state.status === 'busy' ? '停止' : '发送';
+    send.classList.toggle('cm-send-stop', state.status === 'busy');
 
     const hint = $('#cm-hint');
     hint.classList.toggle('cm-foot-hint-busy', state.status === 'busy');
@@ -1351,17 +1562,22 @@
       html += `<div class="cm-msg-user">${escapeHtml(normalized.text)}</div>`;
       return `<div class="cm-msg">${html}</div>`;
     }
-    return `<div class="cm-msg">${msg.blocks.map(renderBlock).join('')}</div>`;
+    const blocksHtml = msg.blocks.map(renderBlock).filter(Boolean).join('');
+    return `<div class="cm-msg">${blocksHtml}</div>`;
   }
 
   function normalizeUserDisplayText(text) {
-    const raw = safeStr(text);
+    const raw = stripInternalContextBlocks(text);
     const refs = [];
     if (!raw.includes('canvas_agent_context')) return { text: raw, refs };
 
-    const refRe = /-\s*id:\s*([^\n]+)([\s\S]*?)(?=\n-\s*id:|\n<\/canvas_agent_context>|$)/g;
+    let selectedCtx = raw.includes('selected_refs:') ? raw.split('selected_refs:', 2)[1] : '';
+    ['\ncurrent_canvas_image_generation_defaults:', '\navailable_image_providers:', '\ncurrent_canvas_video_generation_defaults:', '\navailable_video_providers:'].forEach(marker => {
+      if (selectedCtx.includes(marker)) selectedCtx = selectedCtx.split(marker, 1)[0];
+    });
+    const refRe = /-\s*id:\s*([^\n]+)([\s\S]*?)(?=\n-\s*id:|$)/g;
     let m;
-    while ((m = refRe.exec(raw)) !== null) {
+    while ((m = refRe.exec(selectedCtx)) !== null) {
       const block = m[2] || '';
       const get = (key) => {
         const hit = block.match(new RegExp(`\\n\\s*${key}:\\s*([^\\n]*)`));
@@ -1369,7 +1585,9 @@
       };
       const sourcePath = get('source_path');
       const localPath = get('local_path');
-      const path = sourcePath || localPath;
+      const url = get('url');
+      const path = sourcePath || localPath || url;
+      if (!path) continue;
       refs.push({
         refId: m[1].trim(),
         name: get('name') || extractName(path),
@@ -1408,10 +1626,13 @@
   function renderBlock(b) {
     const type = b.type;
     if (type === 'text') {
-      return `<div class="cm-msg-bot cm-md">${renderMarkdown(safeStr(b.text))}${b.streaming ? '<span class="cm-stream-caret"> ▍</span>' : ''}</div>`;
+      const text = cleanAgentDisplayText(safeStr(b.text));
+      if (!text) return '';
+      return `<div class="cm-msg-bot cm-md">${renderMarkdown(text)}${b.streaming ? '<span class="cm-stream-caret"> ▍</span>' : ''}</div>`;
     }
     if (type === 'thinking') {
-      const t = safeStr(b.text);
+      const t = cleanAgentDisplayText(safeStr(b.text));
+      if (!t) return '';
       const truncated = t.length > 200 ? '…' + t.slice(-200) : t;
       return `<div class="cm-thinking" title="${escapeAttr(t)}">${escapeHtml(truncated)}</div>`;
     }
@@ -1461,6 +1682,19 @@
         if (code) openCodeModal(code, label);
       });
     });
+    root.querySelectorAll('.cm-code-toggle').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const box = btn.closest('.cm-code-block');
+        if (!box) return;
+        const willCollapse = !box.classList.contains('cm-code-collapsed');
+        box.classList.toggle('cm-code-collapsed', willCollapse);
+        btn.textContent = willCollapse ? '▾' : '▴';
+        btn.title = willCollapse ? '展开代码块' : '收起代码块';
+        btn.setAttribute('aria-expanded', willCollapse ? 'false' : 'true');
+      });
+    });
   }
 
   async function copyTextFromButton(btn, text) {
@@ -1475,10 +1709,10 @@
 
   function setCopyButtonState(btn, text) {
     const old = btn.textContent;
-    btn.textContent = text;
+    btn.textContent = text === '已复制' ? '✓' : text === '复制失败' ? '!' : text;
     btn.disabled = true;
     setTimeout(() => {
-      btn.textContent = old || '复制';
+      btn.textContent = old || '⧉';
       btn.disabled = false;
     }, 1200);
   }
@@ -1520,15 +1754,22 @@
 
   function renderCodeBlock(code, lang) {
     const label = safeStr(lang).trim().split(/\s+/)[0] || 'code';
-    return `<div class="cm-code-block">
+    const clean = code.replace(/\n$/, '');
+    const lineCount = clean ? clean.split('\n').length : 0;
+    const summary = `${lineCount || 1} 行 · ${clean.length} 字符`;
+    return `<div class="cm-code-block cm-code-collapsed">
       <div class="cm-code-head">
-        <span class="cm-code-lang">${escapeHtml(label)}</span>
+        <span class="cm-code-title">
+          <span class="cm-code-lang">${escapeHtml(label)}</span>
+          <span class="cm-code-summary">${escapeHtml(summary)}</span>
+        </span>
         <span class="cm-code-actions">
-          <button type="button" class="cm-code-expand" title="放大查看">放大</button>
-          <button type="button" class="cm-code-copy">复制</button>
+          <button type="button" class="cm-code-toggle cm-icon-btn" aria-expanded="false" title="展开代码块">▾</button>
+          <button type="button" class="cm-code-expand cm-icon-btn" title="放大查看">⛶</button>
+          <button type="button" class="cm-code-copy cm-icon-btn" title="复制">⧉</button>
         </span>
       </div>
-      <pre><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>
+      <pre><code>${escapeHtml(clean)}</code></pre>
     </div>`;
   }
 

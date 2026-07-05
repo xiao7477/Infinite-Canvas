@@ -5998,6 +5998,412 @@ function smartAgentMediaItem(item){
     if(source.prompt) image.prompt = String(source.prompt || '');
     return image;
 }
+function smartAgentImageRefs(refs=[]){
+    return (Array.isArray(refs) ? refs : [refs]).map(ref => {
+        if(!ref) return null;
+        if(typeof ref === 'string') {
+            const url = smartAgentLocalAssetUrl(ref);
+            return {url, name:smartImageNameFromUrl(url) || 'reference', kind:'image'};
+        }
+        const url = smartAgentLocalAssetUrl(ref.url || ref.path || ref.src || '');
+        if(!url) return null;
+        return {
+            url,
+            name:ref.name || smartImageNameFromUrl(url) || 'reference',
+            role:ref.role || '',
+            kind:ref.kind || mediaKindForItem(ref) || 'image',
+            mime:ref.mime || '',
+            nodeId:ref.nodeId || ref.node_id || '',
+            imageIndex:ref.imageIndex ?? ref.image_index ?? '',
+            canvasKind:ref.canvasKind || ref.canvas_kind || ''
+        };
+    }).filter(ref => ref?.url).slice(0, SMART_REFERENCE_IMAGE_MAX);
+}
+function smartAgentLocalAssetUrl(value=''){
+    const raw = String(value || '').trim();
+    if(!raw) return '';
+    if(raw.startsWith('/assets/') || raw.startsWith('/output/')) return raw;
+    if(/^https?:\/\//i.test(raw)){
+        try {
+            const u = new URL(raw, window.location.href);
+            if(u.origin === window.location.origin && (u.pathname.startsWith('/assets/') || u.pathname.startsWith('/output/'))){
+                return `${u.pathname}${u.search || ''}`;
+            }
+        } catch {}
+    }
+    return raw;
+}
+function smartAgentConnectReferenceNodes(targetNode, refs=[]){
+    if(!targetNode?.id) return [];
+    const connected = [];
+    const seen = new Set();
+    (Array.isArray(refs) ? refs : [refs]).forEach(ref => {
+        const sourceId = String(ref?.nodeId || ref?.node_id || '').trim();
+        if(!sourceId || sourceId === targetNode.id || seen.has(sourceId)) return;
+        if(connectInputNode(sourceId, targetNode.id)){
+            seen.add(sourceId);
+            connected.push(sourceId);
+        }
+    });
+    return connected;
+}
+function smartAgentRunLog(node, prompt, refs, kind, runSettings, request={}){
+    return {
+        nodeId:node?.id || '',
+        nodeType:node?.type || 'smart-image',
+        kind,
+        settings:JSON.parse(JSON.stringify(runSettings || {})),
+        prompt:prompt || '',
+        refs:(refs || []).map(ref => ({url:ref.url || '', name:ref.name || 'image', kind:ref.kind || ''})).filter(ref => ref.url),
+        size:request.size || ''
+    };
+}
+function smartAgentProviderOptions(){
+    return imageProviders().map(provider => ({
+        id:provider.id || '',
+        name:provider.name || provider.id || '',
+        protocol:provider.protocol || '',
+        image_models:[...(provider.image_models || [])],
+        primary:Boolean(provider.primary)
+    })).filter(provider => provider.id);
+}
+function smartAgentVideoProviderOptions(){
+    return videoApiProviders().map(provider => ({
+        id:provider.id || '',
+        name:provider.name || provider.id || '',
+        protocol:provider.protocol || '',
+        video_models:[...(provider.video_models || [])],
+        primary:Boolean(provider.primary)
+    })).filter(provider => provider.id);
+}
+function smartAgentResolveProviderId(value=''){
+    const raw = String(value || '').trim();
+    const providers = imageProviders();
+    if(!providers.length) return settings.provider_id || '';
+    if(!raw) return settings.provider_id || providers[0].id || '';
+    const lower = raw.toLowerCase();
+    const exact = providers.find(provider => [provider.id, provider.name].some(text => String(text || '').toLowerCase() === lower));
+    if(exact) return exact.id;
+    const aliasTerms = lower.includes('gpt') || lower.includes('openai') || lower.includes('codex')
+        ? ['gpt', 'openai', 'codex']
+        : lower.includes('即梦') || lower.includes('jimeng')
+        ? ['即梦', 'jimeng']
+        : [lower];
+    const fuzzy = providers.find(provider => {
+        const hay = `${provider.id || ''} ${provider.name || ''} ${provider.protocol || ''} ${(provider.image_models || []).join(' ')}`.toLowerCase();
+        return aliasTerms.some(term => hay.includes(String(term).toLowerCase()));
+    });
+    return fuzzy?.id || raw;
+}
+function smartAgentResolveModel(value='', providerId=''){
+    const provider = apiProviderById(providerId);
+    const models = [...(provider?.image_models || [])];
+    const raw = String(value || '').trim();
+    if(!raw) return settings.provider_id === providerId && settings.model ? settings.model : (models[0] || settings.model || '');
+    if(models.includes(raw)) return raw;
+    const lower = raw.toLowerCase();
+    return models.find(model => String(model).toLowerCase() === lower)
+        || models.find(model => String(model).toLowerCase().includes(lower))
+        || raw;
+}
+function smartAgentResolveVideoProviderId(value=''){
+    const raw = String(value || '').trim();
+    const providers = videoApiProviders();
+    if(!providers.length) return settings.videoProvider || '';
+    if(!raw) return settings.videoProvider || providers[0].id || '';
+    const lower = raw.toLowerCase();
+    const exact = providers.find(provider => [provider.id, provider.name].some(text => String(text || '').toLowerCase() === lower));
+    if(exact) return exact.id;
+    const aliasTerms = lower.includes('即梦') || lower.includes('jimeng')
+        ? ['即梦', 'jimeng']
+        : lower.includes('gpt') || lower.includes('openai') || lower.includes('sora')
+        ? ['gpt', 'openai', 'sora']
+        : [lower];
+    const fuzzy = providers.find(provider => {
+        const hay = `${provider.id || ''} ${provider.name || ''} ${provider.protocol || ''} ${(provider.video_models || []).join(' ')}`.toLowerCase();
+        return aliasTerms.some(term => hay.includes(String(term).toLowerCase()));
+    });
+    return fuzzy?.id || raw;
+}
+function smartAgentResolveVideoModel(value='', providerId=''){
+    const models = [...providerVideoModels(providerId)];
+    const raw = String(value || '').trim();
+    if(!raw) return settings.videoProvider === providerId && settings.videoModel ? settings.videoModel : (models[0] || settings.videoModel || '');
+    if(models.includes(raw)) return raw;
+    const lower = raw.toLowerCase();
+    return models.find(model => String(model).toLowerCase() === lower)
+        || models.find(model => String(model).toLowerCase().includes(lower))
+        || raw;
+}
+function smartAgentVideoAspect(value=''){
+    const text = String(value || '').trim().toLowerCase();
+    if(!text) return settings.videoAspect || '16:9';
+    if(['16:9','wide','横版','横屏'].includes(text)) return '16:9';
+    if(['9:16','story','竖版','竖屏'].includes(text)) return '9:16';
+    if(['1:1','square','正方形'].includes(text)) return '1:1';
+    if(['4:3','landscape43'].includes(text)) return '4:3';
+    if(['3:4','portrait43'].includes(text)) return '3:4';
+    return text;
+}
+function smartAgentVideoResolution(value=''){
+    const text = String(value || '').trim().toLowerCase();
+    if(!text) return settings.videoResolution || '';
+    if(['720p','720','1k','标清'].includes(text)) return '720p';
+    if(['1080p','1080','2k','高清','hd'].includes(text)) return '1080p';
+    return text;
+}
+function smartAgentRatioKey(value=''){
+    const text = String(value || '').trim().toLowerCase();
+    if(!text) return '';
+    if(['1:1','square','正方形'].includes(text)) return 'square';
+    if(['16:9','wide','横版','横屏'].includes(text)) return 'wide';
+    if(['9:16','story','竖版','竖屏'].includes(text)) return 'story';
+    if(['3:2','landscape'].includes(text)) return 'landscape';
+    if(['2:3','portrait'].includes(text)) return 'portrait';
+    if(['4:3','landscape43'].includes(text)) return 'landscape43';
+    if(['3:4','portrait43'].includes(text)) return 'portrait43';
+    if(['21:9','ultrawide'].includes(text)) return 'ultrawide';
+    if(['9:21','ultratall'].includes(text)) return 'ultratall';
+    return '';
+}
+function smartAgentResolutionKey(value=''){
+    const text = String(value || '').trim().toLowerCase();
+    if(!text) return '';
+    if(['auto','自动'].includes(text)) return 'auto';
+    if(['1k','1024','720p','标清'].includes(text)) return '1k';
+    if(['2k','2048','高清','hd'].includes(text)) return '2k';
+    if(['4k','4096','超清','uhd'].includes(text)) return '4k';
+    return '';
+}
+function smartAgentQuality(value=''){
+    const text = String(value || '').trim().toLowerCase();
+    if(!text) return '';
+    if(['auto','自动'].includes(text)) return 'auto';
+    if(['low','低'].includes(text)) return 'low';
+    if(['medium','mid','中'].includes(text)) return 'medium';
+    if(['high','高清','高'].includes(text)) return 'high';
+    return text;
+}
+function smartAgentSizeForItem(item={}, options={}, providerId='', model=''){
+    const explicit = item.size || item.image_size || item.resolutionSize || options.size || options.image_size;
+    if(explicit && /^\d+\s*[xX*]\s*\d+$/.test(String(explicit).trim())) return String(explicit).replace(/\s+/g, '');
+    if(String(explicit || '').trim().toLowerCase() === 'auto') return 'auto';
+    const ratio = smartAgentRatioKey(item.ratio || item.aspect || item.aspect_ratio || options.ratio || options.aspect || options.aspect_ratio || explicit) || settings.ratio || 'square';
+    const resolution = smartAgentResolutionKey(item.resolution || item.quality_size || options.resolution || options.quality_size) || settings.resolution || (isGptImageAutoSizeModel(model) ? 'auto' : '1k');
+    if(resolution === 'custom') return item.customSize || options.customSize || settings.customSize || sizeForRun(settings);
+    return apiImageSize(ratio, resolution, item.customRatio || options.customRatio || settings.customRatio || '', item.customSize || options.customSize || settings.customSize || '') || sizeForRun(settings);
+}
+function smartAgentCreatePendingNode(prompt, payload, index, total, options={}){
+    const count = Math.max(1, Math.min(8, Number(payload.n || 1)));
+    const parsed = parseSizeValue(payload.size);
+    const pendingBox = parsed ? pendingBoxSize(count, {refs:payload.reference_images || []}) : pendingBoxSize(count, {refs:payload.reference_images || []});
+    if(parsed){
+        const display = displayBoxFromNaturalSize({w:Number(parsed.width) || 1024, h:Number(parsed.height) || 1024});
+        pendingBox.w = count <= 1 ? display.w : pendingBox.w;
+        pendingBox.h = count <= 1 ? display.h : pendingBox.h;
+    }
+    const point = smartAgentGridPoint(index, total, options);
+    const node = {
+        id:uid('smart'),
+        type:'smart-image',
+        x:Math.round(point.x - pendingBox.w / 2),
+        y:Math.round(point.y - pendingBox.h / 2),
+        title:options.kind === 'video' ? 'Video' : 'Image',
+        images:[],
+        pending:count,
+        runStartedAt:nowMs(),
+        runTimerHidden:false,
+        w:pendingBox.w,
+        h:pendingBox.h,
+        scale:MEDIA_NODE_DEFAULT_SCALE,
+        agentGenerated:true,
+        created_at:Date.now()
+    };
+    const meta = {
+        prompt,
+        displayPrompt:prompt,
+        promptHtml:escapeHtml(prompt),
+        promptText:prompt,
+        promptRefs:payload.reference_images || [],
+        inputRefs:payload.reference_images || [],
+        sourceNodeId:'',
+        settings:{
+            ...cloneSmartSettings(settings),
+            engine:'api',
+            apiKind:options.kind === 'video' ? 'video' : 'image',
+            provider_id:payload.provider_id,
+            model:payload.model,
+            customSize:payload.size,
+            quality:payload.quality,
+            count,
+            videoProvider:payload.provider_id,
+            videoModel:payload.model,
+            videoDuration:payload.duration,
+            videoAspect:payload.aspect_ratio,
+            videoResolution:payload.resolution,
+            videoCameraFixed:payload.camerafixed
+        },
+        createdAt:Date.now()
+    };
+    attachRunMeta(node, meta);
+    nodes.push(node);
+    return {node, meta};
+}
+async function smartAgentGenerateImageItems(items=[], options={}){
+    const list = (Array.isArray(items) ? items : [items]).map(item => typeof item === 'string' ? {prompt:item} : item).filter(item => item && String(item.prompt || item.text || '').trim());
+    if(!list.length) return [];
+    const baseOptions = options || {};
+    pushUndo();
+    const pendingNodes = [];
+    for(let itemIndex = 0; itemIndex < list.length; itemIndex++){
+        const item = list[itemIndex];
+        const prompt = String(item.prompt || item.text || '').trim();
+        const count = Math.max(1, Math.min(8, Number(item.n || item.count || baseOptions.n || baseOptions.count || 1)));
+        const providerId = smartAgentResolveProviderId(item.provider_id || item.providerId || item.provider || baseOptions.provider_id || baseOptions.providerId || baseOptions.provider);
+        const model = smartAgentResolveModel(item.model || baseOptions.model, providerId);
+        if(!providerId || !model) throw new Error(tr('smart.errNoApiModel'));
+        const refs = smartAgentImageRefs(item.reference_images || item.references || item.refs || baseOptions.reference_images || baseOptions.references || baseOptions.refs || []);
+        const payload = {
+            prompt,
+            provider_id:providerId,
+            model,
+            size:smartAgentSizeForItem(item, baseOptions, providerId, model),
+            quality:smartAgentQuality(item.quality || baseOptions.quality) || settings.quality || 'auto',
+            n:count,
+            reference_images:refs
+        };
+        const pending = smartAgentCreatePendingNode(prompt, payload, itemIndex, list.length, baseOptions);
+        smartAgentConnectReferenceNodes(pending.node, refs);
+        const runSettings = {
+            ...cloneSmartSettings(settings),
+            engine:'api',
+            apiKind:'image',
+            provider_id:payload.provider_id,
+            model:payload.model,
+            quality:payload.quality,
+            count,
+            customSize:payload.size
+        };
+        const runLog = smartAgentRunLog(pending.node, prompt, refs, 'image', runSettings, {size:payload.size});
+        const runLogStart = nowMs();
+        pendingNodes.push(pending.node.id);
+        selectedId = pending.node.id;
+        selectedIds = pendingNodes.length > 1 ? pendingNodes.slice() : [];
+        selectedImage = {nodeId:'', index:-1};
+        render();
+        scheduleSave();
+        const created = await fetch('/api/canvas-image-tasks', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify(payload)
+        }).then(async r => {
+            if(!r.ok) throw new Error(await r.text());
+            return r.json();
+        });
+        pending.node.pendingTasks = [{taskId:created.task_id, kind:'image', providerId:payload.provider_id, model:payload.model}];
+        render();
+        scheduleSave();
+        (async () => {
+            try {
+                const result = await pollSmartCanvasTask(created.task_id);
+                const outputs = resultMediaUrls(result?.image_items?.length ? result.image_items : (result?.images?.length ? result.images : result));
+                finalizePendingNode(pending.node, outputs, pending.meta, 'image');
+                addSmartGenerationLog({run:runLog, outputs, runMs:nowMs() - runLogStart});
+                render();
+                scheduleSave();
+            } catch(e) {
+                if(handleJimengPendingSignal(pending.node, e)) return;
+                pending.node.pending = 0;
+                pending.node.running = false;
+                pending.node.pendingTasks = (pending.node.pendingTasks || []).map(task => task.taskId === created.task_id ? {...task, failed:true, error:e.message || String(e)} : task);
+                addSmartGenerationLog({run:runLog, outputs:[], runMs:nowMs() - runLogStart, error:e.message || String(e)});
+                toast((e.message || tr('smart.errRunFailed')).slice(0, 160));
+                render();
+                scheduleSave();
+            }
+        })();
+    }
+    return pendingNodes.map(id => nodes.find(n => n.id === id)).filter(Boolean).map(smartAgentNodeSummary);
+}
+async function smartAgentGenerateVideoItems(items=[], options={}){
+    const list = (Array.isArray(items) ? items : [items]).map(item => typeof item === 'string' ? {prompt:item} : item).filter(item => item && String(item.prompt || item.text || '').trim());
+    if(!list.length) return [];
+    const baseOptions = options || {};
+    pushUndo();
+    const pendingNodes = [];
+    for(let itemIndex = 0; itemIndex < list.length; itemIndex++){
+        const item = list[itemIndex];
+        const prompt = String(item.prompt || item.text || '').trim();
+        const providerId = smartAgentResolveVideoProviderId(item.provider_id || item.providerId || item.provider || item.videoProvider || baseOptions.provider_id || baseOptions.providerId || baseOptions.provider || baseOptions.videoProvider);
+        const model = smartAgentResolveVideoModel(item.model || item.videoModel || baseOptions.model || baseOptions.videoModel, providerId);
+        if(!providerId || !model) throw new Error(tr('smart.errNoVideoModel'));
+        const refs = smartAgentImageRefs(item.reference_images || item.references || item.refs || item.images || baseOptions.reference_images || baseOptions.references || baseOptions.refs || []);
+        const duration = Math.max(1, Math.min(60, Number(item.duration || item.seconds || baseOptions.duration || baseOptions.seconds || settings.videoDuration || 5)));
+        const payload = {
+            prompt,
+            provider_id:providerId,
+            model,
+            duration,
+            aspect_ratio:smartAgentVideoAspect(item.aspect_ratio || item.aspect || item.ratio || baseOptions.aspect_ratio || baseOptions.aspect || baseOptions.ratio),
+            resolution:smartAgentVideoResolution(item.resolution || baseOptions.resolution),
+            reference_images:refs,
+            n:1,
+            camerafixed:item.camerafixed ?? item.camera_fixed ?? item.fixed_camera ?? baseOptions.camerafixed ?? baseOptions.camera_fixed ?? settings.videoCameraFixed,
+            generate_audio:item.generate_audio ?? item.audio ?? baseOptions.generate_audio ?? settings.videoGenerateAudio,
+            enhance_prompt:item.enhance_prompt ?? baseOptions.enhance_prompt ?? settings.videoEnhancePrompt,
+            enable_upsample:item.enable_upsample ?? baseOptions.enable_upsample ?? settings.videoEnableUpsample,
+            watermark:item.watermark ?? baseOptions.watermark ?? settings.videoWatermark,
+            multimodal:item.multimodal ?? baseOptions.multimodal ?? settings.videoMultimodal,
+            use_frame_roles:item.use_frame_roles ?? baseOptions.use_frame_roles ?? settings.videoUseFrameRoles
+        };
+        const pending = smartAgentCreatePendingNode(prompt, payload, itemIndex, list.length, {...baseOptions, kind:'video'});
+        smartAgentConnectReferenceNodes(pending.node, refs);
+        pendingNodes.push(pending.node.id);
+        selectedId = pending.node.id;
+        selectedIds = pendingNodes.length > 1 ? pendingNodes.slice() : [];
+        selectedImage = {nodeId:'', index:-1};
+        render();
+        scheduleSave();
+        const runSettings = {
+            ...cloneSmartSettings(settings),
+            engine:'api',
+            apiKind:'video',
+            videoProvider:payload.provider_id,
+            videoModel:payload.model,
+            videoDuration:payload.duration,
+            videoAspect:payload.aspect_ratio,
+            videoResolution:payload.resolution,
+            videoCameraFixed:Boolean(payload.camerafixed),
+            videoGenerateAudio:Boolean(payload.generate_audio),
+            videoEnhancePrompt:Boolean(payload.enhance_prompt),
+            videoEnableUpsample:Boolean(payload.enable_upsample),
+            videoWatermark:Boolean(payload.watermark),
+            videoMultimodal:Boolean(payload.multimodal),
+            videoUseFrameRoles:Boolean(payload.use_frame_roles)
+        };
+        const runLog = smartAgentRunLog(pending.node, prompt, refs, 'video', runSettings);
+        const runLogStart = nowMs();
+        (async () => {
+            try {
+                const outputs = await runApiVideoGeneration(prompt, refs, runSettings);
+                if(!outputs.length) throw new Error(tr('smart.errNoOutVideos'));
+                finalizePendingNode(pending.node, outputs, pending.meta, 'video');
+                addSmartGenerationLog({run:runLog, outputs, runMs:nowMs() - runLogStart});
+                render();
+                scheduleSave();
+            } catch(e) {
+                if(handleJimengPendingSignal(pending.node, e)) return;
+                pending.node.pending = 0;
+                pending.node.running = false;
+                addSmartGenerationLog({run:runLog, outputs:[], runMs:nowMs() - runLogStart, error:e.message || String(e)});
+                toast((e.message || tr('smart.errRunFailed')).slice(0, 160));
+                render();
+                scheduleSave();
+            }
+        })();
+    }
+    return pendingNodes.map(id => nodes.find(n => n.id === id)).filter(Boolean).map(smartAgentNodeSummary);
+}
 function installSmartCanvasAgentApi(){
     window.SmartCanvasAgentApi = {
         kind:'smart',
@@ -6008,7 +6414,9 @@ function installSmartCanvasAgentApi(){
                 viewport:{...viewport},
                 selectedNodeIds:selectedNodeIds(),
                 selectedImage:{...selectedImage},
-                selectedNodes:selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean).map(smartAgentNodeSummary)
+                selectedNodes:selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean).map(smartAgentNodeSummary),
+                imageGeneration:this.getImageGenerationDefaults(),
+                videoGeneration:this.getVideoGenerationDefaults()
             };
         },
         getSelectedAssets(){
@@ -6125,6 +6533,36 @@ function installSmartCanvasAgentApi(){
             scheduleSave();
             toast(`已由 Agent 添加 ${created.length} 个循环节点`);
             return created.map(smartAgentNodeSummary);
+        },
+        getImageGenerationDefaults(){
+            return {
+                provider_id:settings.provider_id || '',
+                model:settings.model || '',
+                size:sizeForRun(settings),
+                quality:settings.quality || 'auto',
+                count:Math.max(1, Math.min(8, Number(settings.count || 1))),
+                providers:smartAgentProviderOptions()
+            };
+        },
+        getVideoGenerationDefaults(){
+            const providerId = settings.videoProvider || videoApiProviders()[0]?.id || '';
+            const models = providerVideoModels(providerId);
+            return {
+                provider_id:providerId,
+                model:settings.videoModel || models[0] || '',
+                duration:Math.max(1, Math.min(60, Number(settings.videoDuration || 5))),
+                aspect_ratio:settings.videoAspect || '16:9',
+                resolution:settings.videoResolution || '',
+                camerafixed:Boolean(settings.videoCameraFixed),
+                generate_audio:Boolean(settings.videoGenerateAudio),
+                providers:smartAgentVideoProviderOptions()
+            };
+        },
+        async generateImageNodes(items=[], options={}){
+            return await smartAgentGenerateImageItems(items, options);
+        },
+        async generateVideoNodes(items=[], options={}){
+            return await smartAgentGenerateVideoItems(items, options);
         }
     };
 }
@@ -12494,6 +12932,14 @@ function manualReferenceImagesFor(node){
         manualAdded:true
     }));
 }
+function isAgentGeneratedNode(node){
+    if(!node) return false;
+    if(node.agentGenerated) return true;
+    const runSettings = node.runSettings || {};
+    return Boolean(Array.isArray(node.runInputRefs) && node.runInputRefs.length
+        && runSettings.engine === 'api'
+        && ['image', 'video'].includes(runSettings.apiKind || ''));
+}
 function isInputRefBlocked(node, img){
     if(!node || !img?.url) return false;
     return blockedInputRefKeys(node).has(inputRefKey(img));
@@ -12519,7 +12965,9 @@ function defaultReferenceImagesFor(node, consume=false, ctx=smartLoopContext){
     const self = selfReferenceImagesForNode(node, consume, ctx).filter(img => img?.url);
     const upstream = (smartImageUsesWorkflowInput(node, ctx) ? workflowInputImagesFor(node, consume, ctx) : inputImagesFor(node, consume, ctx))
         .filter(img => img?.url);
+    const savedInputs = Array.isArray(node.runInputRefs) ? node.runInputRefs.filter(img => img?.url) : [];
     const manual = manualReferenceImagesFor(node);
+    if(isAgentGeneratedNode(node) && savedInputs.length) return uniqueReferenceImages([...savedInputs, ...upstream, ...manual, ...self]);
     if(smartImageUsesWorkflowInput(node, ctx)) return uniqueReferenceImages([...upstream, ...manual]);
     if(self.length) return uniqueReferenceImages([...self, ...upstream, ...manual]);
     return uniqueReferenceImages([...upstream, ...manual]);
@@ -12606,7 +13054,8 @@ function uniqueReferenceImages(images){
 }
 function visibleReferenceImagesFor(node){
     const base = defaultReferenceImagesFor(node);
-    return uniqueReferenceImages([...base, ...collectMentionedImagesFromPrompt()]);
+    return uniqueReferenceImages([...base, ...collectMentionedImagesFromPrompt()])
+        .filter(img => !isSelfReferenceForNode(node, img));
 }
 function inputMentionCandidateImages(node){
     const current = node ? [...lineImagesFor(node), ...manualReferenceImagesFor(node)] : [];
@@ -14995,6 +15444,7 @@ function handleJimengPendingSignal(node, e){
 }
 function finalizeJimengPending(node, urls, kind='image'){
     if(!node) return false;
+    const runStartedAt = Number(node.runStartedAt || node.jimengPending?.startedAt || nowMs());
     const ext = kind === 'video' ? 'mp4' : kind === 'audio' ? 'mp3' : kind === 'text' ? 'txt' : 'png';
     const additions = (urls || []).map((item, i) => {
         const url = typeof item === 'string' ? item : item?.url || '';
@@ -15010,6 +15460,9 @@ function finalizeJimengPending(node, urls, kind='image'){
     if(!node.runStartedAt) node.runStartedAt = node.runFinishedAt;
     node.runElapsedMs = Math.max(0, node.runFinishedAt - Number(node.runStartedAt || node.runFinishedAt));
     node.runTimerHidden = false;
+    const runSettings = cloneSmartSettings(node.runSettings || {});
+    const runLog = smartAgentRunLog(node, node.runPrompt || node.runModelPrompt || '', node.runInputRefs || [], kind, runSettings, {size:sizeForRun(runSettings)});
+    addSmartGenerationLog({run:runLog, outputs:additions, runMs:Math.max(0, node.runFinishedAt - runStartedAt)});
     render();
     scheduleSave();
     return true;
@@ -15021,9 +15474,14 @@ function applyJimengQueryResult(node, data){
         return finalizeJimengPending(node, data.urls || [], kind);
     }
     if(data.status === 'failed'){
+        const kind = data.kind || node.jimengPending?.kind || 'image';
+        const runStartedAt = Number(node.runStartedAt || node.jimengPending?.startedAt || nowMs());
+        const runSettings = cloneSmartSettings(node.runSettings || {});
+        const runLog = smartAgentRunLog(node, node.runPrompt || node.runModelPrompt || '', node.runInputRefs || [], kind, runSettings, {size:sizeForRun(runSettings)});
         delete node.jimengPending;
         node.running = false;
         node.pending = 0;
+        addSmartGenerationLog({run:runLog, outputs:[], runMs:Math.max(0, nowMs() - runStartedAt), error:data.error || '即梦任务失败'});
         toast((data.error || '即梦任务失败').slice(0, 160));
         render();
         scheduleSave();

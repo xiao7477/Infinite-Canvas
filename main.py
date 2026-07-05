@@ -4536,6 +4536,17 @@ async def codex_prepare_local_media(ref_url):
     text = str(ref_url or "").strip()
     if not text:
         return "", []
+    if text.startswith(("http://", "https://")):
+        parsed = urllib.parse.urlparse(text)
+        if parsed.path == "/api/codex-agent/file/view":
+            local_path = urllib.parse.parse_qs(parsed.query).get("path", [""])[0]
+            local_path = urllib.parse.unquote(local_path)
+            if os.path.isfile(local_path):
+                return local_path, []
+        if parsed.path.startswith(("/assets/", "/output/")):
+            path = output_file_from_url(parsed.path)
+            if path:
+                return path, []
     if text.startswith(("/output/", "/assets/")):
         path = output_file_from_url(text)
         if path:
@@ -5567,6 +5578,17 @@ async def jimeng_prepare_local_media(ref_url, kind="image"):
     text = str(ref_url or "").strip()
     if not text:
         return "", []
+    if text.startswith(("http://", "https://")):
+        parsed = urllib.parse.urlparse(text)
+        if parsed.path == "/api/codex-agent/file/view":
+            local_path = urllib.parse.parse_qs(parsed.query).get("path", [""])[0]
+            local_path = urllib.parse.unquote(local_path)
+            if os.path.isfile(local_path):
+                return local_path, []
+        if parsed.path.startswith(("/assets/", "/output/")):
+            path = output_file_from_url(parsed.path)
+            if path:
+                return path, []
     if text.startswith("/output/") or text.startswith("/assets/"):
         path = output_file_from_url(text)
         if path:
@@ -5595,8 +5617,11 @@ async def jimeng_prepare_local_media(ref_url, kind="image"):
         return path, temp_paths
     if text.startswith(("http://", "https://")):
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=20.0), follow_redirects=True) as client:
-            response = await client.get(text)
-            response.raise_for_status()
+            try:
+                response = await client.get(text)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HTTPException(status_code=400, detail=f"即梦参考素材下载失败：{text[:160]} ({exc.response.status_code})") from exc
             clean_path = urllib.parse.urlparse(text).path
             suffix = os.path.splitext(clean_path)[1] or mimetypes.guess_extension(response.headers.get("content-type", "")) or suffix
             fd, path = tempfile.mkstemp(prefix="jimeng_ref_", suffix=suffix)
@@ -16649,6 +16674,12 @@ from pathlib import Path as _Path  # main.py 顶部没用到 pathlib，这里局
 
 # Codex home 目录（用环境变量 CODEX_HOME 兜底，默认 ~/.codex）
 CODEX_AGENT_HOME = _Path(os.environ.get("CODEX_HOME") or (_Path.home() / ".codex"))
+CODEX_AGENT_PREFS_FILE = _Path(os.environ.get("CODEX_AGENT_PREFS_FILE") or (CODEX_AGENT_HOME / "infinite-canvas-agent" / "preferences.md"))
+CODEX_AGENT_DEFAULT_PREFS = """# Infinite Canvas Agent Preferences
+- 模糊且高成本/耗时任务先确认，尤其生视频、大量生图。
+- 画布聊天默认优先操作当前智能画布。
+- 优先使用已选素材，按图1、图2顺序引用。
+"""
 
 
 class CodexAppServerSession:
@@ -17064,21 +17095,73 @@ async def _codex_agent_prepare_local_image(ref: Any, project_dir: str, client: O
     return {**ref_data, "url": ref_url, "source_path": str(local_path), "local_path": local_out, "kind": _codex_agent_media_kind_from_ref(ref_data, local_out)}
 
 
-def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]]) -> str:
+def _codex_agent_ensure_preferences_file() -> None:
+    try:
+        CODEX_AGENT_PREFS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not CODEX_AGENT_PREFS_FILE.exists():
+            CODEX_AGENT_PREFS_FILE.write_text(CODEX_AGENT_DEFAULT_PREFS, encoding="utf-8")
+    except Exception as exc:
+        print(f"[codex-agent] preferences file unavailable: {exc}")
+
+
+def _codex_agent_read_preferences(limit: int = 1200) -> str:
+    try:
+        _codex_agent_ensure_preferences_file()
+        text = CODEX_AGENT_PREFS_FILE.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        print(f"[codex-agent] failed to read preferences: {exc}")
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n- ...偏好过长，已截断"
+
+
+def _codex_agent_append_preference(note: str) -> str:
+    clean = re.sub(r"\s+", " ", str(note or "")).strip(" -\t\r\n")
+    if not clean:
+        raise ValueError("偏好内容为空")
+    if len(clean) > 80:
+        clean = clean[:80].rstrip()
+    _codex_agent_ensure_preferences_file()
+    current = CODEX_AGENT_PREFS_FILE.read_text(encoding="utf-8") if CODEX_AGENT_PREFS_FILE.exists() else ""
+    line = f"- {clean}"
+    if line in current.splitlines():
+        return str(CODEX_AGENT_PREFS_FILE)
+    suffix = "" if current.endswith("\n") or not current else "\n"
+    CODEX_AGENT_PREFS_FILE.write_text(current + suffix + line + "\n", encoding="utf-8")
+    return str(CODEX_AGENT_PREFS_FILE)
+
+
+def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]], canvas_context: Optional[Dict[str, Any]] = None) -> str:
+    preferences = _codex_agent_read_preferences()
     lines = [
         "<canvas_agent_context>",
         f"project_dir: {project_dir}",
+        f"preferences_file: {CODEX_AGENT_PREFS_FILE}",
         "你正在 Infinite-Canvas 的 Agent 面板中。下面是用户从当前画布选择并附加给你的素材。",
+        "系统级规则：画布 Agent 的任务优先围绕当前智能画布；普通文件整理只在用户明确要求时执行。",
         "当用户说“这张图/选中的图/这些素材/放到项目目录/重命名/整理”时，优先指这些 ref。",
         "这些素材按用户在输入框附件区的顺序排列：图一/第一张=ref_1，图二/第二张=ref_2，依此类推。",
         "local_path 是本机临时缓存文件，仅用于本轮读取；如果要保存文件，请把 local_path 复制到 project_dir 或用户指定的子目录，不要把缓存目录当作最终目录。",
         "完成文件操作后，请明确回复保存后的路径。",
         "如果用户要求你把图片、视频、提示词、文本或循环节点放回画布，请在回复末尾输出一个 fenced 代码块，语言名必须是 canvas_agent_action。",
+        "确认机制：当用户要求模糊且会明显影响成本、耗时或结果偏差时，先用简短中文反问确认，不要输出 canvas_agent_action。",
+        "尤其是生视频、批量生图/生视频、数量较多、没有说明模型/时长/比例/清晰度/运动方式/是否直接执行时，应先给出当前默认值和一个推荐方案请用户确认。",
+        "如果用户明确说“直接执行/按默认/你决定/不用问/先跑起来/马上生成”，则可以用当前默认值执行，无需反问。",
+        "当用户明确说“记住/以后都这样/作为偏好/写入规则”时，在回复末尾额外输出 remember_preference 动作，note 必须是 60 字以内中文短句。",
+        "在画布 Agent 面板里，用户说“生成图片/画一张/做几张图”等生图请求时，默认就是要在当前画布生成并新增图片节点；不要要求用户额外说明“放到画布”。",
+        "用户说“生成视频/生视频/图生视频/调用即梦做视频”等请求时，默认就是要在当前智能画布创建视频生成节点；请输出 generate_video 动作，不要只口头说明。",
         "前端会读取并执行该动作块，然后把动作块从聊天正文里隐藏。不要把动作块当作普通说明。",
-        "动作块 JSON 示例：{\"actions\":[{\"type\":\"add_media\",\"items\":[{\"path\":\"/absolute/path/to/image.png\",\"name\":\"图名\",\"kind\":\"image\"}]},{\"type\":\"add_prompt\",\"items\":[{\"title\":\"Prompt\",\"text\":\"提示词内容\"}]}]}",
-        "支持的 type: add_media/add_image/add_video/add_prompt/add_text/add_loop/add_nodes。media item 可用 path 或 url；本机绝对路径会由前端转成可预览地址。",
-        "selected_refs:",
+        "动作块 JSON 示例：{\"actions\":[{\"type\":\"generate_image\",\"items\":[{\"prompt\":\"一张复古东方民俗木版年画海报\",\"count\":1}]},{\"type\":\"generate_video\",\"items\":[{\"prompt\":\"固定镜头，人物轻微举杯，10秒\",\"duration\":10,\"provider_id\":\"jimeng\",\"reference_images\":[\"ref_1\"]}]}]}",
+        "记忆动作示例：{\"actions\":[{\"type\":\"remember_preference\",\"note\":\"生视频参数不明确时先确认\"}]}",
+        "支持的 type: generate_image/generate_video/add_media/add_image/add_video/add_prompt/add_text/add_loop/add_nodes/remember_preference。generate_image 会调用当前画布 API 生图设置，items 里每项至少包含 prompt，可选 count/n、size、quality、model、provider_id、reference_images。",
+        "generate_video 会调用当前画布 API 视频设置，items 里每项至少包含 prompt，可选 duration/seconds、aspect_ratio/ratio、resolution、model、provider_id、reference_images、camerafixed/camera_fixed、generate_audio。",
+        "如果用户指定 GPT/OpenAI/Codex/即梦/其它平台、模型、比例、尺寸、高清/低清、数量、时长、固定镜头，请优先根据 available_image_providers/available_video_providers 填入准确 provider_id、model、size/quality/count/duration/aspect_ratio/camerafixed；如果不确定才省略并使用当前默认值。",
+        "media item 可用 path 或 url；本机绝对路径会由前端转成可预览地址。",
+        "user_canvas_preferences:",
     ]
+    lines.extend(preferences.splitlines() if preferences else ["(none)"])
+    lines.append("selected_refs:")
     if not refs:
         lines.append("(none)")
     for index, ref in enumerate(refs, 1):
@@ -17094,6 +17177,56 @@ def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]]) 
             f"  image_index: {ref.get('imageIndex') if ref.get('imageIndex') is not None else ''}",
             f"  node_title: {ref.get('nodeTitle') or ref.get('node_title') or ''}",
         ])
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
+    native = ctx.get("native") if isinstance(ctx.get("native"), dict) else {}
+    image_defaults = native.get("imageGeneration") or native.get("image_generation") or {}
+    video_defaults = native.get("videoGeneration") or native.get("video_generation") or {}
+    providers = image_defaults.get("providers") if isinstance(image_defaults, dict) else []
+    video_providers = video_defaults.get("providers") if isinstance(video_defaults, dict) else []
+    if isinstance(image_defaults, dict) and image_defaults:
+        lines.extend([
+            "current_canvas_image_generation_defaults:",
+            f"  provider_id: {image_defaults.get('provider_id') or ''}",
+            f"  model: {image_defaults.get('model') or ''}",
+            f"  size: {image_defaults.get('size') or ''}",
+            f"  quality: {image_defaults.get('quality') or ''}",
+            f"  count: {image_defaults.get('count') or ''}",
+        ])
+    if isinstance(providers, list) and providers:
+        lines.append("available_image_providers:")
+        for provider in providers[:20]:
+            if not isinstance(provider, dict):
+                continue
+            models = provider.get("image_models") if isinstance(provider.get("image_models"), list) else []
+            lines.extend([
+                f"- id: {provider.get('id') or ''}",
+                f"  name: {provider.get('name') or ''}",
+                f"  protocol: {provider.get('protocol') or ''}",
+                f"  image_models: {', '.join(str(model) for model in models[:20])}",
+            ])
+    if isinstance(video_defaults, dict) and video_defaults:
+        lines.extend([
+            "current_canvas_video_generation_defaults:",
+            f"  provider_id: {video_defaults.get('provider_id') or ''}",
+            f"  model: {video_defaults.get('model') or ''}",
+            f"  duration: {video_defaults.get('duration') or ''}",
+            f"  aspect_ratio: {video_defaults.get('aspect_ratio') or ''}",
+            f"  resolution: {video_defaults.get('resolution') or ''}",
+            f"  camerafixed: {video_defaults.get('camerafixed')}",
+            f"  generate_audio: {video_defaults.get('generate_audio')}",
+        ])
+    if isinstance(video_providers, list) and video_providers:
+        lines.append("available_video_providers:")
+        for provider in video_providers[:20]:
+            if not isinstance(provider, dict):
+                continue
+            models = provider.get("video_models") if isinstance(provider.get("video_models"), list) else []
+            lines.extend([
+                f"- id: {provider.get('id') or ''}",
+                f"  name: {provider.get('name') or ''}",
+                f"  protocol: {provider.get('protocol') or ''}",
+                f"  video_models: {', '.join(str(model) for model in models[:20])}",
+            ])
     lines.append("</canvas_agent_context>")
     return "\n".join(lines)
 
@@ -17111,12 +17244,22 @@ def _codex_agent_parse_ref_context(text: str) -> Tuple[str, List[Dict[str, Any]]
     raw = str(text or "")
     refs: List[Dict[str, Any]] = []
     if "<canvas_agent_context>" not in raw or "</canvas_agent_context>" not in raw:
-        return raw, refs
+        return _codex_agent_strip_internal_context(raw), refs
 
     before, rest = raw.split("<canvas_agent_context>", 1)
     ctx, after = rest.split("</canvas_agent_context>", 1)
+    selected_ctx = ctx.split("selected_refs:", 1)[1] if "selected_refs:" in ctx else ""
+    for stop in (
+        "\ncurrent_canvas_image_generation_defaults:",
+        "\navailable_image_providers:",
+        "\ncurrent_canvas_video_generation_defaults:",
+        "\navailable_video_providers:",
+    ):
+        if stop in selected_ctx:
+            selected_ctx = selected_ctx.split(stop, 1)[0]
+
     current: Optional[Dict[str, Any]] = None
-    for line in ctx.splitlines():
+    for line in selected_ctx.splitlines():
         stripped = line.strip()
         if stripped.startswith("- id:"):
             if current:
@@ -17157,7 +17300,49 @@ def _codex_agent_parse_ref_context(text: str) -> Tuple[str, List[Dict[str, Any]]
     marker = "用户请求："
     if marker in clean:
         clean = clean.split(marker, 1)[1]
-    return clean.strip(), refs
+    return _codex_agent_strip_agent_markup(clean).strip(), refs
+
+
+def _codex_agent_strip_internal_context(text: str) -> str:
+    clean = str(text or "")
+    for tag in (
+        "skill",
+        "skills_instructions",
+        "environment_context",
+        "app-context",
+        "permissions instructions",
+        "collaboration_mode",
+        "plugins_instructions",
+    ):
+        escaped = re.escape(tag)
+        clean = re.sub(rf"<{escaped}>[\s\S]*?</{escaped}>", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"<skill\b[\s\S]*?</skill>", "", clean, flags=re.IGNORECASE)
+    return clean.strip()
+
+
+def _codex_agent_strip_agent_markup(text: str) -> str:
+    clean = _codex_agent_strip_internal_context(text)
+    clean = re.sub(r"```(?:canvas_agent_action|canvas-agent-action)\s*[\s\S]*?```", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"<canvas_agent_action>[\s\S]*?</canvas_agent_action>", "", clean, flags=re.IGNORECASE)
+    return clean.strip()
+
+
+def _codex_agent_is_internal_context_text(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return True
+    lowered = raw.lower()
+    internal_markers = (
+        "<environment_context>",
+        "<app-context>",
+        "<permissions instructions>",
+        "<collaboration_mode>",
+        "<skills_instructions>",
+        "<plugins_instructions>",
+    )
+    if any(marker in lowered for marker in internal_markers):
+        return True
+    return lowered.startswith("<skill>") or "<skill>" in lowered[:200]
 
 
 async def _to_inline_data_url(url: str, client: Optional[httpx.AsyncClient] = None) -> str:
@@ -17223,6 +17408,11 @@ class CodexAgentTurnRequest(BaseModel):
     project_dir: str
     text: str
     attachments: Optional[List[Any]] = None  # URL、本地路径，或 {url,name,nodeId,...}
+    canvas_context: Optional[Dict[str, Any]] = None
+
+
+class CodexAgentPreferenceRequest(BaseModel):
+    note: str
 
 
 @app.post("/api/codex-agent/board/open")
@@ -17266,6 +17456,15 @@ async def codex_agent_board_close(payload: CodexAgentBoardCloseRequest):
     return {"ok": True}
 
 
+@app.post("/api/codex-agent/preferences/remember")
+async def codex_agent_preferences_remember(payload: CodexAgentPreferenceRequest):
+    try:
+        path = _codex_agent_append_preference(payload.note)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "path": path}
+
+
 @app.post("/api/codex-agent/turn")
 async def codex_agent_turn(payload: CodexAgentTurnRequest):
     """
@@ -17290,7 +17489,7 @@ async def codex_agent_turn(payload: CodexAgentTurnRequest):
                     ref_errors.append(f"{item}: {e}")
 
     image_refs = [ref for ref in refs if str(ref.get("kind") or "image").lower() == "image"]
-    context_text = _codex_agent_ref_context_text(payload.project_dir, refs)
+    context_text = _codex_agent_ref_context_text(payload.project_dir, refs, payload.canvas_context)
     turn_text = f"{context_text}\n\n用户请求：\n{payload.text}" if context_text else payload.text
 
     async def event_stream():
@@ -17371,7 +17570,7 @@ async def codex_agent_threads_replay(session_id: str = ""):
                         for c in content:
                             if isinstance(c, dict) and c.get("type") == "input_text":
                                 txt = str(c.get("text", ""))
-                                if txt and "<environment_context>" not in txt and "<app-context>" not in txt and "<permissions instructions>" not in txt and "<collaboration_mode>" not in txt and "<skills_instructions>" not in txt and "<plugins_instructions>" not in txt:
+                                if txt and not _codex_agent_is_internal_context_text(txt):
                                     clean_txt, refs = _codex_agent_parse_ref_context(txt)
                                     blocks = []
                                     if refs:
@@ -17389,6 +17588,8 @@ async def codex_agent_threads_replay(session_id: str = ""):
                     etype = str(payload.get("type", ""))
                     if etype == "user_message":
                         txt = str(payload.get("message") or "")
+                        if _codex_agent_is_internal_context_text(txt):
+                            continue
                         clean_txt, refs = _codex_agent_parse_ref_context(txt)
                         if clean_txt or refs:
                             if messages and messages[-1].get("role") == "user":
@@ -17407,18 +17608,20 @@ async def codex_agent_threads_replay(session_id: str = ""):
                             messages.append({"role": "user", "blocks": blocks})
                             current_bot = None
                     elif etype == "agent_message":
-                        if current_bot is None:
-                            current_bot = {"role": "bot", "blocks": []}
-                            messages.append(current_bot)
                         txt = str(payload.get("message") or payload.get("text") or "")
+                        txt = _codex_agent_strip_agent_markup(txt)
                         if txt:
+                            if current_bot is None:
+                                current_bot = {"role": "bot", "blocks": []}
+                                messages.append(current_bot)
                             current_bot["blocks"].append({"type": "text", "text": txt})
                     elif etype in ("agent_reasoning", "agent_reasoning_section_break"):
-                        if current_bot is None:
-                            current_bot = {"role": "bot", "blocks": []}
-                            messages.append(current_bot)
                         txt = str(payload.get("text") or "")
+                        txt = _codex_agent_strip_agent_markup(txt)
                         if txt:
+                            if current_bot is None:
+                                current_bot = {"role": "bot", "blocks": []}
+                                messages.append(current_bot)
                             current_bot["blocks"].append({"type": "thinking", "text": txt})
     except Exception as e:
         return {"messages": messages, "session_id": session_meta_id,
