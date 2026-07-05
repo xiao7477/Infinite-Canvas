@@ -54,6 +54,22 @@ function Install-WithNpmFallback {
     Add-NpmPrefixToPath -NpmCommand $npm
 }
 
+function Install-GptImage2Skill {
+    $npm = Get-NpmCommand
+    if (-not $npm) {
+        Write-Host "npm was not found. Skipping gpt-image-2-skill install."
+        return
+    }
+
+    Write-Host "Installing/updating GPT Image 2 helper: npm install -g gpt-image-2-skill"
+    & $npm install -g "gpt-image-2-skill"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "gpt-image-2-skill install failed with exit code $LASTEXITCODE. Codex CLI can still run, but Image 2 helper will be unavailable."
+        return
+    }
+    Add-NpmPrefixToPath -NpmCommand $npm
+}
+
 try {
     Write-Host "=== OpenAI Codex CLI install/update ==="
     Write-Host "Workspace: $root"
@@ -71,6 +87,7 @@ try {
         Write-Host "Standalone installer failed: $($_.Exception.Message)"
         Install-WithNpmFallback
     }
+    Install-GptImage2Skill
     Write-Host ""
 
     $codex = Get-Command codex -ErrorAction SilentlyContinue
@@ -86,6 +103,12 @@ try {
         & codex --version
     } catch {
         Write-Host "Could not read Codex version in this session. Open a new PowerShell and run: codex --version"
+    }
+    $gptImage2Skill = Get-Command gpt-image-2-skill -ErrorAction SilentlyContinue
+    if ($gptImage2Skill) {
+        Write-Host "GPT Image 2 helper found: $($gptImage2Skill.Source)"
+    } else {
+        Write-Host "GPT Image 2 helper is not available in this PowerShell PATH yet."
     }
 
     Write-Host ""

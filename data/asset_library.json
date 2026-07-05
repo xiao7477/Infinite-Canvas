@@ -11,14 +11,14 @@
           "name": "角色",
           "type": "image",
           "items": [],
-          "dir": "角色_3"
+          "dir": "角色"
         },
         {
           "id": "scenes",
           "name": "场景",
           "type": "image",
           "items": [],
-          "dir": "场景_3"
+          "dir": "场景"
         },
         {
           "id": "workflows",
@@ -35,14 +35,14 @@
       "name": "角色",
       "type": "image",
       "items": [],
-      "dir": "角色_3"
+      "dir": "角色"
     },
     {
       "id": "scenes",
       "name": "场景",
       "type": "image",
       "items": [],
-      "dir": "场景_3"
+      "dir": "场景"
     },
     {
       "id": "workflows",
@@ -51,5 +51,5 @@
       "items": []
     }
   ],
-  "updated_at": 1782823687001
+  "updated_at": 1783212587156
 }

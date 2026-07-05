@@ -90,14 +90,14 @@ const JIMENG_LEGACY_IMAGE_MODELS = new Set(['jimeng-image-2k', 'jimeng-image-4k'
 const JIMENG_LEGACY_VIDEO_MODELS = new Set(['jimeng-video-720p', 'jimeng-video-1080p']);
 const CODEX_DEFAULT_IMAGE_MODELS = ['$imagegen'];
 const CODEX_DEFAULT_CHAT_MODELS = ['gpt-5.5'];
-const GEMINI_CLI_DEFAULT_IMAGE_MODELS = ['gemini-2.5-flash-image', 'auto', 'pro', 'flash', 'flash-lite'];
-const GEMINI_CLI_DEFAULT_CHAT_MODELS = ['auto', 'pro', 'flash', 'flash-lite'];
+const GEMINI_CLI_DEFAULT_IMAGE_MODELS = ['auto'];
+const GEMINI_CLI_DEFAULT_CHAT_MODELS = ['auto'];
 const CLI_PROTOCOLS = new Set(['jimeng', 'codex', 'gemini-cli']);
 const API_PROTOCOLS = ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng', 'codex', 'gemini-cli'];
 const CLI_PROVIDER_PRESETS = {
     jimeng:{id:'jimeng', name:'即梦 CLI', protocol:'jimeng'},
     codex:{id:'codex', name:'GPT CLI', protocol:'codex'},
-    'gemini-cli':{id:'gemini-cli', name:'Gemini CLI', protocol:'gemini-cli'}
+    'gemini-cli':{id:'gemini-cli', name:'Antigravity CLI', protocol:'gemini-cli'}
 };
 const ONBOARDING_GUIDES = {
     modelscope:{
@@ -166,6 +166,7 @@ const RECOMMENDED_APIS = [
         icons:['IMG'],
         summaryKey:'api.recommendExellomeSummary',
         perks:[{key:'api.recommendExellome2k4k'}],
+        keyHint:'使用 VIP 分组',
         advantages:['稳定输出 GPT-Image2 和 Nano Banana 的 2K/4K', '异步协议适合长任务', '预填全系图像模型'],
         image_models:['gpt-image2-2k', 'gpt-image2-4k', 'Nano-Banana-2-2k', 'Nano-Banana-2-4k', 'Nano-Banana-Pro-2k', 'Nano-Banana-Pro-4k'],
         chat_models:[],
@@ -255,8 +256,25 @@ const RECOMMEND_GROUPS = [
 const LOCKED_RECOMMENDED_PROTOCOL_IDS = new Set(['exellome', 'fhl']);
 function lockedRecommendedApi(itemOrId){
     const id = typeof itemOrId === 'string' ? itemOrId : itemOrId?.id;
-    if(!LOCKED_RECOMMENDED_PROTOCOL_IDS.has(id)) return null;
-    return RECOMMENDED_APIS.find(api => api.id === id) || null;
+    const name = typeof itemOrId === 'string' ? '' : itemOrId?.name;
+    const baseUrl = typeof itemOrId === 'string' ? '' : itemOrId?.base_url;
+    const normalizedId = String(id || '').trim().toLowerCase();
+    const normalizedName = String(name || '').trim().toLowerCase();
+    const normalizedBase = String(baseUrl || '').trim().replace(/\/+$/, '').toLowerCase();
+    const normalizedHost = (() => {
+        try { return new URL(normalizedBase).host.toLowerCase(); } catch(e) { return ''; }
+    })();
+    return RECOMMENDED_APIS.find(api => {
+        if(!LOCKED_RECOMMENDED_PROTOCOL_IDS.has(api.id)) return false;
+        const apiBase = String(api.base_url || '').trim().replace(/\/+$/, '').toLowerCase();
+        const apiHost = (() => {
+            try { return new URL(apiBase).host.toLowerCase(); } catch(e) { return ''; }
+        })();
+        return normalizedId === api.id
+            || normalizedName === String(api.name || '').trim().toLowerCase()
+            || (apiBase && normalizedBase === apiBase)
+            || (apiHost && normalizedHost === apiHost);
+    }) || null;
 }
 function hasLockedRecommendedProtocol(itemOrId){
     return Boolean(lockedRecommendedApi(itemOrId));
@@ -2123,6 +2141,14 @@ function syncRecommendView(){
     if(recommendSub) recommendSub.textContent = tr('api.recommendPanelSub');
     document.body.classList.toggle('show-recommend-mode', recommendInlineOpen);
 }
+function focusRecommendKey(event, index){
+    if(event?.target?.closest?.('a,button,input,textarea,select,label')) return;
+    const input = recommendPanel?.querySelector(`[data-recommend-key="${index}"]`);
+    if(input){
+        input.focus();
+        input.scrollIntoView({block:'nearest', inline:'nearest'});
+    }
+}
 function renderRecommendApi(){
     if(!recommendPanel) return;
     if(!recommendInlineOpen){
@@ -2130,7 +2156,7 @@ function renderRecommendApi(){
         return;
     }
     const recommendCardHtml = (api, index) => `
-        <section class="recommend-card recommend-platform-card" style="--recommend-index:${index}">
+        <section class="recommend-card recommend-platform-card" style="--recommend-index:${index}" onclick="focusRecommendKey(event, ${index})">
             <div class="recommend-platform-info">
                 <div class="recommend-platform-head">
                     <div>
@@ -2163,6 +2189,7 @@ function renderRecommendApi(){
                         <label class="onboarding-key-field onboarding-rh-row-field">
                             <span>API Key</span>
                             <input type="password" data-recommend-key="${index}" placeholder="${escapeAttr(trf('api.recommendKeyPlaceholder', {name:api.name}))}">
+                            ${api.keyHint ? `<em class="recommend-key-hint">${escapeHtml(api.keyHint)}</em>` : ''}
                         </label>
                         <button class="onboarding-save-btn recommend-guide-save-btn" type="button" onclick="saveRecommendedApi(${index})"><span>${escapeHtml(tr('api.save'))}</span></button>
                     </div>
@@ -2474,8 +2501,8 @@ function renderEditor(){
     }
     if(isGeminiCli){
         applyCliProtocolDefaults(item, 'gemini-cli');
-        keyInput.placeholder = 'Gemini CLI 使用本机 gemini 登录态，无需 API Key';
-        keyHint.textContent = '请先安装 Gemini CLI，并在终端执行 gemini 完成登录';
+        keyInput.placeholder = 'Antigravity CLI 使用本机 agy 登录态，无需 API Key';
+        keyHint.textContent = '请先安装 Antigravity CLI，并在终端执行 agy 完成登录';
     }
     document.body.classList.toggle('show-ms', isModelScope);
     document.body.classList.toggle('show-runninghub', isRunningHub);
@@ -3014,7 +3041,7 @@ async function testConnection(){
                 : '';
             const jimengNote = isJimeng ? `<div style="margin-top:6px;color:#15803d;font-size:11px;font-weight:700">即梦 CLI 已可用，可在画布里选择“即梦 CLI”生成。</div>` : '';
             const codexNote = currentProtocol === 'codex' ? `<div style="margin-top:6px;color:#15803d;font-size:11px;font-weight:700">OpenAI Codex CLI 已可用，可在画布里选择“OpenAI CLI”聊天或生成图片。</div>` : '';
-            const geminiCliNote = currentProtocol === 'gemini-cli' ? `<div style="margin-top:6px;color:#15803d;font-size:11px;font-weight:700">Gemini CLI 已可用，可在画布里选择“Gemini CLI”聊天或测试生图。</div>` : '';
+            const geminiCliNote = currentProtocol === 'gemini-cli' ? `<div style="margin-top:6px;color:#15803d;font-size:11px;font-weight:700">Antigravity CLI 已可用，可在画布里选择“Antigravity CLI”聊天或测试生图。</div>` : '';
             const imageModeNote = ` · 图片接口：${imageRequestModeLabel(imageRequestModeInput?.value || item.image_request_mode)}`;
             const runninghubNote = isRunningHubNow
                 ? ` · RunningHub OpenAPI${runninghubModelSourceNote(data)}`

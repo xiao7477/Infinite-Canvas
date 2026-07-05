@@ -60,6 +60,17 @@ html.studio-theme-dark body .api-link-btn:hover { background:#ffffff; border-col
 .cli-quick-btn:hover { border-color:var(--line-strong); background:var(--soft); color:var(--text); }
 .cli-quick-btn i,
 .cli-quick-btn svg { flex:0 0 auto; color:currentColor; }
+.cli-quick-note {
+    margin:-2px 2px 4px 2px;
+    padding:5px 7px;
+    border:1px solid var(--line);
+    border-radius:8px;
+    background:var(--soft);
+    color:var(--muted);
+    font-size:9.5px;
+    line-height:1.45;
+    font-weight:650;
+}
 .recommend-api-body { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; padding:18px 20px 6px; }
 /* 推荐分组（稳定/便宜）：组容器占满整行，组内卡片继续两列 */
 .recommend-group { grid-column:1 / -1; display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }
@@ -5759,6 +5770,7 @@ html.studio-theme-dark body .recommend-tag.recommend-free-tag svg {
 
 .recommend-inline-card .recommend-platform-info {
     width:100% !important;
+    min-height:auto !important;
     min-width:0 !important;
     justify-content:flex-start !important;
 }
@@ -5833,6 +5845,15 @@ html.studio-theme-dark body .recommend-tag.recommend-free-tag svg {
     width:100% !important;
     min-width:0 !important;
     box-sizing:border-box !important;
+}
+
+.recommend-inline-card .recommend-key-hint {
+    margin-top:4px;
+    color:var(--muted);
+    font-size:9.5px;
+    line-height:1.35;
+    font-style:normal;
+    font-weight:750;
 }
 
 .recommend-inline-card .recommend-guide-key-btn,

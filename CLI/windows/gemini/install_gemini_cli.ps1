@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..\..")
 $logDir = Join-Path $root "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-$logPath = Join-Path $logDir ("gemini-cli-install-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+$logPath = Join-Path $logDir ("antigravity-cli-install-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 Start-Transcript -Path $logPath -Force | Out-Null
 
 function Pause-End {
@@ -19,64 +19,50 @@ function Pause-End {
     Stop-Transcript | Out-Null
 }
 
-function Get-NpmCommand {
-    $npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
-    if ($npmCmd) { return $npmCmd.Source }
+function Find-Agy {
+    $cmd = Get-Command agy -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
 
-    $npm = Get-Command npm -ErrorAction SilentlyContinue
-    if ($npm) { return $npm.Source }
+    $pattern = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages\Google.AntigravityCLI_*\agy.exe"
+    $match = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+    if ($match) { return $match.FullName }
 
     return $null
 }
 
-function Add-NpmPrefixToPath {
-    param([string]$NpmCommand)
-
-    try {
-        $prefix = (& $NpmCommand config get prefix 2>$null | Select-Object -First 1).Trim()
-        if ($prefix -and (Test-Path -LiteralPath $prefix)) {
-            $env:PATH = "$prefix;$env:PATH"
-        }
-    } catch {
-        Write-Host "Could not read npm global prefix. Continuing with the current PATH."
-    }
-}
-
 try {
-    Write-Host "=== Gemini CLI install/update ==="
+    Write-Host "=== Antigravity CLI install/update ==="
     Write-Host "Workspace: $root"
     Write-Host ""
 
-    $npm = Get-NpmCommand
-    if (-not $npm) {
-        throw "npm was not found. Please install Node.js first, then rerun this installer."
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        throw "winget was not found. Please install App Installer from Microsoft Store, then rerun this installer."
     }
 
-    Write-Host "Installing/updating Gemini CLI with npm: npm install -g @google/gemini-cli"
-    & $npm install -g "@google/gemini-cli"
+    Write-Host "Installing/updating Antigravity CLI with winget: winget install --id Google.AntigravityCLI"
+    & $winget.Source install --id Google.AntigravityCLI -e --source winget --accept-package-agreements --accept-source-agreements
     if ($LASTEXITCODE -ne 0) {
-        throw "npm install failed with exit code $LASTEXITCODE."
+        Write-Host "winget install returned exit code $LASTEXITCODE. Checking whether agy is already available..."
     }
-    Add-NpmPrefixToPath -NpmCommand $npm
-    Write-Host ""
 
-    $gemini = Get-Command gemini -ErrorAction SilentlyContinue
-    if (-not $gemini) {
-        Write-Host "Gemini CLI was installed, but 'gemini' is not available in this PowerShell PATH yet."
-        Write-Host "Close this window, open a new PowerShell, then run: gemini"
+    $agy = Find-Agy
+    if (-not $agy) {
+        Write-Host "Antigravity CLI may be installed, but 'agy' was not found in this PowerShell PATH yet."
+        Write-Host "Close this window, open a new PowerShell, then run: agy --version"
         Pause-End
         exit 2
     }
 
-    Write-Host "Gemini CLI found: $($gemini.Source)"
+    Write-Host "Antigravity CLI found: $agy"
     try {
-        & gemini --version
+        & $agy --version
     } catch {
-        Write-Host "Could not read Gemini version in this session. Open a new PowerShell and run: gemini --version"
+        Write-Host "Could not read Antigravity version in this session. Open a new PowerShell and run: agy --version"
     }
 
     Write-Host ""
-    Write-Host "Done. Run 'gemini' in PowerShell to sign in and start using Gemini CLI."
+    Write-Host "Done. Run 'agy' in PowerShell to sign in and start using Antigravity CLI."
     Write-Host "You can also double-click CLI\windows\gemini\2-start_gemini_cli.bat."
     Pause-End
 } catch {
