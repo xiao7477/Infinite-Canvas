@@ -373,7 +373,7 @@
     }
     pop.innerHTML = state.sessions.map(s => `
       <div class="cm-popover-item" data-sid="${escapeAttr(s.session_id)}">
-        💬 ${escapeHtml(s.preview || '(空)')}
+        💬 ${escapeHtml(sessionPreviewTitle(s))}
         <span class="cm-popover-meta">${s.started_at} · ${s.model || '?'}</span>
       </div>
     `).join('');
@@ -385,6 +385,14 @@
         switchSession(sid);
       });
     });
+  }
+
+  function sessionPreviewTitle(session) {
+    const text = safeStr(session?.preview).trim();
+    if (text && text !== '(空)') return text;
+    const media = safeStr(session?.preview_media || session?.media_preview || session?.first_media || '').trim();
+    if (media) return media;
+    return '含图片/附件的对话';
   }
 
   async function switchSession(sessionId) {
@@ -544,6 +552,21 @@
     addLoopNodes(items, options = {}) {
       return addLoopNodesToCanvas(items, options);
     },
+    groupNodes(items, options = {}) {
+      return groupNodesOnCanvas(items, options);
+    },
+    ungroupNodes(items, options = {}) {
+      return ungroupNodesOnCanvas(items, options);
+    },
+    renameNodes(items, options = {}) {
+      return renameNodesOnCanvas(items, options);
+    },
+    moveNodes(items, options = {}) {
+      return moveNodesOnCanvas(items, options);
+    },
+    arrangeNodes(items, options = {}) {
+      return arrangeNodesOnCanvas(items, options);
+    },
     generateImageNodes(items, options = {}) {
       return generateImageNodesToCanvas(items, options);
     },
@@ -660,7 +683,7 @@
 
   function addPromptNodesToCanvas(items, options = {}) {
     const list = (Array.isArray(items) ? items : [items])
-      .map(item => typeof item === 'string' ? { text: item } : item)
+      .map(normalizeCanvasNodeItem)
       .filter(item => item && (item.text || item.title));
     if (!list.length) return [];
     if (window.SmartCanvasAgentApi?.addPromptNodes) {
@@ -671,13 +694,84 @@
 
   function addLoopNodesToCanvas(items, options = {}) {
     const list = (Array.isArray(items) ? items : [items])
-      .map(item => typeof item === 'string' ? { variablePrompt: item } : item)
+      .map(normalizeCanvasNodeItem)
       .filter(Boolean);
     if (!list.length) return [];
     if (window.SmartCanvasAgentApi?.addLoopNodes) {
       return window.SmartCanvasAgentApi.addLoopNodes(list, options) || [];
     }
     return [];
+  }
+
+  function attachmentFromReferenceValue(value) {
+    const text = safeStr(value).trim();
+    if (!text) return null;
+    const m = text.match(/^@?ref[_-]?(\d+)$/i) || text.match(/^@?图\s*(\d+)$/);
+    if (!m) return null;
+    const idx = Math.max(0, Number(m[1] || m[2]) - 1);
+    return currentTurnAttachments[idx] || state.attachments[idx] || null;
+  }
+
+  function nodeIdFromReferenceValue(value) {
+    const item = attachmentFromReferenceValue(value);
+    return safeStr(item?.nodeId || item?.node_id);
+  }
+
+  function normalizeCanvasNodeTargetItem(item) {
+    if (!item) return null;
+    const data = typeof item === 'string' ? { ref: item } : { ...item };
+    const refValue = data.ref || data.ref_id || data.refId || data.target || data.target_ref || data.targetRef;
+    const refItem = attachmentFromReferenceValue(refValue);
+    const refNodeId = safeStr(refItem?.nodeId || refItem?.node_id) || nodeIdFromReferenceValue(refValue);
+    if (refNodeId && !data.node_id && !data.nodeId && !data.id) data.node_id = refNodeId;
+    if (refItem && data.image_index == null && data.imageIndex == null) data.image_index = refItem.imageIndex ?? refItem.image_index ?? 0;
+    if (Array.isArray(data.refs) && !Array.isArray(data.node_ids)) {
+      const nodeIds = data.refs.map(nodeIdFromReferenceValue).filter(Boolean);
+      if (nodeIds.length) data.node_ids = nodeIds;
+    }
+    return data;
+  }
+
+  function renameNodesOnCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items]).map(normalizeCanvasNodeTargetItem).filter(Boolean);
+    if (!list.length) return [];
+    if (window.SmartCanvasAgentApi?.renameNodes) {
+      return window.SmartCanvasAgentApi.renameNodes(list, options) || [];
+    }
+    throw new Error('当前画布还不支持 Agent 改名节点');
+  }
+
+  function moveNodesOnCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items]).map(normalizeCanvasNodeTargetItem).filter(Boolean);
+    if (!list.length) return [];
+    if (window.SmartCanvasAgentApi?.moveNodes) {
+      return window.SmartCanvasAgentApi.moveNodes(list, options) || [];
+    }
+    throw new Error('当前画布还不支持 Agent 移动节点');
+  }
+
+  function arrangeNodesOnCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items]).map(normalizeCanvasNodeTargetItem).filter(Boolean);
+    if (window.SmartCanvasAgentApi?.arrangeNodes) {
+      return window.SmartCanvasAgentApi.arrangeNodes(list, options) || [];
+    }
+    throw new Error('当前画布还不支持 Agent 整理节点');
+  }
+
+  function groupNodesOnCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items]).map(normalizeCanvasNodeTargetItem).filter(Boolean);
+    if (window.SmartCanvasAgentApi?.groupNodes) {
+      return window.SmartCanvasAgentApi.groupNodes(list, options) || [];
+    }
+    throw new Error('当前画布还不支持 Agent 分组节点');
+  }
+
+  function ungroupNodesOnCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items]).map(normalizeCanvasNodeTargetItem).filter(Boolean);
+    if (window.SmartCanvasAgentApi?.ungroupNodes) {
+      return window.SmartCanvasAgentApi.ungroupNodes(list, options) || [];
+    }
+    throw new Error('当前画布还不支持 Agent 取消分组');
   }
 
   async function generateImageNodesToCanvas(items, options = {}) {
@@ -788,6 +882,23 @@
     const data = { ...item };
     const explicitRefs = normalizeCanvasReferences(data.reference_images || data.references || data.refs || data.ref || data.refId || data.ref_id || []);
     const textRefs = explicitRefs.length ? [] : referenceTokensFromText(data.prompt || data.text || '');
+    const refs = explicitRefs.length ? explicitRefs : textRefs;
+    if (refs.length) {
+      data.reference_images = refs;
+      delete data.references;
+      delete data.refs;
+      delete data.ref;
+      delete data.refId;
+      delete data.ref_id;
+    }
+    return data;
+  }
+
+  function normalizeCanvasNodeItem(item) {
+    if (!item) return null;
+    const data = typeof item === 'string' ? { text: item } : { ...item };
+    const explicitRefs = normalizeCanvasReferences(data.reference_images || data.references || data.refs || data.ref || data.refId || data.ref_id || []);
+    const textRefs = explicitRefs.length ? [] : referenceTokensFromText(data.prompt || data.text || data.variablePrompt || '');
     const refs = explicitRefs.length ? explicitRefs : textRefs;
     if (refs.length) {
       data.reference_images = refs;
@@ -1432,8 +1543,8 @@
       }
     }
     if (totalCreated > 0) {
-      botMsg.blocks.push({ type: 'tool', text: `已执行画布动作，新增 ${totalCreated} 个节点`, status: 'done' });
-      showHint(`已执行画布动作，新增 ${totalCreated} 个节点`);
+      botMsg.blocks.push({ type: 'tool', text: `已执行画布动作，影响 ${totalCreated} 个节点`, status: 'done' });
+      showHint(`已执行画布动作，影响 ${totalCreated} 个节点`);
       renderBody();
     }
   }
@@ -1477,6 +1588,26 @@
     if (type === 'add_loop' || type === 'add_loop_nodes') {
       const items = action.items || action.loops || [action];
       return addLoopNodesToCanvas(items, options);
+    }
+    if (type === 'group_node' || type === 'group_nodes' || type === 'create_group' || type === 'create_group_node') {
+      const items = action.items || action.nodes || action.targets || [];
+      return groupNodesOnCanvas(items, options);
+    }
+    if (type === 'ungroup_node' || type === 'ungroup_nodes' || type === 'split_group' || type === 'split_group_node') {
+      const items = action.items || action.nodes || action.targets || [];
+      return ungroupNodesOnCanvas(items, options);
+    }
+    if (type === 'rename_node' || type === 'rename_nodes' || type === 'set_node_title' || type === 'set_node_titles') {
+      const items = action.items || action.nodes || action.targets || [action];
+      return renameNodesOnCanvas(items, options);
+    }
+    if (type === 'move_node' || type === 'move_nodes' || type === 'position_node' || type === 'position_nodes') {
+      const items = action.items || action.nodes || action.targets || [action];
+      return moveNodesOnCanvas(items, options);
+    }
+    if (type === 'arrange_node' || type === 'arrange_nodes' || type === 'layout_nodes' || type === 'organize_nodes') {
+      const items = action.items || action.nodes || action.targets || [];
+      return arrangeNodesOnCanvas(items, options);
     }
     if (type === 'add_nodes') {
       const nodes = Array.isArray(action.nodes) ? action.nodes : (Array.isArray(action.items) ? action.items : []);
@@ -1560,10 +1691,10 @@
         html += renderMessageAttachments(attachItems || [], attachBlock?.count || attachItems.length || 0);
       }
       html += `<div class="cm-msg-user">${escapeHtml(normalized.text)}</div>`;
-      return `<div class="cm-msg">${html}</div>`;
+      return `<div class="cm-msg cm-msg-user-wrap">${html}</div>`;
     }
     const blocksHtml = msg.blocks.map(renderBlock).filter(Boolean).join('');
-    return `<div class="cm-msg">${blocksHtml}</div>`;
+    return `<div class="cm-msg cm-msg-bot-wrap">${blocksHtml}</div>`;
   }
 
   function normalizeUserDisplayText(text) {
@@ -1754,17 +1885,18 @@
 
   function renderCodeBlock(code, lang) {
     const label = safeStr(lang).trim().split(/\s+/)[0] || 'code';
+    const displayLabel = label.toLowerCase() === 'text' ? 'Prompt' : label;
     const clean = code.replace(/\n$/, '');
     const lineCount = clean ? clean.split('\n').length : 0;
     const summary = `${lineCount || 1} 行 · ${clean.length} 字符`;
-    return `<div class="cm-code-block cm-code-collapsed">
+    return `<div class="cm-code-block">
       <div class="cm-code-head">
         <span class="cm-code-title">
-          <span class="cm-code-lang">${escapeHtml(label)}</span>
+          <span class="cm-code-lang">${escapeHtml(displayLabel)}</span>
           <span class="cm-code-summary">${escapeHtml(summary)}</span>
         </span>
         <span class="cm-code-actions">
-          <button type="button" class="cm-code-toggle cm-icon-btn" aria-expanded="false" title="展开代码块">▾</button>
+          <button type="button" class="cm-code-toggle cm-icon-btn" aria-expanded="true" title="收起代码块">▴</button>
           <button type="button" class="cm-code-expand cm-icon-btn" title="放大查看">⛶</button>
           <button type="button" class="cm-code-copy cm-icon-btn" title="复制">⧉</button>
         </span>

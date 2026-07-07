@@ -4914,10 +4914,30 @@ function clearSmartNodeBusyState(node){
     delete node.pendingTasks;
     return node;
 }
+function setSmartNodeGenerationError(node, message='', kind='image'){
+    if(!node) return node;
+    node.running = false;
+    node.pending = 0;
+    node.queued = false;
+    delete node.jimengPending;
+    delete node.pendingTasks;
+    node.generationError = {
+        message:String(message || tr('smart.errRunFailed')).slice(0, 1000),
+        kind:kind || node.outputKind || 'image',
+        at:Date.now(),
+        logged:Boolean(node.generationError?.logged)
+    };
+    node.runFinishedAt = nowMs();
+    if(!node.runStartedAt) node.runStartedAt = node.runFinishedAt;
+    node.runElapsedMs = Math.max(0, node.runFinishedAt - Number(node.runStartedAt || node.runFinishedAt));
+    node.runTimerHidden = false;
+    return node;
+}
 function markSmartNodeComplete(node, meta=null){
     if(!node) return node;
     const keepHidden = node.runTimerHidden === true;
     clearSmartNodeBusyState(node);
+    delete node.generationError;
     node.runFinishedAt = Number(node.runFinishedAt || 0) || nowMs();
     if(!node.runStartedAt) node.runStartedAt = meta?.createdAt || node.runFinishedAt;
     node.runElapsedMs = Math.max(0, Number(node.runFinishedAt || nowMs()) - Number(node.runStartedAt || node.runFinishedAt || nowMs()));
@@ -5945,12 +5965,70 @@ function smartAgentSelectionBounds(){
     const bottom = Math.max(...rects.map(r => r.y + r.height));
     return {x:left, y:top, width:right - left, height:bottom - top, right, bottom};
 }
+function smartAgentAnchorRectFromRefs(refs=[]){
+    const list = Array.isArray(refs) ? refs : [refs];
+    for(const ref of list){
+        const nodeId = String(ref?.nodeId || ref?.node_id || '').trim();
+        if(!nodeId) continue;
+        const node = nodes.find(n => n.id === nodeId);
+        if(node) return nodeRect(node);
+    }
+    return null;
+}
+function smartAgentRectIntersects(a, b, pad=36){
+    if(!a || !b) return false;
+    return !(
+        a.x + a.width + pad <= b.x ||
+        b.x + b.width + pad <= a.x ||
+        a.y + a.height + pad <= b.y ||
+        b.y + b.height + pad <= a.y
+    );
+}
+function smartAgentFindOpenTopLeft(base, size, options={}){
+    const width = Number(size?.width) || Number(options.boxWidth) || 300;
+    const height = Number(size?.height) || Number(options.boxHeight) || 240;
+    const gapX = Number(options.gapX) || 88;
+    const gapY = Number(options.gapY) || 36;
+    const cellX = Math.max(Number(options.cellX) || 0, width + gapX);
+    const cellY = Math.max(Number(options.cellY) || 0, height + gapY);
+    const existing = nodes.map(nodeRect);
+    const rowOffsets = [0, 1, -1, 2, -2, 3, 4, -3, 5, 6, 7, 8];
+    for(let col = 0; col < 8; col++){
+        for(const row of rowOffsets){
+            const rect = {
+                x:Math.round((base.x || 0) + col * cellX),
+                y:Math.round((base.y || 0) + row * cellY),
+                width,
+                height
+            };
+            if(!existing.some(other => smartAgentRectIntersects(rect, other, Number(options.collisionPad) || 36))){
+                return {x:rect.x, y:rect.y};
+            }
+        }
+    }
+    return {
+        x:Math.round((base.x || 0) + 8 * cellX),
+        y:Math.round(base.y || 0)
+    };
+}
 function smartAgentGridPoint(index, total, options={}){
     const cellX = Number(options.cellX) || 360;
     const cellY = Number(options.cellY) || 330;
     const cols = Math.max(1, Number(options.cols) || Math.ceil(Math.sqrt(Math.max(1, total))));
     const baseRect = smartAgentSelectionBounds();
+    const anchorRect = smartAgentAnchorRectFromRefs(options.reference_images || options.references || options.refs || []);
     const center = viewportCenter();
+    const boxWidth = Number(options.boxWidth) || 0;
+    const boxHeight = Number(options.boxHeight) || 0;
+    if(anchorRect && boxWidth > 0 && boxHeight > 0){
+        const base = {
+            x:anchorRect.x + anchorRect.width + (Number(options.anchorGapX) || 88),
+            y:anchorRect.y + Math.floor(index / Math.max(1, cols)) * Math.max(cellY, boxHeight + 36)
+        };
+        const topLeft = smartAgentFindOpenTopLeft(base, {width:boxWidth, height:boxHeight}, options);
+        if(options.returnTopLeft) return {x:topLeft.x, y:topLeft.y};
+        return {x:Math.round(topLeft.x + boxWidth / 2), y:Math.round(topLeft.y + boxHeight / 2)};
+    }
     const baseX = Number.isFinite(Number(options.x))
         ? Number(options.x)
         : (baseRect ? baseRect.right + 220 : center.x);
@@ -5979,6 +6057,313 @@ function smartAgentNodeSummary(node){
             kind:mediaKindForItem(img)
         }))
     };
+}
+function smartAgentResolveNodeIdsFromItem(item={}){
+    const ids = [];
+    const add = value => {
+        const id = String(value || '').trim();
+        if(id && nodes.some(node => node.id === id) && !ids.includes(id)) ids.push(id);
+    };
+    add(item.node_id || item.nodeId || item.id);
+    const nodeIds = Array.isArray(item.node_ids) ? item.node_ids : (Array.isArray(item.nodeIds) ? item.nodeIds : []);
+    nodeIds.forEach(add);
+    if(item.selected || item.scope === 'selected') selectedNodeIds().forEach(add);
+    return ids;
+}
+function smartAgentGroupNodes(items=[], options={}){
+    const list = Array.isArray(items) ? items : [items];
+    const idSet = new Set();
+    list.forEach(item => smartAgentResolveNodeIdsFromItem(item || {}).forEach(id => idSet.add(id)));
+    if(!idSet.size && (options.selected || options.scope === 'selected')) selectedNodeIds().forEach(id => idSet.add(id));
+    if(!idSet.size) selectedNodeIds().forEach(id => idSet.add(id));
+    const selected = [...idSet].map(id => nodes.find(n => n.id === id)).filter(n => n && !isSmartGroupNode(n));
+    if(!selected.length) return [];
+    pushUndo();
+    const rects = selected.map(nodeRect);
+    const minX = Math.min(...rects.map(r => r.x));
+    const minY = Math.min(...rects.map(r => r.y));
+    const maxX = Math.max(...rects.map(r => r.x + r.width));
+    const maxY = Math.max(...rects.map(r => r.y + r.height));
+    const group = {
+        id:uid('group'),
+        type:'smart-group',
+        x:Math.round(minX - 18),
+        y:Math.round(minY - 44),
+        w:Math.max(340, Math.round(maxX - minX + 36)),
+        h:Math.max(220, Math.round(maxY - minY + 72)),
+        title:String(options.title || options.name || '').trim() || '智能分组',
+        items:[],
+        images:[],
+        created_at:Date.now()
+    };
+    nodes.push(group);
+    selected.forEach(node => addNodeToSmartGroup(group, node));
+    arrangeSmartGroupMembers(group, {skipUndo:true});
+    selectedIds = [];
+    selectedId = group.id;
+    selectedImage = {nodeId:'', index:-1};
+    render();
+    scheduleSave();
+    toast(`已由 Agent 分组 ${selected.length} 个节点`);
+    return [smartAgentNodeSummary(group)];
+}
+function smartAgentUngroupNodes(items=[], options={}){
+    const list = Array.isArray(items) ? items : [items];
+    const idSet = new Set();
+    list.forEach(item => smartAgentResolveNodeIdsFromItem(item || {}).forEach(id => idSet.add(id)));
+    if(!idSet.size && (options.selected || options.scope === 'selected')) selectedNodeIds().forEach(id => idSet.add(id));
+    if(!idSet.size) selectedNodeIds().forEach(id => idSet.add(id));
+    const beforeIds = new Set(nodes.map(node => node.id));
+    const groups = [...idSet].map(id => nodes.find(n => n.id === id)).filter(isSmartGroupNode);
+    const changed = [];
+    groups.forEach(group => {
+        if(ungroupNode(group.id)){
+            changed.push(group.id);
+        }
+    });
+    if(!changed.length) return [];
+    const affected = nodes.filter(node => !beforeIds.has(node.id) || selectedIds.includes(node.id) || selectedId === node.id);
+    toast(`已由 Agent 取消分组 ${changed.length} 个分组`);
+    return affected.map(smartAgentNodeSummary);
+}
+function smartAgentNameWithExistingExt(name, media={}){
+    const text = String(name || '').trim();
+    if(!text) return '';
+    if(/\.[a-z0-9]{2,8}$/i.test(text)) return text;
+    const source = String(media.name || media.url || '').split('?')[0];
+    const m = source.match(/(\.[a-z0-9]{2,8})$/i);
+    return m ? `${text}${m[1]}` : text;
+}
+function smartAgentRenameNodes(items=[], options={}){
+    const list = Array.isArray(items) ? items : [items];
+    const changes = [];
+    list.forEach(item => {
+        if(!item) return;
+        const name = String(item.name || item.title || item.label || item.text || '').trim();
+        if(!name) return;
+        const wantsNodeTitle = ['node_title','title'].includes(String(item.field || item.target_field || item.rename_field || '').toLowerCase()) || item.node_title === true || item.renameNodeTitle === true;
+        smartAgentResolveNodeIdsFromItem(item).forEach(id => {
+            const node = nodes.find(n => n.id === id);
+            if(!node) return;
+            const imageIndexRaw = item.image_index ?? item.imageIndex;
+            const imageIndex = Number.isFinite(Number(imageIndexRaw)) ? Number(imageIndexRaw) : (node.images?.length === 1 ? 0 : -1);
+            changes.push({node, name, imageIndex, field:wantsNodeTitle ? 'node_title' : 'media_name'});
+        });
+    });
+    if(!changes.length && (options.selected || options.scope === 'selected') && (options.title || options.name)){
+        selectedNodeIds().forEach(id => {
+            const node = nodes.find(n => n.id === id);
+            if(!node) return;
+            const wantsNodeTitle = ['node_title','title'].includes(String(options.field || options.target_field || options.rename_field || '').toLowerCase()) || options.node_title === true || options.renameNodeTitle === true;
+            changes.push({node, name:String(options.name || options.title || '').trim(), imageIndex:node.images?.length === 1 ? 0 : -1, field:wantsNodeTitle ? 'node_title' : 'media_name'});
+        });
+    }
+    const unique = [];
+    const seen = new Set();
+    changes.forEach(change => {
+        const key = `${change.node.id}|${change.field}|${change.imageIndex}`;
+        if(!change.name || seen.has(key)) return;
+        if(change.field !== 'node_title' && !(change.node.images || [])[change.imageIndex]) return;
+        seen.add(key);
+        unique.push(change);
+    });
+    if(!unique.length) return [];
+    pushUndo();
+    unique.forEach(({node, name, imageIndex, field}) => {
+        if(field === 'node_title') node.title = name;
+        else if(node.images?.[imageIndex]) node.images[imageIndex].name = smartAgentNameWithExistingExt(name, node.images[imageIndex]);
+    });
+    selectedId = unique.length === 1 ? unique[0].node.id : '';
+    selectedIds = unique.length > 1 ? unique.map(change => change.node.id) : [];
+    selectedImage = {nodeId:'', index:-1};
+    render();
+    scheduleSave();
+    toast(`已由 Agent 改名 ${unique.length} 个素材`);
+    return unique.map(change => smartAgentNodeSummary(change.node));
+}
+function smartAgentMoveNodes(items=[], options={}){
+    const list = Array.isArray(items) ? items : [items];
+    const changes = [];
+    list.forEach(item => {
+        if(!item) return;
+        smartAgentResolveNodeIdsFromItem(item).forEach(id => {
+            const node = nodes.find(n => n.id === id);
+            if(!node) return;
+            const hasX = Number.isFinite(Number(item.x));
+            const hasY = Number.isFinite(Number(item.y));
+            const dx = Number(item.dx ?? item.offset_x ?? item.offsetX ?? 0);
+            const dy = Number(item.dy ?? item.offset_y ?? item.offsetY ?? 0);
+            const x = hasX ? Number(item.x) : (Number(node.x) || 0) + (Number.isFinite(dx) ? dx : 0);
+            const y = hasY ? Number(item.y) : (Number(node.y) || 0) + (Number.isFinite(dy) ? dy : 0);
+            if(Number.isFinite(x) && Number.isFinite(y)) changes.push({node, x, y});
+        });
+    });
+    if(!changes.length && (options.selected || options.scope === 'selected')){
+        selectedNodeIds().forEach(id => {
+            const node = nodes.find(n => n.id === id);
+            if(!node) return;
+            const x = Number.isFinite(Number(options.x)) ? Number(options.x) : (Number(node.x) || 0) + (Number(options.dx) || 0);
+            const y = Number.isFinite(Number(options.y)) ? Number(options.y) : (Number(node.y) || 0) + (Number(options.dy) || 0);
+            if(Number.isFinite(x) && Number.isFinite(y)) changes.push({node, x, y});
+        });
+    }
+    const unique = [];
+    const seen = new Set();
+    changes.forEach(change => {
+        if(seen.has(change.node.id)) return;
+        seen.add(change.node.id);
+        unique.push(change);
+    });
+    if(!unique.length) return [];
+    pushUndo();
+    unique.forEach(({node, x, y}) => {
+        node.x = Math.round(x);
+        node.y = Math.round(y);
+    });
+    selectedId = unique.length === 1 ? unique[0].node.id : '';
+    selectedIds = unique.length > 1 ? unique.map(change => change.node.id) : [];
+    selectedImage = {nodeId:'', index:-1};
+    render();
+    scheduleSave();
+    toast(`已由 Agent 移动 ${unique.length} 个节点`);
+    return unique.map(change => smartAgentNodeSummary(change.node));
+}
+function smartAgentArrangeNodes(items=[], options={}){
+    const idSet = new Set();
+    const addIdsFromItem = item => smartAgentResolveNodeIdsFromItem(item).forEach(id => idSet.add(id));
+    (Array.isArray(items) ? items : [items]).filter(Boolean).forEach(addIdsFromItem);
+    if(!idSet.size && (options.selected || options.scope === 'selected')) selectedNodeIds().forEach(id => idSet.add(id));
+    if(!idSet.size && (options.all || options.scope === 'all' || options.scope === 'canvas')) nodes.forEach(node => idSet.add(node.id));
+    if(!idSet.size) selectedNodeIds().forEach(id => idSet.add(id));
+    const targetNodes = [...idSet].map(id => nodes.find(node => node.id === id)).filter(Boolean);
+    if(!targetNodes.length) return [];
+    const ids = new Set(targetNodes.map(node => node.id));
+    const relatedConnections = (canvas?.connections || []).filter(conn => ids.has(conn.from) && ids.has(conn.to));
+    const rects = targetNodes.map(node => ({node, rect:nodeRect(node)}));
+    const minX = Number.isFinite(Number(options.x)) ? Number(options.x) : Math.min(...rects.map(item => item.rect.x));
+    const minY = Number.isFinite(Number(options.y)) ? Number(options.y) : Math.min(...rects.map(item => item.rect.y));
+    const cellX = Number(options.cellX) || Math.max(420, Math.max(...rects.map(item => item.rect.width)) + 110);
+    const cellY = Number(options.cellY) || Math.max(260, Math.max(...rects.map(item => item.rect.height)) + 54);
+    const mode = String(options.mode || options.layout || '').toLowerCase();
+    if(relatedConnections.length && mode !== 'layers' && mode !== 'columns'){
+        const incoming = new Map(targetNodes.map(node => [node.id, 0]));
+        const outgoing = new Map(targetNodes.map(node => [node.id, []]));
+        relatedConnections.forEach(conn => {
+            incoming.set(conn.to, (incoming.get(conn.to) || 0) + 1);
+            outgoing.get(conn.from)?.push(conn.to);
+        });
+        const byOriginalPosition = (a, b) => {
+            const na = nodes.find(node => node.id === a);
+            const nb = nodes.find(node => node.id === b);
+            return (Number(na?.y) || 0) - (Number(nb?.y) || 0)
+                || (Number(na?.x) || 0) - (Number(nb?.x) || 0)
+                || String(a).localeCompare(String(b));
+        };
+        const roots = targetNodes
+            .filter(node => (incoming.get(node.id) || 0) === 0)
+            .map(node => node.id)
+            .sort(byOriginalPosition);
+        const queue = roots.length ? roots.slice() : targetNodes.map(node => node.id).sort(byOriginalPosition);
+        const orderedIds = [];
+        const seen = new Set();
+        while(queue.length){
+            const id = queue.shift();
+            if(seen.has(id)) continue;
+            seen.add(id);
+            orderedIds.push(id);
+            const next = (outgoing.get(id) || []).slice().sort(byOriginalPosition);
+            next.forEach(childId => {
+                if(!seen.has(childId)) queue.push(childId);
+            });
+        }
+        targetNodes.map(node => node.id).sort(byOriginalPosition).forEach(id => {
+            if(!seen.has(id)) orderedIds.push(id);
+        });
+        const ordered = orderedIds.map(id => nodes.find(node => node.id === id)).filter(Boolean);
+        const rootNode = ordered[0] || targetNodes[0];
+        const rootRect = nodeRect(rootNode);
+        const baseX = Number.isFinite(Number(options.x)) ? Number(options.x) : rootRect.x;
+        const baseCenterY = Number.isFinite(Number(options.centerY))
+            ? Number(options.centerY)
+            : (Number.isFinite(Number(options.y)) ? Number(options.y) + rootRect.height / 2 : rootRect.y + rootRect.height / 2);
+        const gapX = Number(options.gapX) || 80;
+        const changes = [];
+        let cursorX = Math.round(baseX);
+        ordered.forEach((node, index) => {
+            const rect = nodeRect(node);
+            const x = index === 0 ? Math.round(baseX) : Math.round(cursorX);
+            const y = Math.round(baseCenterY - rect.height / 2);
+            changes.push({node, x, y});
+            cursorX = x + rect.width + Math.max(gapX, Number(options.minGapX) || 0);
+            if(Number(options.cellX) > 0) cursorX = Math.max(cursorX, Math.round(baseX + (index + 1) * Number(options.cellX)));
+        });
+        if(!changes.length) return [];
+        pushUndo();
+        changes.forEach(({node, x, y}) => {
+            node.x = x;
+            node.y = y;
+        });
+        selectedId = changes.length === 1 ? changes[0].node.id : '';
+        selectedIds = changes.length > 1 ? changes.map(change => change.node.id) : [];
+        selectedImage = {nodeId:'', index:-1};
+        render();
+        scheduleSave();
+        toast(`已由 Agent 横向整理 ${changes.length} 个节点`);
+        return changes.map(change => smartAgentNodeSummary(change.node));
+    }
+    const depth = new Map(targetNodes.map(node => [node.id, 0]));
+    if(relatedConnections.length){
+        const incoming = new Map(targetNodes.map(node => [node.id, 0]));
+        const outgoing = new Map(targetNodes.map(node => [node.id, []]));
+        relatedConnections.forEach(conn => {
+            incoming.set(conn.to, (incoming.get(conn.to) || 0) + 1);
+            outgoing.get(conn.from)?.push(conn.to);
+        });
+        const queue = [...incoming.entries()].filter(([, count]) => count === 0).map(([id]) => id);
+        const visited = new Set(queue);
+        while(queue.length){
+            const id = queue.shift();
+            (outgoing.get(id) || []).forEach(next => {
+                depth.set(next, Math.max(depth.get(next) || 0, (depth.get(id) || 0) + 1));
+                incoming.set(next, (incoming.get(next) || 0) - 1);
+                if((incoming.get(next) || 0) <= 0 && !visited.has(next)){
+                    visited.add(next);
+                    queue.push(next);
+                }
+            });
+        }
+        relatedConnections.forEach(conn => {
+            if((depth.get(conn.to) || 0) <= (depth.get(conn.from) || 0)) {
+                depth.set(conn.to, (depth.get(conn.from) || 0) + 1);
+            }
+        });
+    }
+    const columns = new Map();
+    targetNodes.forEach(node => {
+        const d = depth.get(node.id) || 0;
+        if(!columns.has(d)) columns.set(d, []);
+        columns.get(d).push(node);
+    });
+    const changes = [];
+    [...columns.entries()].sort((a, b) => a[0] - b[0]).forEach(([d, colNodes]) => {
+        colNodes.sort((a, b) => (Number(a.y) || 0) - (Number(b.y) || 0) || String(a.id).localeCompare(String(b.id)));
+        colNodes.forEach((node, row) => {
+            changes.push({node, x:Math.round(minX + d * cellX), y:Math.round(minY + row * cellY)});
+        });
+    });
+    if(!changes.length) return [];
+    pushUndo();
+    changes.forEach(({node, x, y}) => {
+        node.x = x;
+        node.y = y;
+    });
+    selectedId = changes.length === 1 ? changes[0].node.id : '';
+    selectedIds = changes.length > 1 ? changes.map(change => change.node.id) : [];
+    selectedImage = {nodeId:'', index:-1};
+    render();
+    scheduleSave();
+    toast(`已由 Agent 整理 ${changes.length} 个节点`);
+    return changes.map(change => smartAgentNodeSummary(change.node));
 }
 function smartAgentMediaItem(item){
     const source = item || {};
@@ -6057,6 +6442,10 @@ function smartAgentRunLog(node, prompt, refs, kind, runSettings, request={}){
         refs:(refs || []).map(ref => ({url:ref.url || '', name:ref.name || 'image', kind:ref.kind || ''})).filter(ref => ref.url),
         size:request.size || ''
     };
+}
+async function smartAgentSaveNow(){
+    clearTimeout(saveTimer);
+    await saveCanvas();
 }
 function smartAgentProviderOptions(){
     return imageProviders().map(provider => ({
@@ -6202,7 +6591,12 @@ function smartAgentCreatePendingNode(prompt, payload, index, total, options={}){
         pendingBox.w = count <= 1 ? display.w : pendingBox.w;
         pendingBox.h = count <= 1 ? display.h : pendingBox.h;
     }
-    const point = smartAgentGridPoint(index, total, options);
+    const point = smartAgentGridPoint(index, total, {
+        ...options,
+        reference_images:payload.reference_images || options.reference_images || options.references || options.refs || [],
+        boxWidth:pendingBox.w,
+        boxHeight:pendingBox.h
+    });
     const node = {
         id:uid('smart'),
         type:'smart-image',
@@ -6272,7 +6666,7 @@ async function smartAgentGenerateImageItems(items=[], options={}){
             n:count,
             reference_images:refs
         };
-        const pending = smartAgentCreatePendingNode(prompt, payload, itemIndex, list.length, baseOptions);
+        const pending = smartAgentCreatePendingNode(prompt, payload, itemIndex, list.length, {...baseOptions, reference_images:refs});
         smartAgentConnectReferenceNodes(pending.node, refs);
         const runSettings = {
             ...cloneSmartSettings(settings),
@@ -6292,6 +6686,7 @@ async function smartAgentGenerateImageItems(items=[], options={}){
         selectedImage = {nodeId:'', index:-1};
         render();
         scheduleSave();
+        await smartAgentSaveNow();
         const created = await fetch('/api/canvas-image-tasks', {
             method:'POST',
             headers:{'Content-Type':'application/json'},
@@ -6303,6 +6698,7 @@ async function smartAgentGenerateImageItems(items=[], options={}){
         pending.node.pendingTasks = [{taskId:created.task_id, kind:'image', providerId:payload.provider_id, model:payload.model}];
         render();
         scheduleSave();
+        await smartAgentSaveNow();
         (async () => {
             try {
                 const result = await pollSmartCanvasTask(created.task_id);
@@ -6311,15 +6707,20 @@ async function smartAgentGenerateImageItems(items=[], options={}){
                 addSmartGenerationLog({run:runLog, outputs, runMs:nowMs() - runLogStart});
                 render();
                 scheduleSave();
+                await smartAgentSaveNow();
             } catch(e) {
-                if(handleJimengPendingSignal(pending.node, e)) return;
-                pending.node.pending = 0;
-                pending.node.running = false;
+                if(handleJimengPendingSignal(pending.node, e)){
+                    await smartAgentSaveNow();
+                    return;
+                }
+                setSmartNodeGenerationError(pending.node, e.message || tr('smart.errRunFailed'), 'image');
                 pending.node.pendingTasks = (pending.node.pendingTasks || []).map(task => task.taskId === created.task_id ? {...task, failed:true, error:e.message || String(e)} : task);
                 addSmartGenerationLog({run:runLog, outputs:[], runMs:nowMs() - runLogStart, error:e.message || String(e)});
+                if(pending.node.generationError) pending.node.generationError.logged = true;
                 toast((e.message || tr('smart.errRunFailed')).slice(0, 160));
                 render();
                 scheduleSave();
+                await smartAgentSaveNow();
             }
         })();
     }
@@ -6356,7 +6757,7 @@ async function smartAgentGenerateVideoItems(items=[], options={}){
             multimodal:item.multimodal ?? baseOptions.multimodal ?? settings.videoMultimodal,
             use_frame_roles:item.use_frame_roles ?? baseOptions.use_frame_roles ?? settings.videoUseFrameRoles
         };
-        const pending = smartAgentCreatePendingNode(prompt, payload, itemIndex, list.length, {...baseOptions, kind:'video'});
+        const pending = smartAgentCreatePendingNode(prompt, payload, itemIndex, list.length, {...baseOptions, kind:'video', reference_images:refs});
         smartAgentConnectReferenceNodes(pending.node, refs);
         pendingNodes.push(pending.node.id);
         selectedId = pending.node.id;
@@ -6364,6 +6765,7 @@ async function smartAgentGenerateVideoItems(items=[], options={}){
         selectedImage = {nodeId:'', index:-1};
         render();
         scheduleSave();
+        await smartAgentSaveNow();
         const runSettings = {
             ...cloneSmartSettings(settings),
             engine:'api',
@@ -6383,22 +6785,53 @@ async function smartAgentGenerateVideoItems(items=[], options={}){
         };
         const runLog = smartAgentRunLog(pending.node, prompt, refs, 'video', runSettings);
         const runLogStart = nowMs();
+        const videoTaskPayload = {
+            ...payload,
+            images:imageRefsOnly(refs).map((ref, i) => ({
+                url:ref.url,
+                name:ref.name || `图${i + 1}`,
+                role:ref.role || ''
+            })),
+            videos:videoRefsOnly(refs).map(ref => ref.url).filter(Boolean),
+            audios:audioRefsOnly(refs).map(ref => ref.url).filter(Boolean)
+        };
+        const created = await fetch('/api/canvas-video-tasks', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify(videoTaskPayload)
+        }).then(async r => {
+            if(!r.ok) throw new Error(await r.text());
+            return r.json();
+        });
+        pending.node.pendingTasks = [{taskId:created.task_id, kind:'video', providerId:payload.provider_id, model:payload.model}];
+        pending.node.pending = 1;
+        pending.node.running = false;
+        render();
+        scheduleSave();
+        await smartAgentSaveNow();
         (async () => {
             try {
-                const outputs = await runApiVideoGeneration(prompt, refs, runSettings);
+                const result = await pollSmartCanvasTask(created.task_id, 'video');
+                const outputs = resultMediaUrls(result?.videos?.length ? result.videos : result);
                 if(!outputs.length) throw new Error(tr('smart.errNoOutVideos'));
-                finalizePendingNode(pending.node, outputs, pending.meta, 'video');
+                finalizeSmartPendingTask(pending.node, created.task_id, outputs, 'video');
                 addSmartGenerationLog({run:runLog, outputs, runMs:nowMs() - runLogStart});
                 render();
                 scheduleSave();
+                await smartAgentSaveNow();
             } catch(e) {
-                if(handleJimengPendingSignal(pending.node, e)) return;
-                pending.node.pending = 0;
-                pending.node.running = false;
+                if(handleJimengPendingSignal(pending.node, e)){
+                    await smartAgentSaveNow();
+                    return;
+                }
+                setSmartNodeGenerationError(pending.node, e.message || tr('smart.errRunFailed'), 'video');
+                pending.node.pendingTasks = (pending.node.pendingTasks || []).map(task => task.taskId === created.task_id ? {...task, failed:true, error:e.message || String(e)} : task);
                 addSmartGenerationLog({run:runLog, outputs:[], runMs:nowMs() - runLogStart, error:e.message || String(e)});
+                if(pending.node.generationError) pending.node.generationError.logged = true;
                 toast((e.message || tr('smart.errRunFailed')).slice(0, 160));
                 render();
                 scheduleSave();
+                await smartAgentSaveNow();
             }
         })();
     }
@@ -6415,6 +6848,8 @@ function installSmartCanvasAgentApi(){
                 selectedNodeIds:selectedNodeIds(),
                 selectedImage:{...selectedImage},
                 selectedNodes:selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean).map(smartAgentNodeSummary),
+                allNodes:nodes.map(smartAgentNodeSummary),
+                connections:(canvas?.connections || []).map(conn => ({from:conn.from || '', to:conn.to || '', kind:conn.kind || 'flow'})),
                 imageGeneration:this.getImageGenerationDefaults(),
                 videoGeneration:this.getVideoGenerationDefaults()
             };
@@ -6481,8 +6916,11 @@ function installSmartCanvasAgentApi(){
             pushUndo();
             const created = [];
             list.forEach((item, index) => {
-                const point = smartAgentGridPoint(index, list.length, options);
-                const node = createImageNodeAt(point, [smartAgentMediaItem(item)], {skipUndo:true, select:false});
+                const media = smartAgentMediaItem(item);
+                const layout = imageLayout([media], mediaNodeDefaultScale({type:'smart-image', images:[media]}), {type:'smart-image', images:[media]});
+                const refs = smartAgentImageRefs(item.reference_images || item.references || item.refs || options.reference_images || options.references || options.refs || []);
+                const point = smartAgentGridPoint(index, list.length, {...options, reference_images:refs, boxWidth:layout.width, boxHeight:layout.height});
+                const node = createImageNodeAt(point, [media], {skipUndo:true, select:false});
                 if(node) created.push(node);
             });
             selectedId = created.length === 1 ? created[0].id : '';
@@ -6499,7 +6937,8 @@ function installSmartCanvasAgentApi(){
             pushUndo();
             const created = [];
             list.forEach((item, index) => {
-                const point = smartAgentGridPoint(index, list.length, {...options, cellX:Number(options.cellX) || 360, cellY:Number(options.cellY) || 280});
+                const refs = smartAgentImageRefs(item.reference_images || item.references || item.refs || options.reference_images || options.references || options.refs || []);
+                const point = smartAgentGridPoint(index, list.length, {...options, reference_images:refs, cellX:Number(options.cellX) || 360, cellY:Number(options.cellY) || 280, boxWidth:316, boxHeight:240, returnTopLeft:true});
                 const node = createPromptNode(point.x, point.y, {skipUndo:true, select:false});
                 node.title = item.title || 'Prompt';
                 node.text = String(item.text || '');
@@ -6519,7 +6958,8 @@ function installSmartCanvasAgentApi(){
             pushUndo();
             const created = [];
             list.forEach((item, index) => {
-                const point = smartAgentGridPoint(index, list.length, {...options, cellX:Number(options.cellX) || 380, cellY:Number(options.cellY) || 230});
+                const refs = smartAgentImageRefs(item.reference_images || item.references || item.refs || options.reference_images || options.references || options.refs || []);
+                const point = smartAgentGridPoint(index, list.length, {...options, reference_images:refs, cellX:Number(options.cellX) || 380, cellY:Number(options.cellY) || 230, boxWidth:340, boxHeight:168, returnTopLeft:true});
                 const node = createLoopNode(point.x, point.y, {skipUndo:true, select:false});
                 if(item.title) node.title = String(item.title);
                 if(item.count) node.count = Math.max(1, Number(item.count) || 1);
@@ -6533,6 +6973,21 @@ function installSmartCanvasAgentApi(){
             scheduleSave();
             toast(`已由 Agent 添加 ${created.length} 个循环节点`);
             return created.map(smartAgentNodeSummary);
+        },
+        renameNodes(items=[], options={}){
+            return smartAgentRenameNodes(items, options);
+        },
+        groupNodes(items=[], options={}){
+            return smartAgentGroupNodes(items, options);
+        },
+        ungroupNodes(items=[], options={}){
+            return smartAgentUngroupNodes(items, options);
+        },
+        moveNodes(items=[], options={}){
+            return smartAgentMoveNodes(items, options);
+        },
+        arrangeNodes(items=[], options={}){
+            return smartAgentArrangeNodes(items, options);
         },
         getImageGenerationDefaults(){
             return {
@@ -7710,6 +8165,9 @@ function nodeBodyHtml(node, layout){
     if(recoverTask && imgs.length === 0){
         return imageTaskRecoverBodyHtml(node, recoverTask, layout);
     }
+    if(node.generationError && imgs.length === 0){
+        return generationErrorBodyHtml(node, layout);
+    }
     if(node.queued && imgs.length === 0 && !node.pending){
         return `<div class="loading-cell single queued" style="width:${layout.width}px;height:${layout.height}px"></div>`;
     }
@@ -7747,6 +8205,17 @@ function jimengPendingBodyHtml(node, layout){
 }
 function smartRecoverableImageTask(node){
     return smartPendingTasks(node).find(task => task.failed && task.recoverTaskId) || null;
+}
+function generationErrorBodyHtml(node, layout){
+    const err = node.generationError || {};
+    const message = String(err.message || tr('smart.errRunFailed'));
+    return `<div class="jimeng-pending-cell loading-cell single" style="width:${layout.width}px;height:${layout.height}px">
+        <div class="jimeng-pending-overlay">
+            <div class="jimeng-pending-spinner"><i data-lucide="circle-alert"></i></div>
+            <div class="jimeng-pending-text">生成失败</div>
+            <div class="jimeng-pending-sub">${escapeHtml(message)}</div>
+        </div>
+    </div>`;
 }
 function imageTaskRecoverBodyHtml(node, task, layout){
     const querying = Boolean(task.querying);
@@ -15428,6 +15897,7 @@ function setNodeJimengPending(node, signal){
     node.running = false;
     node.pending = 0;
     delete node.pendingTasks;
+    delete node.generationError;
     if(!node.runStartedAt) node.runStartedAt = node.jimengPending.startedAt;
     delete node.runFinishedAt;
     delete node.runElapsedMs;
@@ -15453,6 +15923,7 @@ function finalizeJimengPending(node, urls, kind='image'){
     }).filter(item => item.url);
     if(!additions.length) return false;
     delete node.jimengPending;
+    delete node.generationError;
     replaceOutputsToNodeWithHistory(node, additions, kind, null, {skipShift:true});
     node.running = false;
     node.pending = 0;
@@ -15479,9 +15950,9 @@ function applyJimengQueryResult(node, data){
         const runSettings = cloneSmartSettings(node.runSettings || {});
         const runLog = smartAgentRunLog(node, node.runPrompt || node.runModelPrompt || '', node.runInputRefs || [], kind, runSettings, {size:sizeForRun(runSettings)});
         delete node.jimengPending;
-        node.running = false;
-        node.pending = 0;
+        setSmartNodeGenerationError(node, data.error || '即梦任务失败', kind);
         addSmartGenerationLog({run:runLog, outputs:[], runMs:Math.max(0, nowMs() - runStartedAt), error:data.error || '即梦任务失败'});
+        if(node.generationError) node.generationError.logged = true;
         toast((data.error || '即梦任务失败').slice(0, 160));
         render();
         scheduleSave();
@@ -15607,13 +16078,16 @@ function resumeJimengPendingNodes(){
         startJimengPoll(n);
     });
 }
-async function pollSmartCanvasTask(taskId){
+async function pollSmartCanvasTask(taskId, taskKind='image'){
     if(!taskId) throw new Error(tr('smart.errRunFailed'));
     if(activeSmartTaskPolls.has(taskId)) return activeSmartTaskPolls.get(taskId);
     const promise = (async () => {
         for(let i = 0; i < 900; i++){
             await new Promise(resolve => setTimeout(resolve, 2000));
-            const task = await fetch(`/api/canvas-image-tasks/${encodeURIComponent(taskId)}`).then(async r => {
+            const endpoint = String(taskId).startsWith('canvas_vid_') || taskKind === 'video'
+                ? `/api/canvas-video-tasks/${encodeURIComponent(taskId)}`
+                : `/api/canvas-image-tasks/${encodeURIComponent(taskId)}`;
+            const task = await fetch(endpoint).then(async r => {
                 if(!r.ok) throw new Error(await r.text());
                 return r.json();
             });
@@ -15656,6 +16130,7 @@ function finalizeSmartPendingTask(node, taskId, images, kind='image'){
     if(additions.length) node.outputKind = kind;
     if(!node.pending && smartPendingTasks(node).length === 0){
         delete node.pendingTasks;
+        delete node.generationError;
         node.runFinishedAt = nowMs();
         if(!node.runStartedAt) node.runStartedAt = node.runFinishedAt;
         node.runElapsedMs = Math.max(0, node.runFinishedAt - Number(node.runStartedAt || node.runFinishedAt));
@@ -15672,14 +16147,25 @@ async function resumeSmartPendingNode(node, logContext={}){
     const tasks = smartPendingTasks(node);
     if(!node || !tasks.length) return;
     const logTaskFailure = (message, task) => {
-        if(!logContext?.run || !message) return;
-        const runMs = Math.max(0, nowMs() - Number(logContext.runLogStart || nowMs()));
+        if(!message || node.generationError?.logged) return;
+        const kind = task?.kind || node.outputKind || 'image';
+        const run = logContext?.run || smartAgentRunLog(
+            node,
+            node.runPrompt || node.runModelPrompt || '',
+            node.runInputRefs || [],
+            kind,
+            cloneSmartSettings(node.runSettings || {}),
+            {size:sizeForRun(node.runSettings || settings)}
+        );
+        const startedAt = Number(logContext.runLogStart || node.runStartedAt || nowMs());
+        const runMs = Math.max(0, nowMs() - startedAt);
         addSmartGenerationLog({
-            run:logContext.run,
+            run,
             outputs:[],
             runMs,
             error:message
         });
+        if(node.generationError) node.generationError.logged = true;
     };
     node.pending = Math.max(tasks.length, Number(node.pending || 0) || tasks.length);
     node.running = false;
@@ -15718,11 +16204,8 @@ async function resumeSmartPendingNode(node, logContext={}){
             node.pending = Math.max(0, Number(node.pending || 0) - 1);
             if(!node.pending && smartPendingTasks(node).length === 0){
                 delete node.pendingTasks;
-                node.running = false;
-                if(!(node.images || []).length){
-                    delete node.w;
-                    delete node.h;
-                }
+                if(!(node.images || []).length) setSmartNodeGenerationError(node, e.message || tr('smart.errRunFailed'), task.kind || 'image');
+                else node.running = false;
             }
             failures.push(e);
             logTaskFailure(e.message || tr('smart.errRunFailed'), task);

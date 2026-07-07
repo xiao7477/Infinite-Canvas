@@ -13668,6 +13668,72 @@ async def canvas_video(payload: CanvasVideoRequest):
         log_net_error(f"视频 网络/TLS错误 provider={provider.get('id')} model={payload.model}", exc)
         raise HTTPException(status_code=502, detail=f"请求上游视频接口失败：{exc}") from exc
 
+async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
+    with CANVAS_TASK_LOCK:
+        if task_id in CANVAS_TASKS:
+            CANVAS_TASKS[task_id]["status"] = "running"
+            CANVAS_TASKS[task_id]["updated_at"] = time.time()
+    try:
+        result = await canvas_video(payload)
+        with CANVAS_TASK_LOCK:
+            CANVAS_TASKS[task_id].update({
+                "status": "succeeded",
+                "result": result,
+                "error": "",
+                "updated_at": time.time(),
+            })
+    except JimengPendingError as exc:
+        info = jimeng_pending_payload(exc)
+        with CANVAS_TASK_LOCK:
+            CANVAS_TASKS[task_id].update({
+                "status": "jimeng_pending",
+                "jimeng_pending": True,
+                "submit_id": exc.submit_id,
+                "kind": exc.kind or "video",
+                "queue_info": exc.queue_info,
+                "message": info["message"],
+                "error": "",
+                "updated_at": time.time(),
+            })
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc)
+        status_code = getattr(exc, "status_code", 500)
+        upstream_task_id = getattr(exc, "upstream_task_id", "") or extract_task_id_from_text(detail)
+        with CANVAS_TASK_LOCK:
+            CANVAS_TASKS[task_id].update({
+                "status": "failed",
+                "error": str(detail),
+                "status_code": status_code,
+                "upstream_task_id": upstream_task_id,
+                "updated_at": time.time(),
+            })
+
+@app.post("/api/canvas-video-tasks")
+async def create_canvas_video_task(payload: CanvasVideoRequest):
+    task_id = f"canvas_vid_{uuid.uuid4().hex}"
+    with CANVAS_TASK_LOCK:
+        CANVAS_TASKS[task_id] = {
+            "id": task_id,
+            "type": "canvas-video",
+            "status": "queued",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "result": None,
+            "error": "",
+            "provider_id": payload.provider_id,
+            "model": payload.model,
+        }
+    asyncio.create_task(run_canvas_video_task(task_id, payload))
+    return {"task_id": task_id, "status": "queued"}
+
+@app.get("/api/canvas-video-tasks/{task_id}")
+async def get_canvas_video_task(task_id: str):
+    with CANVAS_TASK_LOCK:
+        task = dict(CANVAS_TASKS.get(task_id) or {})
+    if not task:
+        raise HTTPException(status_code=404, detail="画布视频任务不存在，可能服务已重启或任务已过期")
+    return task
+
 # --- Canvas LLM ---
 
 @app.post("/api/canvas-llm")
@@ -16712,7 +16778,9 @@ class CodexAppServerSession:
             if self.proc is not None and self.proc.returncode is None:
                 return self.thread_id or ""
 
-            cli = shutil.which("codex") or "/opt/homebrew/bin/codex"
+            cli = codex_cli_executable()
+            if not cli:
+                raise HTTPException(status_code=400, detail="未找到 OpenAI Codex CLI。请先在 API 设置里安装/检测 Codex CLI，并完成 codex 登录。")
             env = {**os.environ, "PWD": self.project_dir}
 
             self.proc = await asyncio.create_subprocess_exec(
@@ -17144,18 +17212,25 @@ def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]], 
         "这些素材按用户在输入框附件区的顺序排列：图一/第一张=ref_1，图二/第二张=ref_2，依此类推。",
         "local_path 是本机临时缓存文件，仅用于本轮读取；如果要保存文件，请把 local_path 复制到 project_dir 或用户指定的子目录，不要把缓存目录当作最终目录。",
         "完成文件操作后，请明确回复保存后的路径。",
-        "如果用户要求你把图片、视频、提示词、文本或循环节点放回画布，请在回复末尾输出一个 fenced 代码块，语言名必须是 canvas_agent_action。",
+        "如果用户要求你把图片、视频、提示词、文本或循环节点放回画布，或要求移动/改名/分组/取消分组画布节点，请在回复末尾输出一个 fenced 代码块，语言名必须是 canvas_agent_action。",
         "确认机制：当用户要求模糊且会明显影响成本、耗时或结果偏差时，先用简短中文反问确认，不要输出 canvas_agent_action。",
+        "移动大量节点、全画布整理、批量改名时，先给简短整理/命名方案并请用户确认；用户明确说直接执行时才输出动作。",
         "尤其是生视频、批量生图/生视频、数量较多、没有说明模型/时长/比例/清晰度/运动方式/是否直接执行时，应先给出当前默认值和一个推荐方案请用户确认。",
         "如果用户明确说“直接执行/按默认/你决定/不用问/先跑起来/马上生成”，则可以用当前默认值执行，无需反问。",
         "当用户明确说“记住/以后都这样/作为偏好/写入规则”时，在回复末尾额外输出 remember_preference 动作，note 必须是 60 字以内中文短句。",
         "在画布 Agent 面板里，用户说“生成图片/画一张/做几张图”等生图请求时，默认就是要在当前画布生成并新增图片节点；不要要求用户额外说明“放到画布”。",
         "用户说“生成视频/生视频/图生视频/调用即梦做视频”等请求时，默认就是要在当前智能画布创建视频生成节点；请输出 generate_video 动作，不要只口头说明。",
         "前端会读取并执行该动作块，然后把动作块从聊天正文里隐藏。不要把动作块当作普通说明。",
+        "重要命名规则：用户说“节点重命名/给节点命名/根据内容命名”时，默认是改资产详情里的素材显示名 images[index].name，不是改来源节点/节点标题。对用户说明时说“素材名/详情名称/显示名”，不要说“节点标题”。",
+        "除非用户明确说“改来源节点/改节点标题/title”，否则不要使用 field:\"node_title\"，也不要承诺修改节点 title。",
+        "对用户可见的命名方案不要展示 smart_xxx/prompt_xxx/loop_xxx 这类内部 id；用 图1/图2、当前素材名、缩略图顺序或简短内容标签展示。内部 id 只可用于隐藏 canvas_agent_action。",
         "动作块 JSON 示例：{\"actions\":[{\"type\":\"generate_image\",\"items\":[{\"prompt\":\"一张复古东方民俗木版年画海报\",\"count\":1}]},{\"type\":\"generate_video\",\"items\":[{\"prompt\":\"固定镜头，人物轻微举杯，10秒\",\"duration\":10,\"provider_id\":\"jimeng\",\"reference_images\":[\"ref_1\"]}]}]}",
+        "移动/改名/分组示例：{\"actions\":[{\"type\":\"rename_nodes\",\"items\":[{\"ref\":\"ref_1\",\"name\":\"酒坛人物夜宴_01.png\"}]},{\"type\":\"group_nodes\",\"items\":[{\"ref\":\"ref_1\"},{\"ref\":\"ref_2\"}],\"options\":{\"title\":\"参考素材\"}},{\"type\":\"arrange_nodes\",\"items\":[{\"ref\":\"ref_1\"},{\"ref\":\"ref_2\"}],\"options\":{\"cellX\":460,\"cellY\":320}}]}",
         "记忆动作示例：{\"actions\":[{\"type\":\"remember_preference\",\"note\":\"生视频参数不明确时先确认\"}]}",
-        "支持的 type: generate_image/generate_video/add_media/add_image/add_video/add_prompt/add_text/add_loop/add_nodes/remember_preference。generate_image 会调用当前画布 API 生图设置，items 里每项至少包含 prompt，可选 count/n、size、quality、model、provider_id、reference_images。",
+        "支持的 type: generate_image/generate_video/add_media/add_image/add_video/add_prompt/add_text/add_loop/add_nodes/rename_nodes/group_nodes/ungroup_nodes/move_nodes/arrange_nodes/remember_preference。generate_image 会调用当前画布 API 生图设置，items 里每项至少包含 prompt，可选 count/n、size、quality、model、provider_id、reference_images。",
         "generate_video 会调用当前画布 API 视频设置，items 里每项至少包含 prompt，可选 duration/seconds、aspect_ratio/ratio、resolution、model、provider_id、reference_images、camerafixed/camera_fixed、generate_audio。",
+        "rename_nodes 默认只修改节点内素材显示名 images[index].name，也就是资产详情里的名称；不改真实文件名、不改 url、不改节点 title。只有用户明确要求改来源节点/节点标题时，才传 field:\"node_title\"。",
+        "move_nodes 只修改节点坐标；items 可用 node_id/id/ref/ref_1/图1 和 x/y 或 dx/dy。整理连线节点时优先用 arrange_nodes，不要手算每个坐标；默认 arrange_nodes 会把上游放左、下游按连接顺序在同一水平线向右依次排开；只有用户要求分层/分列时才传 options.mode=\"layers\"。",
         "如果用户指定 GPT/OpenAI/Codex/即梦/其它平台、模型、比例、尺寸、高清/低清、数量、时长、固定镜头，请优先根据 available_image_providers/available_video_providers 填入准确 provider_id、model、size/quality/count/duration/aspect_ratio/camerafixed；如果不确定才省略并使用当前默认值。",
         "media item 可用 path 或 url；本机绝对路径会由前端转成可预览地址。",
         "user_canvas_preferences:",
@@ -17181,6 +17256,8 @@ def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]], 
     native = ctx.get("native") if isinstance(ctx.get("native"), dict) else {}
     image_defaults = native.get("imageGeneration") or native.get("image_generation") or {}
     video_defaults = native.get("videoGeneration") or native.get("video_generation") or {}
+    all_nodes = native.get("allNodes") or native.get("all_nodes") or []
+    connections = native.get("connections") or []
     providers = image_defaults.get("providers") if isinstance(image_defaults, dict) else []
     video_providers = video_defaults.get("providers") if isinstance(video_defaults, dict) else []
     if isinstance(image_defaults, dict) and image_defaults:
@@ -17227,6 +17304,36 @@ def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]], 
                 f"  protocol: {provider.get('protocol') or ''}",
                 f"  video_models: {', '.join(str(model) for model in models[:20])}",
             ])
+    if isinstance(all_nodes, list) and all_nodes:
+        lines.append("current_canvas_nodes:")
+        for node in all_nodes[:80]:
+            if not isinstance(node, dict):
+                continue
+            images = node.get("images") if isinstance(node.get("images"), list) else []
+            names = []
+            kinds = []
+            for img in images[:4]:
+                if not isinstance(img, dict):
+                    continue
+                if img.get("name"):
+                    names.append(str(img.get("name")))
+                if img.get("kind"):
+                    kinds.append(str(img.get("kind")))
+            lines.extend([
+                f"- internal_id_for_actions: {node.get('id') or ''}",
+                f"  type: {node.get('type') or ''}",
+                f"  title: {node.get('title') or ''}",
+                f"  position: {node.get('x') or 0},{node.get('y') or 0}",
+                f"  size: {node.get('width') or 0}x{node.get('height') or 0}",
+                f"  media_count: {len(images)}",
+                f"  media_kinds: {', '.join(kinds[:4])}",
+                f"  media_names: {', '.join(names[:4])}",
+                f"  text: {str(node.get('text') or '')[:120]}",
+            ])
+        if len(all_nodes) > 80:
+            lines.append(f"current_canvas_nodes_truncated: {len(all_nodes) - 80} more")
+    if isinstance(connections, list) and connections:
+        lines.append(f"current_canvas_connections_count: {len(connections)}")
     lines.append("</canvas_agent_context>")
     return "\n".join(lines)
 
@@ -17254,6 +17361,8 @@ def _codex_agent_parse_ref_context(text: str) -> Tuple[str, List[Dict[str, Any]]
         "\navailable_image_providers:",
         "\ncurrent_canvas_video_generation_defaults:",
         "\navailable_video_providers:",
+        "\ncurrent_canvas_nodes:",
+        "\ncurrent_canvas_connections_count:",
     ):
         if stop in selected_ctx:
             selected_ctx = selected_ctx.split(stop, 1)[0]
@@ -17633,17 +17742,7 @@ async def codex_agent_threads_replay(session_id: str = ""):
 def _codex_cli_resolve() -> Dict[str, Any]:
     """检测 codex CLI 是否安装 + 版本。"""
     info: Dict[str, Any] = {"found": False, "path": "", "version": ""}
-    cli = shutil.which("codex")
-    if not cli:
-        # 常见 fallback（npm-global / .local/bin）
-        for cand in [
-            str(_Path.home() / ".local/bin/codex"),
-            str(_Path.home() / ".npm-global/bin/codex"),
-            "/usr/local/bin/codex",
-        ]:
-            if os.path.exists(cand) and os.access(cand, os.X_OK):
-                cli = cand
-                break
+    cli = codex_cli_executable()
     if not cli:
         return info
     info["found"] = True
@@ -17750,6 +17849,7 @@ def _codex_session_meta_quick(path: _Path) -> Dict[str, Any]:
         "cwd": "",
         "model": "",
         "preview": "",
+        "preview_media": "",
     }
 
     # 文件名格式: rollout-2026-07-04T21-05-37-019f2d3c-...jsonl
@@ -17791,12 +17891,25 @@ def _codex_session_meta_quick(path: _Path) -> Dict[str, Any]:
                         for c in content:
                             if isinstance(c, dict) and c.get("type") == "input_text":
                                 txt = c.get("text", "")
-                                # 跳过 system / 环境上下文
-                                if txt and "<environment_context>" not in txt and "<" not in txt[:5]:
-                                    meta["preview"] = txt[:120]
+                                clean_txt, refs = _codex_agent_parse_ref_context(txt)
+                                clean_txt = re.sub(r"\s+", " ", clean_txt).strip()
+                                if clean_txt:
+                                    meta["preview"] = clean_txt[:120]
                                     break
+                                if refs and not meta["preview_media"]:
+                                    names = [str(ref.get("name") or "").strip() for ref in refs[:2] if ref.get("name")]
+                                    meta["preview_media"] = "、".join(names) if names else "含图片/附件的对话"
+                            elif isinstance(c, dict) and not meta["preview_media"]:
+                                ctype = str(c.get("type") or "").lower()
+                                if any(key in ctype for key in ("image", "video", "file", "attachment")):
+                                    raw_name = c.get("name") or c.get("filename") or c.get("path") or c.get("url") or ""
+                                    name = os.path.basename(str(raw_name)) if raw_name else ""
+                                    meta["preview_media"] = name or "含图片/附件的对话"
     except Exception:
         pass
+
+    if not meta["preview"] and meta.get("preview_media"):
+        meta["preview"] = meta["preview_media"]
 
     return meta
 
