@@ -6058,6 +6058,35 @@ function smartAgentNodeSummary(node){
         }))
     };
 }
+function smartAgentFocusNodes(ids=[]){
+    const list = (Array.isArray(ids) ? ids : [ids]).map(id => String(id || '')).filter(Boolean);
+    const targetNodes = list.map(id => nodes.find(n => n.id === id)).filter(Boolean);
+    if(!targetNodes.length) return false;
+    const rects = targetNodes.map(nodeRect);
+    const minX = Math.min(...rects.map(r => r.x));
+    const minY = Math.min(...rects.map(r => r.y));
+    const maxX = Math.max(...rects.map(r => r.x + r.width));
+    const maxY = Math.max(...rects.map(r => r.y + r.height));
+    if(targetNodes.length > 1){
+        const pad = 180;
+        const width = Math.max(1, maxX - minX + pad);
+        const height = Math.max(1, maxY - minY + pad);
+        viewport.scale = Math.max(0.08, Math.min(1.05, (shell.clientWidth - 80) / width, (shell.clientHeight - 80) / height));
+    }else{
+        viewport.scale = Math.max(0.18, Math.min(1.2, safeScale(viewport.scale)));
+    }
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    viewport.x = shell.clientWidth / 2 - cx * viewport.scale;
+    viewport.y = shell.clientHeight / 2 - cy * viewport.scale;
+    selectedId = targetNodes.length === 1 ? targetNodes[0].id : '';
+    selectedIds = targetNodes.length > 1 ? targetNodes.map(n => n.id) : [];
+    selectedImage = {nodeId:'', index:-1};
+    applyViewport();
+    render();
+    scheduleSave();
+    return true;
+}
 function smartAgentResolveNodeIdsFromItem(item={}){
     const ids = [];
     const add = value => {
@@ -6841,10 +6870,25 @@ function installSmartCanvasAgentApi(){
     window.SmartCanvasAgentApi = {
         kind:'smart',
         getContext(){
+            const scale = safeScale(viewport.scale);
+            const shellW = Math.max(1, shell?.clientWidth || window.innerWidth || 1);
+            const shellH = Math.max(1, shell?.clientHeight || window.innerHeight || 1);
+            const visibleWorld = {
+                x:-viewport.x / scale,
+                y:-viewport.y / scale,
+                width:shellW / scale,
+                height:shellH / scale,
+                centerX:(shellW / 2 - viewport.x) / scale,
+                centerY:(shellH / 2 - viewport.y) / scale,
+                screenWidth:shellW,
+                screenHeight:shellH
+            };
             return {
                 canvasId,
                 title:canvas?.title || '',
+                capturedAt:Date.now(),
                 viewport:{...viewport},
+                visibleWorld,
                 selectedNodeIds:selectedNodeIds(),
                 selectedImage:{...selectedImage},
                 selectedNodes:selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean).map(smartAgentNodeSummary),
@@ -6853,6 +6897,12 @@ function installSmartCanvasAgentApi(){
                 imageGeneration:this.getImageGenerationDefaults(),
                 videoGeneration:this.getVideoGenerationDefaults()
             };
+        },
+        refreshFromServer(){
+            return mergeReloadCanvasNow();
+        },
+        focusNodes(ids=[]){
+            return smartAgentFocusNodes(ids);
         },
         getSelectedAssets(){
             const selected = selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean);

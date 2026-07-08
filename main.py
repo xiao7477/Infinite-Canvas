@@ -16,6 +16,7 @@ import time
 import traceback
 import shutil
 import glob
+import sqlite3
 import asyncio
 import logging
 import requests
@@ -27,6 +28,7 @@ import shlex
 import functools
 import html
 import xml.etree.ElementTree as ET
+import socket
 from typing import List, Dict, Any, Optional, Tuple
 from threading import Lock, Thread
 import httpx
@@ -4155,13 +4157,40 @@ def is_codex_provider(provider):
 def is_gemini_cli_provider(provider):
     return provider_protocol(provider) == "gemini-cli"
 
+def read_codex_config_env_value(key: str) -> str:
+    key = str(key or "").strip()
+    if not key:
+        return ""
+    config_path = os.path.join(os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex")), "config.toml")
+    if not os.path.exists(config_path):
+        return ""
+    try:
+        pattern = re.compile(rf"^\s*{re.escape(key)}\s*=\s*([\"']?)(.*?)\1\s*$")
+        with open(config_path, "r", encoding="utf-8-sig") as f:
+            for raw_line in f.read().splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                hit = pattern.match(line)
+                if hit:
+                    return hit.group(2).strip()
+    except Exception:
+        return ""
+    return ""
+
 def codex_env_value(key):
-    return os.getenv(key, "") or read_api_env_value(key)
+    return os.getenv(key, "") or read_api_env_value(key) or read_codex_config_env_value(key)
 
 def codex_cli_executable():
     configured = str(codex_env_value("CODEX_BIN") or "").strip()
     if configured:
         return configured
+    configured = str(codex_env_value("CODEX_CLI_PATH") or "").strip()
+    if configured and os.path.exists(configured):
+        return configured
+    bundled = "/Applications/Codex.app/Contents/Resources/codex"
+    if os.path.exists(bundled):
+        return bundled
     return shutil.which("codex") or shutil.which("codex.exe") or shutil.which("codex.cmd") or ""
 
 def codex_timeout(default=CODEX_DEFAULT_TIMEOUT):
@@ -16746,6 +16775,129 @@ CODEX_AGENT_DEFAULT_PREFS = """# Infinite Canvas Agent Preferences
 - 画布聊天默认优先操作当前智能画布。
 - 优先使用已选素材，按图1、图2顺序引用。
 """
+CODEX_AGENT_PROXY_ENV_KEYS = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+)
+CODEX_AGENT_LOCAL_PROXY_PORTS = (7890, 7897, 7899, 1080, 1087, 6152)
+
+
+def _codex_agent_env_file_values(path: _Path) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    try:
+        if not path.exists() or not path.is_file():
+            return values
+        for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key:
+                continue
+            values[key] = value.strip().strip('"').strip("'")
+    except Exception as exc:
+        print(f"[codex-agent] failed to read env file {path}: {exc}")
+    return values
+
+
+def _codex_agent_extra_env_values(project_dir: str = "") -> Dict[str, str]:
+    env_files = [
+        CODEX_AGENT_HOME / ".env",
+        _Path(BASE_DIR) / ".env",
+        _Path(API_ENV_FILE),
+    ]
+    if project_dir:
+        try:
+            env_files.insert(1, _Path(project_dir).expanduser().resolve() / ".env")
+        except Exception:
+            pass
+    merged: Dict[str, str] = {}
+    for path in env_files:
+        for key, value in _codex_agent_env_file_values(path).items():
+            if key in CODEX_AGENT_PROXY_ENV_KEYS or key.startswith("CODEX_"):
+                merged.setdefault(key, value)
+    for key in CODEX_AGENT_PROXY_ENV_KEYS:
+        if os.environ.get(key):
+            merged[key] = os.environ.get(key, "")
+    proxy = (
+        merged.get("CODEX_AGENT_PROXY")
+        or merged.get("CODEX_PROXY")
+        or merged.get("ALL_PROXY")
+        or merged.get("all_proxy")
+    )
+    if proxy:
+        for key in ("ALL_PROXY", "all_proxy"):
+            merged.setdefault(key, proxy)
+    for upper, lower in (("HTTP_PROXY", "http_proxy"), ("HTTPS_PROXY", "https_proxy"), ("ALL_PROXY", "all_proxy"), ("NO_PROXY", "no_proxy")):
+        if merged.get(upper) and not merged.get(lower):
+            merged[lower] = merged[upper]
+        if merged.get(lower) and not merged.get(upper):
+            merged[upper] = merged[lower]
+    return {key: value for key, value in merged.items() if value}
+
+
+def _codex_agent_proxy_port_status(proxy_url: str) -> Dict[str, Any]:
+    if not proxy_url:
+        return {"configured": False}
+    try:
+        parsed = urllib.parse.urlparse(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
+        host = parsed.hostname or ""
+        port = int(parsed.port or (443 if parsed.scheme == "https" else 80))
+    except Exception:
+        return {"configured": True, "url": proxy_url, "reachable": None, "error": "proxy url parse failed"}
+    reachable = None
+    error = ""
+    try:
+        with socket.create_connection((host, port), timeout=0.35):
+            reachable = True
+    except Exception as exc:
+        reachable = False
+        error = str(exc)
+    return {"configured": True, "url": proxy_url, "host": host, "port": port, "reachable": reachable, "error": error}
+
+
+def _codex_agent_detect_local_proxy() -> str:
+    if str(os.environ.get("CODEX_AGENT_AUTO_PROXY") or "1").strip().lower() in {"0", "false", "off", "no"}:
+        return ""
+    for port in CODEX_AGENT_LOCAL_PROXY_PORTS:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.18):
+                return f"http://127.0.0.1:{port}"
+        except Exception:
+            continue
+    return ""
+
+
+def _codex_agent_env_summary(project_dir: str = "") -> Dict[str, Any]:
+    values = _codex_agent_extra_env_values(project_dir)
+    proxy = (
+        values.get("ALL_PROXY")
+        or values.get("all_proxy")
+        or values.get("HTTPS_PROXY")
+        or values.get("https_proxy")
+        or values.get("HTTP_PROXY")
+        or values.get("http_proxy")
+        or _codex_agent_detect_local_proxy()
+    )
+    return {
+        "codex_cli": codex_cli_executable(),
+        "proxy_env_keys": sorted([key for key in values if key.lower().endswith("_proxy")]),
+        "proxy": _codex_agent_proxy_port_status(proxy),
+    }
+
+
+def _codex_agent_app_server_env(project_dir: str) -> Dict[str, str]:
+    env = {**os.environ, "PWD": project_dir}
+    env.update(_codex_agent_extra_env_values(project_dir))
+    if not any(env.get(key) for key in ("ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")):
+        detected = _codex_agent_detect_local_proxy()
+        if detected:
+            env["ALL_PROXY"] = detected
+            env["all_proxy"] = detected
+    return env
 
 
 class CodexAppServerSession:
@@ -16776,12 +16928,15 @@ class CodexAppServerSession:
         """启动 codex app-server + 握手 + 创建/恢复 thread。返回 threadId。"""
         async with self._lock:
             if self.proc is not None and self.proc.returncode is None:
-                return self.thread_id or ""
+                if thread_id and thread_id != (self.thread_id or ""):
+                    await self.stop()
+                else:
+                    return self.thread_id or ""
 
             cli = codex_cli_executable()
             if not cli:
                 raise HTTPException(status_code=400, detail="未找到 OpenAI Codex CLI。请先在 API 设置里安装/检测 Codex CLI，并完成 codex 登录。")
-            env = {**os.environ, "PWD": self.project_dir}
+            env = _codex_agent_app_server_env(self.project_dir)
 
             self.proc = await asyncio.create_subprocess_exec(
                 cli, "app-server",
@@ -16978,10 +17133,141 @@ class CodexAppServerSession:
             pass
 
 
-# 项目目录 → session 的运行时映射表
-_codex_agent_sessions: Dict[str, CodexAppServerSession] = {}
+# Agent Runtime 映射表。key 不再只按 project_dir，避免同目录下不同画布/会话串 thread。
+class CodexAppServerRuntime:
+    """Canvas Agent 当前唯一 Runtime 实现：管理一个 codex app-server session。"""
+
+    def __init__(self, runtime_key: str, project_dir: str):
+        self.runtime_key = runtime_key
+        self.project_dir = project_dir
+        self.session = CodexAppServerSession(project_dir)
+        self.thread_id = ""
+        self.resume_warning = ""
+
+    async def start(self, thread_id: str = "") -> Dict[str, Any]:
+        self.resume_warning = ""
+        try:
+            self.thread_id = await self.session.start(thread_id=thread_id or None)
+        except Exception as exc:
+            if not thread_id:
+                raise
+            message = str(exc)
+            try:
+                await self.session.stop()
+            except Exception:
+                pass
+            self.session = CodexAppServerSession(self.project_dir)
+            self.thread_id = await self.session.start(thread_id=None)
+            if "no rollout found" not in message.lower():
+                self.resume_warning = "底层执行线程不可恢复，已新建线程继续。"
+        return {"thread_id": self.thread_id, "resume_warning": self.resume_warning}
+
+    async def stop(self) -> None:
+        await self.session.stop()
+
+    async def send_user_message(self, text: str, image_paths=None):
+        async for event in self.session.send_user_message(text, image_paths):
+            yield event
+
+
+_codex_agent_sessions: Dict[str, CodexAppServerRuntime] = {}
 _codex_agent_lock = Lock()
 _codex_agent_refs_last_cleanup = 0.0
+
+
+def _codex_agent_runtime_key(project_dir: str = "", canvas_id: str = "", conversation_id: str = "", thread_id: str = "") -> str:
+    project_key = str(project_dir or "").strip()
+    canvas_key = str(canvas_id or "").strip() or "no-canvas"
+    conv_key = str(conversation_id or "").strip()
+    thread_key = str(thread_id or "").strip()
+    identity = conv_key or (f"thread:{thread_key}" if thread_key else f"draft:{uuid.uuid4().hex}")
+    raw = "\n".join([project_key, canvas_key, identity])
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _codex_agent_runtime_key_candidates(project_dir: str = "", canvas_id: str = "", conversation_id: str = "", thread_id: str = "") -> List[str]:
+    project_key = str(project_dir or "").strip()
+    canvas_key = str(canvas_id or "").strip() or "no-canvas"
+    candidates: List[str] = []
+    if conversation_id:
+        candidates.append(hashlib.sha256("\n".join([project_key, canvas_key, str(conversation_id)]).encode("utf-8", errors="replace")).hexdigest())
+    if thread_id:
+        candidates.append(hashlib.sha256("\n".join([project_key, canvas_key, f"thread:{thread_id}"]).encode("utf-8", errors="replace")).hexdigest())
+    return candidates
+
+
+async def _codex_agent_open_runtime(project_dir: str = "", thread_id: str = "", canvas_id: str = "", conversation_id: str = "") -> Dict[str, Any]:
+    effective_project_dir = _codex_agent_effective_project_dir(project_dir)
+    if project_dir and not os.path.isabs(project_dir):
+        raise HTTPException(status_code=400, detail=f"请输入绝对路径: {project_dir}")
+    if not os.path.isdir(effective_project_dir):
+        raise HTTPException(status_code=400, detail=f"项目目录不存在: {project_dir or '无目录'}")
+
+    runtime_key = ""
+    with _codex_agent_lock:
+        for candidate in _codex_agent_runtime_key_candidates(project_dir, canvas_id, conversation_id, thread_id):
+            if candidate in _codex_agent_sessions:
+                runtime_key = candidate
+                break
+        if not runtime_key:
+            runtime_key = _codex_agent_runtime_key(project_dir, canvas_id, conversation_id, thread_id)
+        runtime = _codex_agent_sessions.get(runtime_key)
+        if runtime is None:
+            runtime = CodexAppServerRuntime(runtime_key, effective_project_dir)
+            _codex_agent_sessions[runtime_key] = runtime
+
+    try:
+        started = await runtime.start(thread_id=thread_id)
+    except HTTPException:
+        with _codex_agent_lock:
+            _codex_agent_sessions.pop(runtime_key, None)
+        raise
+    except Exception as e:
+        with _codex_agent_lock:
+            _codex_agent_sessions.pop(runtime_key, None)
+        raise HTTPException(status_code=500, detail=f"启动 Codex App Server Runtime 失败: {e}")
+
+    return {
+        "project_dir": project_dir,
+        "thread_id": started.get("thread_id") or "",
+        "runtime_key": runtime_key,
+        "resume_warning": started.get("resume_warning") or "",
+        "is_new": not thread_id or bool(started.get("resume_warning")),
+    }
+
+
+async def _codex_agent_close_runtime(project_dir: str = "", canvas_id: str = "", conversation_id: str = "", thread_id: str = "") -> int:
+    with _codex_agent_lock:
+        if conversation_id or thread_id:
+            keys = [key for key in _codex_agent_runtime_key_candidates(project_dir, canvas_id, conversation_id, thread_id) if key in _codex_agent_sessions]
+        else:
+            keys = [key for key, runtime in _codex_agent_sessions.items() if runtime and str(runtime.project_dir) == _codex_agent_effective_project_dir(project_dir)]
+        runtimes = [_codex_agent_sessions.pop(key, None) for key in keys]
+    count = 0
+    for runtime in runtimes:
+        if not runtime:
+            continue
+        count += 1
+        await runtime.stop()
+    return count
+
+
+async def _codex_agent_runtime_for_payload(payload: "CodexAgentTurnRequest") -> CodexAppServerRuntime:
+    project_dir = str(payload.project_dir or "").strip()
+    canvas_id = _codex_agent_canvas_id_from_payload(payload)
+    thread_id = str(payload.thread_id or "").strip()
+    conversation_id = str(payload.conversation_id or "").strip()
+    with _codex_agent_lock:
+        for candidate in _codex_agent_runtime_key_candidates(project_dir, canvas_id, conversation_id, thread_id):
+            runtime = _codex_agent_sessions.get(candidate)
+            if runtime:
+                return runtime
+    opened = await _codex_agent_open_runtime(project_dir, thread_id, canvas_id, conversation_id)
+    with _codex_agent_lock:
+        runtime = _codex_agent_sessions.get(opened.get("runtime_key", ""))
+    if not runtime:
+        raise HTTPException(status_code=500, detail="Agent Runtime 启动后不可用")
+    return runtime
 
 
 def _codex_agent_ref_ttl_seconds() -> Optional[float]:
@@ -17027,7 +17313,8 @@ def _codex_agent_cleanup_refs(cache_root: _Path) -> None:
 
 
 def _codex_agent_refs_dir(project_dir: str) -> _Path:
-    project_key = hashlib.sha1(str(_Path(project_dir).resolve()).encode("utf-8")).hexdigest()[:16]
+    project_root = _codex_agent_effective_project_dir(project_dir)
+    project_key = hashlib.sha1(str(_Path(project_root).resolve()).encode("utf-8")).hexdigest()[:16]
     cache_root = _Path(os.environ.get("CODEX_AGENT_REF_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "infinite-canvas-codex-agent", "refs"))
     _codex_agent_cleanup_refs(cache_root)
     refs_dir = cache_root / project_key
@@ -17071,13 +17358,19 @@ def _codex_agent_local_path_from_url(raw: str) -> Optional[str]:
                 candidates.append(os.path.join(OUTPUT_OUTPUT_DIR, subfolder, safe_name))
             else:
                 candidates.append(os.path.join(OUTPUT_INPUT_DIR, subfolder, safe_name))
+    elif path == "/api/codex-agent/file/view":
+        file_path = (query.get("path") or [""])[0]
+        if file_path:
+            candidates.append(file_path)
 
-    base_dirs = [_Path(ASSETS_DIR).resolve(), _Path(OUTPUT_DIR).resolve()]
+    base_dirs = [_Path(ASSETS_DIR).resolve(), _Path(OUTPUT_DIR).resolve(), CODEX_AGENT_HOME.resolve()]
     for candidate in candidates:
         try:
             p = _Path(candidate).resolve()
         except Exception:
             continue
+        if path == "/api/codex-agent/file/view" and p.is_file():
+            return str(p)
         if p.is_file() and any(p == base or base in p.parents for base in base_dirs):
             return str(p)
     return None
@@ -17201,13 +17494,33 @@ def _codex_agent_append_preference(note: str) -> str:
 
 
 def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]], canvas_context: Optional[Dict[str, Any]] = None) -> str:
+    display_project_dir = project_dir or "无目录"
+    no_project_rule = "当前未选择工作目录。可以聊天和操作当前画布；如果用户要求读写项目文件，请先提示用户在 Agent 顶部选择工作目录。"
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
+    profile = ctx.get("contextProfile") if isinstance(ctx.get("contextProfile"), dict) else {}
+    agent_input = ctx.get("agentInput") if isinstance(ctx.get("agentInput"), dict) else {}
+    try:
+        context_level = int(profile.get("level", 2 if refs else 1))
+    except Exception:
+        context_level = 2 if refs else 1
+    context_level = max(0, min(3, context_level))
+    context_meta_lines = [
+        f"agent_input_mode: {agent_input.get('mode') or profile.get('mode') or ''}",
+        f"agent_input_scope: {agent_input.get('scope') or profile.get('scope') or ''}",
+        f"agent_approval_policy: {agent_input.get('approvalPolicy') or agent_input.get('approval_policy') or profile.get('approvalPolicy') or ''}",
+        f"context_level: {context_level}",
+        f"context_intent: {profile.get('intent') or ''}",
+        f"context_label: {profile.get('label') or ''}",
+        f"context_attachment_count: {profile.get('attachmentCount') if profile.get('attachmentCount') is not None else len(refs)}",
+    ]
     preferences = _codex_agent_read_preferences()
     lines = [
         "<canvas_agent_context>",
-        f"project_dir: {project_dir}",
+        f"project_dir: {display_project_dir}",
         f"preferences_file: {CODEX_AGENT_PREFS_FILE}",
         "你正在 Infinite-Canvas 的 Agent 面板中。下面是用户从当前画布选择并附加给你的素材。",
         "系统级规则：画布 Agent 的任务优先围绕当前智能画布；普通文件整理只在用户明确要求时执行。",
+        no_project_rule if not project_dir else "",
         "当用户说“这张图/选中的图/这些素材/放到项目目录/重命名/整理”时，优先指这些 ref。",
         "这些素材按用户在输入框附件区的顺序排列：图一/第一张=ref_1，图二/第二张=ref_2，依此类推。",
         "local_path 是本机临时缓存文件，仅用于本轮读取；如果要保存文件，请把 local_path 复制到 project_dir 或用户指定的子目录，不要把缓存目录当作最终目录。",
@@ -17231,10 +17544,24 @@ def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]], 
         "generate_video 会调用当前画布 API 视频设置，items 里每项至少包含 prompt，可选 duration/seconds、aspect_ratio/ratio、resolution、model、provider_id、reference_images、camerafixed/camera_fixed、generate_audio。",
         "rename_nodes 默认只修改节点内素材显示名 images[index].name，也就是资产详情里的名称；不改真实文件名、不改 url、不改节点 title。只有用户明确要求改来源节点/节点标题时，才传 field:\"node_title\"。",
         "move_nodes 只修改节点坐标；items 可用 node_id/id/ref/ref_1/图1 和 x/y 或 dx/dy。整理连线节点时优先用 arrange_nodes，不要手算每个坐标；默认 arrange_nodes 会把上游放左、下游按连接顺序在同一水平线向右依次排开；只有用户要求分层/分列时才传 options.mode=\"layers\"。",
+        "新增节点放置规则：位置信息分三层。用户说当前/现在看到/视口/眼前/画布左边/画布右边时，options.placement 写 {\"scope\":\"viewport\",\"side\":\"left/right/top/bottom\"}；viewport 会先扫描发送瞬间可见区域里的节点群，再放到该节点群对应方向并向外扩展，不要贴视口角落、不要离节点群太远。用户说整个画布/全局/版图/Z总览/所有内容时写 {\"scope\":\"global\",\"side\":\"...\"}；用户说这张图/选中节点/某节点旁边时写 {\"scope\":\"node\",\"side\":\"...\",\"ref\":\"ref_1\" 或 \"anchor_node_id\":\"...\"}。viewport 必须理解为发送消息那一刻的可见视口快照，不随用户后续拖动画布变化。",
         "如果用户指定 GPT/OpenAI/Codex/即梦/其它平台、模型、比例、尺寸、高清/低清、数量、时长、固定镜头，请优先根据 available_image_providers/available_video_providers 填入准确 provider_id、model、size/quality/count/duration/aspect_ratio/camerafixed；如果不确定才省略并使用当前默认值。",
         "media item 可用 path 或 url；本机绝对路径会由前端转成可预览地址。",
         "user_canvas_preferences:",
     ]
+    if context_level <= 0 and not refs:
+        lines = [
+            "<canvas_agent_context>",
+            f"project_dir: {display_project_dir}",
+            f"preferences_file: {CODEX_AGENT_PREFS_FILE}",
+            *context_meta_lines,
+            "你正在 Infinite-Canvas 的 Agent 面板中。",
+            no_project_rule if not project_dir else "",
+            "当前路由为纯聊天：未发送节点列表、供应商列表或画布坐标细节。若用户转为画布操作，再按需使用画布上下文。",
+            "user_canvas_preferences:",
+        ]
+    else:
+        lines[3:3] = context_meta_lines
     lines.extend(preferences.splitlines() if preferences else ["(none)"])
     lines.append("selected_refs:")
     if not refs:
@@ -17256,10 +17583,19 @@ def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]], 
     native = ctx.get("native") if isinstance(ctx.get("native"), dict) else {}
     image_defaults = native.get("imageGeneration") or native.get("image_generation") or {}
     video_defaults = native.get("videoGeneration") or native.get("video_generation") or {}
+    visible_world = native.get("visibleWorld") or native.get("visible_world") or {}
     all_nodes = native.get("allNodes") or native.get("all_nodes") or []
     connections = native.get("connections") or []
+    node_counts = native.get("nodeCounts") or native.get("node_counts") or {}
     providers = image_defaults.get("providers") if isinstance(image_defaults, dict) else []
     video_providers = video_defaults.get("providers") if isinstance(video_defaults, dict) else []
+    if isinstance(node_counts, dict) and node_counts:
+        lines.extend([
+            "current_canvas_node_counts:",
+            f"  total: {node_counts.get('total') or 0}",
+            f"  selected: {node_counts.get('selected') or 0}",
+            f"  sent_detail: {node_counts.get('sent') or 0}",
+        ])
     if isinstance(image_defaults, dict) and image_defaults:
         lines.extend([
             "current_canvas_image_generation_defaults:",
@@ -17268,6 +17604,17 @@ def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]], 
             f"  size: {image_defaults.get('size') or ''}",
             f"  quality: {image_defaults.get('quality') or ''}",
             f"  count: {image_defaults.get('count') or ''}",
+        ])
+    if isinstance(visible_world, dict) and visible_world:
+        lines.extend([
+            "send_time_visible_canvas_viewport:",
+            f"  captured_at: {native.get('capturedAt') or native.get('captured_at') or ''}",
+            f"  x: {visible_world.get('x') or 0}",
+            f"  y: {visible_world.get('y') or 0}",
+            f"  width: {visible_world.get('width') or 0}",
+            f"  height: {visible_world.get('height') or 0}",
+            f"  center: {visible_world.get('centerX') or visible_world.get('center_x') or 0},{visible_world.get('centerY') or visible_world.get('center_y') or 0}",
+            "  placement_note: viewport left/right/top/bottom refer to this send-time visible viewport snapshot; later user panning/zooming does not change this turn.",
         ])
     if isinstance(providers, list) and providers:
         lines.append("available_image_providers:")
@@ -17338,6 +17685,152 @@ def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]], 
     return "\n".join(lines)
 
 
+def _codex_agent_save_context_snapshot(payload: "CodexAgentTurnRequest", canvas_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
+    canvas_id = _codex_agent_canvas_id_from_payload(payload) or "no-canvas"
+    conversation_id = str(payload.conversation_id or "").strip() or str(payload.thread_id or "").strip() or "draft"
+    native = ctx.get("native") if isinstance(ctx.get("native"), dict) else {}
+    snapshot_id = f"snap_{uuid.uuid4().hex[:16]}"
+    viewport_snapshot_id = f"vp_{uuid.uuid4().hex[:16]}"
+    data = {
+        "schema": 1,
+        "snapshot_id": snapshot_id,
+        "viewport_snapshot_id": viewport_snapshot_id,
+        "project_dir": str(payload.project_dir or ""),
+        "canvas_id": canvas_id,
+        "conversation_id": conversation_id,
+        "thread_id": str(payload.thread_id or ""),
+        "created_at": _codex_agent_now(),
+        "context": ctx,
+    }
+    try:
+        canvas_dir = CODEX_AGENT_CONTEXT_SNAPSHOT_DIR / hashlib.sha256(str(canvas_id).encode("utf-8", errors="replace")).hexdigest()[:16]
+        canvas_dir.mkdir(parents=True, exist_ok=True)
+        path = canvas_dir / f"{snapshot_id}.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception as exc:
+        print(f"[codex-agent] failed to save context snapshot: {exc}")
+        path = _Path("")
+    return {
+        "snapshot_id": snapshot_id,
+        "viewport_snapshot_id": viewport_snapshot_id,
+        "snapshot_path": str(path) if path else "",
+        "canvas_id": canvas_id,
+        "conversation_id": conversation_id,
+        "captured_at": native.get("capturedAt") or native.get("captured_at") or _codex_agent_now(),
+    }
+
+
+def _codex_agent_build_turn_context_text(project_dir: str, refs: List[Dict[str, Any]], canvas_context: Optional[Dict[str, Any]], payload: "CodexAgentTurnRequest") -> str:
+    ctx = dict(canvas_context or {}) if isinstance(canvas_context, dict) else {}
+    snapshot = _codex_agent_save_context_snapshot(payload, ctx)
+    ctx["_contextSnapshot"] = snapshot
+    return _codex_agent_context_envelope_text(project_dir, refs, ctx, payload, snapshot)
+
+
+def _codex_agent_context_envelope_text(
+    project_dir: str,
+    refs: List[Dict[str, Any]],
+    canvas_context: Optional[Dict[str, Any]],
+    payload: "CodexAgentTurnRequest",
+    snapshot: Dict[str, Any],
+) -> str:
+    """发送给 App Server 的最小上下文 envelope。完整画布快照只存服务端，不直接塞进 prompt。"""
+    display_project_dir = project_dir or "无目录"
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
+    native = ctx.get("native") if isinstance(ctx.get("native"), dict) else {}
+    profile = ctx.get("contextProfile") if isinstance(ctx.get("contextProfile"), dict) else {}
+    agent_input = ctx.get("agentInput") if isinstance(ctx.get("agentInput"), dict) else {}
+    try:
+        context_level = int(profile.get("level", 2 if refs else 0))
+    except Exception:
+        context_level = 2 if refs else 0
+    context_level = max(0, min(3, context_level))
+    node_counts = native.get("nodeCounts") if isinstance(native.get("nodeCounts"), dict) else {}
+    selected_ids = native.get("selectedNodeIds") if isinstance(native.get("selectedNodeIds"), list) else []
+    preferences = _codex_agent_read_preferences()
+    no_project_rule = "当前未选择工作目录。可以聊天和操作当前画布；如果用户要求读写项目文件，请先提示用户在 Agent 顶部选择工作目录。"
+    lines = [
+        "<canvas_agent_context>",
+        "context_protocol: app_server_minimal_envelope_v1",
+        f"project_dir: {display_project_dir}",
+        f"canvas_id: {snapshot.get('canvas_id') or _codex_agent_canvas_id_from_payload(payload)}",
+        f"conversation_id: {str(payload.conversation_id or '')}",
+        f"codex_thread_id: {str(payload.thread_id or '')}",
+        f"context_snapshot_id: {snapshot.get('snapshot_id') or ''}",
+        f"viewport_snapshot_id: {snapshot.get('viewport_snapshot_id') or ''}",
+        f"captured_at: {snapshot.get('captured_at') or ''}",
+        f"context_level: {context_level}",
+        f"context_intent: {profile.get('intent') or ''}",
+        f"context_command: {profile.get('command') or ''}",
+        f"agent_approval_policy: {agent_input.get('approvalPolicy') or agent_input.get('approval_policy') or profile.get('approvalPolicy') or ''}",
+        "你正在 Infinite-Canvas 的 Agent 面板中。默认围绕当前智能画布工作。",
+        "不要向用户展示 internal node id、canvas_agent_tool、canvas_agent_action、context snapshot id 或工具协议细节。",
+        "按需查询画布时，先只输出隐藏 fenced canvas_agent_tool JSON，不要编造画布内容；收到 canvas_tool_result 后再回答用户。",
+        "查询工具: get_selected_nodes, get_viewport_nodes, get_node_detail, get_connected_nodes, get_canvas_summary。",
+        "低风险操作工具: move_nodes, arrange_nodes, rename_assets, group_nodes, ungroup_nodes。用户明确要求这些操作时优先用 canvas_agent_tool，工具结果会自动展示给用户。",
+        "canvas_agent_tool 格式: {\"tool\":\"get_viewport_nodes\",\"args\":{}} 或 {\"tools\":[{\"tool\":\"arrange_nodes\",\"args\":{\"items\":[{\"ref\":\"ref_1\"}]}}]}。",
+        "生成图片/视频、添加媒体/提示词/循环节点、记忆偏好暂时仍使用兼容的 fenced canvas_agent_action JSON；普通聊天不要输出动作块。",
+        "位置信息以发送这一刻的 viewport_snapshot_id 为准；用户后续拖动画布不改变本轮语义。",
+        "rename_nodes 默认只修改素材显示名 images[index].name，不改真实文件名、不改节点标题，除非用户明确要求。",
+        "高成本或模糊生成任务先简短确认；用户明确说直接执行/按默认/不用问时可继续。",
+        no_project_rule if not project_dir else "",
+    ]
+    if isinstance(node_counts, dict) and node_counts:
+        lines.extend([
+            "canvas_counts:",
+            f"  total_nodes: {node_counts.get('total') or 0}",
+            f"  selected_nodes: {node_counts.get('selected') or len(selected_ids)}",
+            f"  prompt_sent_node_details: 0",
+        ])
+    elif selected_ids:
+        lines.extend(["canvas_counts:", f"  selected_nodes: {len(selected_ids)}"])
+    if refs:
+        lines.append("selected_refs:")
+        for index, ref in enumerate(refs, 1):
+            ref_id = str(ref.get("refId") or ref.get("ref_id") or f"ref_{index}")
+            lines.extend([
+                f"- id: {ref_id}",
+                f"  name: {ref.get('name') or os.path.basename(str(ref.get('local_path') or 'asset'))}",
+                f"  kind: {ref.get('kind') or 'image'}",
+                f"  local_path: {ref.get('local_path') or ''}",
+                f"  source_path: {ref.get('source_path') or ''}",
+                f"  canvas_kind: {ref.get('canvasKind') or ref.get('canvas_kind') or ''}",
+                f"  node_id: {ref.get('nodeId') or ref.get('node_id') or ''}",
+                f"  image_index: {ref.get('imageIndex') if ref.get('imageIndex') is not None else ''}",
+                f"  node_title: {ref.get('nodeTitle') or ref.get('node_title') or ''}",
+            ])
+    else:
+        lines.append("selected_refs: (none)")
+    if context_level >= 2 and (profile.get("intent") == "generation" or re.search(r"生成|生图|视频|模型|provider|model", str(payload.text or ""), re.I)):
+        image_defaults = native.get("imageGeneration") or native.get("image_generation") or {}
+        video_defaults = native.get("videoGeneration") or native.get("video_generation") or {}
+        if isinstance(image_defaults, dict) and image_defaults:
+            lines.extend([
+                "image_generation_defaults:",
+                f"  provider_id: {image_defaults.get('provider_id') or ''}",
+                f"  model: {image_defaults.get('model') or ''}",
+                f"  size: {image_defaults.get('size') or ''}",
+                f"  quality: {image_defaults.get('quality') or ''}",
+                f"  count: {image_defaults.get('count') or ''}",
+            ])
+        if isinstance(video_defaults, dict) and video_defaults:
+            lines.extend([
+                "video_generation_defaults:",
+                f"  provider_id: {video_defaults.get('provider_id') or ''}",
+                f"  model: {video_defaults.get('model') or ''}",
+                f"  duration: {video_defaults.get('duration') or ''}",
+                f"  aspect_ratio: {video_defaults.get('aspect_ratio') or ''}",
+                f"  resolution: {video_defaults.get('resolution') or ''}",
+            ])
+    lines.append("user_canvas_preferences:")
+    lines.extend(preferences.splitlines() if preferences else ["(none)"])
+    lines.append("</canvas_agent_context>")
+    return "\n".join(line for line in lines if line is not None)
+
+
 def _codex_agent_file_view_url(path: str) -> str:
     text = str(path or "").strip()
     if not text:
@@ -17358,6 +17851,7 @@ def _codex_agent_parse_ref_context(text: str) -> Tuple[str, List[Dict[str, Any]]
     selected_ctx = ctx.split("selected_refs:", 1)[1] if "selected_refs:" in ctx else ""
     for stop in (
         "\ncurrent_canvas_image_generation_defaults:",
+        "\nsend_time_visible_canvas_viewport:",
         "\navailable_image_providers:",
         "\ncurrent_canvas_video_generation_defaults:",
         "\navailable_video_providers:",
@@ -17433,6 +17927,8 @@ def _codex_agent_strip_agent_markup(text: str) -> str:
     clean = _codex_agent_strip_internal_context(text)
     clean = re.sub(r"```(?:canvas_agent_action|canvas-agent-action)\s*[\s\S]*?```", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"<canvas_agent_action>[\s\S]*?</canvas_agent_action>", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"```(?:canvas_agent_tool|canvas-agent-tool|canvas_tool|canvas-tool)\s*[\s\S]*?```", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"<(?:canvas_agent_tool|canvas_tool)>[\s\S]*?</(?:canvas_agent_tool|canvas_tool)>", "", clean, flags=re.IGNORECASE)
     return clean.strip()
 
 
@@ -17507,10 +18003,15 @@ async def _to_inline_data_url(url: str, client: Optional[httpx.AsyncClient] = No
 class CodexAgentBoardOpenRequest(BaseModel):
     project_dir: str
     thread_id: Optional[str] = None
+    canvas_id: str = ""
+    conversation_id: str = ""
 
 
 class CodexAgentBoardCloseRequest(BaseModel):
     project_dir: str
+    thread_id: Optional[str] = None
+    canvas_id: str = ""
+    conversation_id: str = ""
 
 
 class CodexAgentTurnRequest(BaseModel):
@@ -17518,51 +18019,2302 @@ class CodexAgentTurnRequest(BaseModel):
     text: str
     attachments: Optional[List[Any]] = None  # URL、本地路径，或 {url,name,nodeId,...}
     canvas_context: Optional[Dict[str, Any]] = None
+    canvas_id: str = ""
+    thread_id: str = ""
+    conversation_id: str = ""
+
+
+class CodexAgentTaskStatusRequest(BaseModel):
+    task_id: str
+    after: int = 0
+
+
+class CodexAgentActionResolveRequest(BaseModel):
+    task_id: str
+    approval_id: str
+    decision: str = "approve"
+
+
+class CodexAgentPanelStateRequest(BaseModel):
+    project_dir: str = ""
+    canvas_id: str = ""
+    thread_id: str = ""
+    conversation_id: str = ""
+    canvas_title: str = ""
+    status: str = "ready"
+    input_mode: str = ""
+    input_scope: str = ""
+    approval_policy: str = ""
+    open: bool = False
+    messages: Optional[List[Any]] = None
+    attachments: Optional[List[Any]] = None
+    task_id: str = ""
+    task_offset: int = 0
+    scroll_top: int = 0
 
 
 class CodexAgentPreferenceRequest(BaseModel):
     note: str
 
 
+class CodexAgentProjectVisibilityRequest(BaseModel):
+    canvas_id: str
+    project_dir: str = ""
+    hidden: bool = False
+
+
+class CodexAgentWorkdirPresetRequest(BaseModel):
+    path: str
+
+
+class CodexAgentCanvasToolRequest(BaseModel):
+    canvas_id: str = ""
+    tool: str
+    args: Optional[Dict[str, Any]] = None
+    refs: Optional[List[Any]] = None
+    canvas_context: Optional[Dict[str, Any]] = None
+
+
+_codex_agent_tasks: Dict[str, Dict[str, Any]] = {}
+_codex_agent_task_lock = Lock()
+CODEX_AGENT_PANEL_STATE_DIR = CODEX_AGENT_HOME / "infinite-canvas-agent" / "panel-history"
+CODEX_AGENT_HISTORY_DB = CODEX_AGENT_HOME / "infinite-canvas-agent" / "history.sqlite"
+CODEX_AGENT_WORKDIR_PRESETS_FILE = CODEX_AGENT_HOME / "infinite-canvas-agent" / "workdir-presets.json"
+CODEX_AGENT_NO_PROJECT_DIR = CODEX_AGENT_HOME / "infinite-canvas-agent" / "no-project-workspace"
+CODEX_AGENT_CONTEXT_SNAPSHOT_DIR = CODEX_AGENT_HOME / "infinite-canvas-agent" / "context-snapshots"
+_codex_agent_history_lock = Lock()
+
+
+def _codex_agent_now() -> int:
+    try:
+        return now_ms()
+    except Exception:
+        return int(time.time() * 1000)
+
+
+def _codex_agent_history_id(*parts: str) -> str:
+    raw = "\n".join(str(part or "") for part in parts)
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _codex_agent_history_connect() -> sqlite3.Connection:
+    CODEX_AGENT_HISTORY_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(CODEX_AGENT_HISTORY_DB))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _codex_agent_history_init() -> None:
+    with _codex_agent_history_lock:
+        conn = _codex_agent_history_connect()
+        try:
+            conn.executescript("""
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                project_dir TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_opened_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS canvases (
+                id TEXT PRIMARY KEY,
+                canvas_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_opened_at INTEGER NOT NULL,
+                UNIQUE(project_id, canvas_id)
+            );
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                canvas_row_id TEXT NOT NULL,
+                canvas_id TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                codex_thread_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'ready',
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_message_preview TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                message_index INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                blocks_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                canvas_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                progress_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS project_visibility (
+                canvas_id TEXT NOT NULL,
+                project_dir TEXT NOT NULL DEFAULT '',
+                hidden INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(canvas_id, project_dir)
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversations_project_updated ON conversations(project_id, archived, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_conversations_canvas_updated ON conversations(canvas_id, archived, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, message_index);
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _codex_agent_message_preview(messages: Any) -> str:
+    rows = messages if isinstance(messages, list) else []
+    meaningful_types = {"text", "image", "media_preview", "attach", "attachment"}
+    for preferred_role in ("user", "bot"):
+        for msg in reversed(rows):
+            if not isinstance(msg, dict) or str(msg.get("role") or "") != preferred_role:
+                continue
+            for block in msg.get("blocks") if isinstance(msg.get("blocks"), list) else []:
+                if not isinstance(block, dict):
+                    continue
+                btype = str(block.get("type") or "").strip()
+                if btype not in meaningful_types:
+                    continue
+                text = str(block.get("text") or block.get("prompt") or "").strip()
+                if text:
+                    return re.sub(r"\s+", " ", text)[:160]
+                if btype in {"attach", "attachment", "media_preview"}:
+                    items = block.get("items") if isinstance(block.get("items"), list) else []
+                    names = [str(item.get("name") or "").strip() for item in items[:2] if isinstance(item, dict) and item.get("name")]
+                    return "、".join(names) if names else "含图片/附件的对话"
+    return "画布 Agent 对话"
+
+
+def _codex_agent_has_meaningful_messages(messages: Any) -> bool:
+    for msg in messages if isinstance(messages, list) else []:
+        if not isinstance(msg, dict):
+            continue
+        for block in msg.get("blocks") if isinstance(msg.get("blocks"), list) else []:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type") or "").strip()
+            if btype in {"text", "image", "media_preview", "attach", "attachment"}:
+                text = str(block.get("text") or block.get("prompt") or "").strip()
+                items = block.get("items") if isinstance(block.get("items"), list) else []
+                if text or items:
+                    return True
+    return False
+
+
+def _codex_agent_history_upsert_panel_state(data: Dict[str, Any]) -> Dict[str, Any]:
+    project_dir = str(data.get("project_dir") or "").strip()
+    canvas_id = str(data.get("canvas_id") or "").strip()
+    thread_id = str(data.get("thread_id") or "").strip()
+    if not canvas_id or (not project_dir and not thread_id):
+        return {}
+    _codex_agent_history_init()
+    now = int(data.get("updated_at") or _codex_agent_now())
+    project_key = project_dir or "__no_project__"
+    project_id = _codex_agent_history_id("project", project_key)
+    canvas_row_id = _codex_agent_history_id("canvas", project_key, canvas_id)
+    conversation_id = str(data.get("conversation_id") or "").strip()
+    if not conversation_id:
+        conversation_id = _codex_agent_history_id("conversation", project_key, canvas_id, thread_id or str(now))
+    messages = data.get("messages") if isinstance(data.get("messages"), list) else []
+    if not _codex_agent_has_meaningful_messages(messages):
+        return {}
+    preview = _codex_agent_message_preview(messages)
+    title = preview[:60] or "画布 Agent 对话"
+    with _codex_agent_history_lock:
+        conn = _codex_agent_history_connect()
+        try:
+            conn.execute("""
+                INSERT INTO projects(id, project_dir, title, created_at, updated_at, last_opened_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_dir) DO UPDATE SET
+                    title=excluded.title,
+                    updated_at=excluded.updated_at,
+                    last_opened_at=excluded.last_opened_at
+            """, (project_id, project_dir, os.path.basename(project_dir) if project_dir else "无目录对话", now, now, now))
+            conn.execute("""
+                INSERT INTO canvases(id, canvas_id, project_id, title, created_at, updated_at, last_opened_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, canvas_id) DO UPDATE SET
+                    title=excluded.title,
+                    updated_at=excluded.updated_at,
+                    last_opened_at=excluded.last_opened_at
+            """, (canvas_row_id, canvas_id, project_id, str(data.get("canvas_title") or canvas_id), now, now, now))
+            existing = conn.execute("SELECT created_at FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+            created_at = int(existing["created_at"]) if existing else now
+            conn.execute("""
+                INSERT INTO conversations(
+                    id, project_id, canvas_row_id, canvas_id, title, codex_thread_id,
+                    status, archived, created_at, updated_at, last_message_preview
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title,
+                    codex_thread_id=excluded.codex_thread_id,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at,
+                    last_message_preview=excluded.last_message_preview
+            """, (conversation_id, project_id, canvas_row_id, canvas_id, title, thread_id, str(data.get("status") or "ready"), created_at, now, preview))
+            conn.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
+            for index, msg in enumerate(messages[-200:]):
+                if not isinstance(msg, dict):
+                    continue
+                role = "user" if msg.get("role") == "user" else "bot"
+                blocks = msg.get("blocks") if isinstance(msg.get("blocks"), list) else []
+                conn.execute(
+                    "INSERT INTO messages(conversation_id, message_index, role, blocks_json, created_at) VALUES(?, ?, ?, ?, ?)",
+                    (conversation_id, index, role, json.dumps(blocks, ensure_ascii=False), now),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    return {"conversation_id": conversation_id, "project_id": project_id, "canvas_row_id": canvas_row_id}
+
+
+def _codex_agent_history_projects(canvas_id: str = "", include_hidden: bool = False) -> List[Dict[str, Any]]:
+    _codex_agent_history_init()
+    canvas_id = str(canvas_id or "").strip()
+    with _codex_agent_history_lock:
+        conn = _codex_agent_history_connect()
+        try:
+            values: List[Any] = []
+            canvas_clause = ""
+            if canvas_id:
+                canvas_clause = "AND c.canvas_id = ?"
+                values.append(canvas_id)
+            hidden_join = ""
+            hidden_where = ""
+            hidden_select = "0 AS hidden"
+            if canvas_id:
+                hidden_join = "LEFT JOIN project_visibility v ON v.canvas_id = ? AND v.project_dir = p.project_dir"
+                hidden_select = "COALESCE(v.hidden, 0) AS hidden"
+                values.append(canvas_id)
+                if not include_hidden:
+                    hidden_where = "AND COALESCE(v.hidden, 0) = 0"
+            rows = conn.execute(f"""
+                WITH project_stats AS (
+                    SELECT
+                        p.id AS project_id,
+                        COUNT(c.id) AS conversation_count,
+                        MAX(c.updated_at) AS last_conversation_at
+                    FROM projects p
+                    JOIN conversations c ON c.project_id = p.id
+                    WHERE c.archived = 0 {canvas_clause}
+                    GROUP BY p.id
+                )
+                SELECT p.*, s.conversation_count, s.last_conversation_at, {hidden_select}
+                FROM project_stats s
+                JOIN projects p ON p.id = s.project_id
+                {hidden_join}
+                WHERE 1=1 {hidden_where}
+                ORDER BY COALESCE(s.last_conversation_at, p.updated_at) DESC
+            """, values).fetchall()
+            out = []
+            for row in rows:
+                item = dict(row)
+                latest_values: List[Any] = [item["id"]]
+                latest_canvas = ""
+                if canvas_id:
+                    latest_canvas = "AND canvas_id = ?"
+                    latest_values.append(canvas_id)
+                latest = conn.execute("""
+                    SELECT id, codex_thread_id, canvas_id
+                    FROM conversations
+                    WHERE project_id = ? AND archived = 0 """ + latest_canvas + """
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                """, latest_values).fetchone()
+                if latest:
+                    item["latest_conversation_id"] = latest["id"]
+                    item["latest_thread_id"] = latest["codex_thread_id"]
+                    item["latest_canvas_id"] = latest["canvas_id"]
+                else:
+                    item["latest_conversation_id"] = ""
+                    item["latest_thread_id"] = ""
+                    item["latest_canvas_id"] = ""
+                out.append(item)
+            return out
+        finally:
+            conn.close()
+
+
+def _codex_agent_history_conversations(project_dir: Optional[str] = None, canvas_id: str = "", include_archived: bool = False) -> List[Dict[str, Any]]:
+    _codex_agent_history_init()
+    clauses = []
+    values: List[Any] = []
+    if project_dir is not None:
+        clauses.append("p.project_dir = ?")
+        values.append(str(project_dir or ""))
+    if canvas_id:
+        clauses.append("c.canvas_id = ?")
+        values.append(canvas_id)
+    if not include_archived:
+        clauses.append("c.archived = 0")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with _codex_agent_history_lock:
+        conn = _codex_agent_history_connect()
+        try:
+            rows = conn.execute(f"""
+                SELECT c.*, p.project_dir, p.title AS project_title
+                FROM conversations c
+                JOIN projects p ON p.id = c.project_id
+                {where}
+                ORDER BY c.updated_at DESC
+            """, values).fetchall()
+            out = []
+            for row in rows:
+                item = dict(row)
+                item["session_id"] = item.get("codex_thread_id", "")
+                item["thread_id"] = item.get("codex_thread_id", "")
+                item["cwd"] = item.get("project_dir", "")
+                item["preview"] = item.get("last_message_preview", "")
+                item["started_at"] = datetime.datetime.fromtimestamp(int(item.get("updated_at") or 0) / 1000, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ") if item.get("updated_at") else ""
+                item["model"] = "Canvas Agent"
+                item["source"] = "canvas-agent"
+                out.append(item)
+            return out
+        finally:
+            conn.close()
+
+
+def _codex_agent_history_conversation_state(conversation_id: str) -> Optional[Dict[str, Any]]:
+    _codex_agent_history_init()
+    with _codex_agent_history_lock:
+        conn = _codex_agent_history_connect()
+        try:
+            conv = conn.execute("""
+                SELECT c.*, p.project_dir
+                FROM conversations c
+                JOIN projects p ON p.id = c.project_id
+                WHERE c.id = ?
+            """, (conversation_id,)).fetchone()
+            if not conv:
+                return None
+            rows = conn.execute("SELECT role, blocks_json FROM messages WHERE conversation_id=? ORDER BY message_index ASC", (conversation_id,)).fetchall()
+            messages = []
+            for row in rows:
+                try:
+                    blocks = json.loads(row["blocks_json"])
+                except Exception:
+                    blocks = []
+                messages.append({"role": row["role"], "blocks": blocks if isinstance(blocks, list) else []})
+            return {
+                "project_dir": conv["project_dir"],
+                "canvas_id": conv["canvas_id"],
+                "thread_id": conv["codex_thread_id"],
+                "conversation_id": conv["id"],
+                "messages": messages,
+                "attachments": [],
+                "task_id": "",
+                "task_offset": 0,
+                "scroll_top": 0,
+                "updated_at": conv["updated_at"],
+                "open": True,
+            }
+        finally:
+            conn.close()
+
+
+def _codex_agent_history_latest_state(canvas_id: str = "", project_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    _codex_agent_history_init()
+    clauses = ["c.archived = 0"]
+    values: List[Any] = []
+    if canvas_id:
+        clauses.append("c.canvas_id = ?")
+        values.append(canvas_id)
+    if project_dir is not None:
+        clauses.append("p.project_dir = ?")
+        values.append(str(project_dir or ""))
+    with _codex_agent_history_lock:
+        conn = _codex_agent_history_connect()
+        try:
+            row = conn.execute(f"""
+                SELECT c.id
+                FROM conversations c
+                JOIN projects p ON p.id = c.project_id
+                WHERE {" AND ".join(clauses)}
+                ORDER BY c.updated_at DESC
+                LIMIT 1
+            """, values).fetchone()
+        finally:
+            conn.close()
+    return _codex_agent_history_conversation_state(row["id"]) if row else None
+
+
+def _codex_agent_set_project_visibility(canvas_id: str, project_dir: str = "", hidden: bool = False) -> None:
+    canvas_id = str(canvas_id or "").strip()
+    if not canvas_id:
+        raise ValueError("缺少 canvas_id")
+    _codex_agent_history_init()
+    with _codex_agent_history_lock:
+        conn = _codex_agent_history_connect()
+        try:
+            conn.execute("""
+                INSERT INTO project_visibility(canvas_id, project_dir, hidden, updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(canvas_id, project_dir) DO UPDATE SET
+                    hidden=excluded.hidden,
+                    updated_at=excluded.updated_at
+            """, (canvas_id, str(project_dir or ""), 1 if hidden else 0, _codex_agent_now()))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _codex_agent_effective_project_dir(project_dir: str = "") -> str:
+    raw = str(project_dir or "").strip()
+    if raw:
+        return raw
+    CODEX_AGENT_NO_PROJECT_DIR.mkdir(parents=True, exist_ok=True)
+    return str(CODEX_AGENT_NO_PROJECT_DIR)
+
+
+def _codex_agent_read_workdir_presets() -> List[str]:
+    try:
+        if not CODEX_AGENT_WORKDIR_PRESETS_FILE.exists():
+            return []
+        data = json.loads(CODEX_AGENT_WORKDIR_PRESETS_FILE.read_text(encoding="utf-8"))
+        values = data.get("presets") if isinstance(data, dict) else data
+        if not isinstance(values, list):
+            return []
+        out = []
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in out:
+                out.append(text)
+        return out
+    except Exception:
+        return []
+
+
+def _codex_agent_write_workdir_presets(values: List[str]) -> None:
+    CODEX_AGENT_WORKDIR_PRESETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    clean = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in clean:
+            clean.append(text)
+    CODEX_AGENT_WORKDIR_PRESETS_FILE.write_text(json.dumps({"presets": clean}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _codex_agent_panel_state_key(canvas_id: str = "", project_dir: str = "", thread_id: str = "") -> str:
+    raw = "\n".join([str(canvas_id or ""), str(project_dir or ""), str(thread_id or "")])
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _codex_agent_panel_state_path(canvas_id: str = "", project_dir: str = "", thread_id: str = "") -> _Path:
+    return CODEX_AGENT_PANEL_STATE_DIR / f"{_codex_agent_panel_state_key(canvas_id, project_dir, thread_id)}.json"
+
+
+def _codex_agent_compact_panel_messages(messages: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    allowed_types = {
+        "text", "thinking", "tool", "error", "image", "todo", "attach",
+        "tool_call", "tool_result", "canvas_action_result", "choice",
+        "parameter_form", "progress", "node_locator", "media_preview", "attachment", "process",
+    }
+    scalar_keys = {
+        "text", "status", "id", "path", "prompt", "title", "label", "name",
+        "kind", "summary", "detail", "command", "tool", "action", "message",
+        "task_id", "approval_id", "target", "url", "risk", "reason", "decision",
+        "startedAt", "endedAt", "output",
+    }
+    list_keys = {"items", "options", "fields", "nodes", "results", "actions", "steps"}
+    dict_keys = {"meta", "data", "params", "progress", "result"}
+    for msg in (messages if isinstance(messages, list) else [])[-120:]:
+        if not isinstance(msg, dict):
+            continue
+        role = "user" if msg.get("role") == "user" else "bot"
+        blocks: List[Dict[str, Any]] = []
+        for block in (msg.get("blocks") if isinstance(msg.get("blocks"), list) else []):
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type") or "")
+            if btype not in allowed_types:
+                continue
+            copy: Dict[str, Any] = {"type": btype}
+            for key in scalar_keys:
+                if key in block:
+                    value = block.get(key)
+                    if isinstance(value, str) and len(value) > 24000:
+                        value = value[:24000] + "\n..."
+                    copy[key] = value
+            for key in list_keys:
+                if isinstance(block.get(key), list):
+                    limit = 40 if key in {"items", "nodes", "results"} else 80
+                    copy[key] = block.get(key)[:limit]
+            for key in dict_keys:
+                if isinstance(block.get(key), dict):
+                    copy[key] = block.get(key)
+            if btype in {"attach", "attachment"} and isinstance(copy.get("items"), list):
+                copy["items"] = copy.get("items")[:40]
+                copy["count"] = block.get("count", len(copy["items"]))
+            elif "count" in block:
+                copy["count"] = block.get("count")
+            for key in ("changed", "skipped", "total", "current", "percent"):
+                if key in block:
+                    copy[key] = block.get(key)
+            if block.get("streaming"):
+                copy["streaming"] = True
+            if block.get("stale"):
+                copy["stale"] = True
+            blocks.append(copy)
+        if blocks:
+            out.append({"role": role, "blocks": blocks})
+    return out
+
+
+def _codex_agent_panel_state_public(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"found": False, "state": None}
+    return {
+        "found": True,
+        "state": {
+            "projectDir": data.get("project_dir", ""),
+            "project_dir": data.get("project_dir", ""),
+            "canvasId": data.get("canvas_id", ""),
+            "canvas_id": data.get("canvas_id", ""),
+            "threadId": data.get("thread_id", ""),
+            "thread_id": data.get("thread_id", ""),
+            "conversationId": data.get("conversation_id", ""),
+            "conversation_id": data.get("conversation_id", ""),
+            "open": bool(data.get("open", False)),
+            "messages": data.get("messages") if isinstance(data.get("messages"), list) else [],
+            "attachments": data.get("attachments") if isinstance(data.get("attachments"), list) else [],
+            "taskId": data.get("task_id", ""),
+            "task_id": data.get("task_id", ""),
+            "taskOffset": int(data.get("task_offset") or 0),
+            "task_offset": int(data.get("task_offset") or 0),
+            "scrollTop": int(data.get("scroll_top") or 0),
+            "scroll_top": int(data.get("scroll_top") or 0),
+            "inputMode": data.get("input_mode", ""),
+            "input_mode": data.get("input_mode", ""),
+            "inputScope": data.get("input_scope", ""),
+            "input_scope": data.get("input_scope", ""),
+            "approvalPolicy": data.get("approval_policy", ""),
+            "approval_policy": data.get("approval_policy", ""),
+            "updatedAt": int(data.get("updated_at") or 0),
+            "updated_at": int(data.get("updated_at") or 0),
+        },
+    }
+
+
+def _codex_agent_read_panel_state(canvas_id: str = "", project_dir: str = "", thread_id: str = "") -> Optional[Dict[str, Any]]:
+    path = _codex_agent_panel_state_path(canvas_id, project_dir, thread_id)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _codex_agent_write_panel_state(payload: CodexAgentPanelStateRequest) -> Dict[str, Any]:
+    project_dir = str(payload.project_dir or "").strip()
+    canvas_id = str(payload.canvas_id or "").strip()
+    thread_id = str(payload.thread_id or "").strip()
+    if not canvas_id:
+        raise HTTPException(status_code=400, detail="缺少 canvas_id")
+    if not project_dir and not thread_id:
+        raise HTTPException(status_code=400, detail="缺少 project_dir/thread_id")
+    CODEX_AGENT_PANEL_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    now = _codex_agent_now()
+    data = {
+        "schema": 1,
+        "project_dir": project_dir,
+        "canvas_id": canvas_id,
+        "thread_id": thread_id,
+        "conversation_id": str(payload.conversation_id or "").strip(),
+        "canvas_title": str(payload.canvas_title or "").strip(),
+        "status": str(payload.status or "ready").strip() or "ready",
+        "input_mode": str(payload.input_mode or "").strip(),
+        "input_scope": str(payload.input_scope or "").strip(),
+        "approval_policy": str(payload.approval_policy or "").strip(),
+        "open": bool(payload.open),
+        "messages": _codex_agent_compact_panel_messages(payload.messages),
+        "attachments": payload.attachments[:40] if isinstance(payload.attachments, list) else [],
+        "task_id": str(payload.task_id or ""),
+        "task_offset": max(0, int(payload.task_offset or 0)),
+        "scroll_top": max(0, int(payload.scroll_top or 0)),
+        "created_at": now,
+        "updated_at": now,
+    }
+    old = _codex_agent_read_panel_state(canvas_id, project_dir, thread_id)
+    if old and old.get("created_at"):
+        data["created_at"] = old.get("created_at")
+    path = _codex_agent_panel_state_path(canvas_id, project_dir, thread_id)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+    data.update(_codex_agent_history_upsert_panel_state(data))
+    return data
+
+
+def _codex_agent_latest_panel_state(canvas_id: str = "", project_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not CODEX_AGENT_PANEL_STATE_DIR.exists():
+        return None
+    best: Optional[Dict[str, Any]] = None
+    try:
+        for path in CODEX_AGENT_PANEL_STATE_DIR.glob("*.json"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if canvas_id and str(data.get("canvas_id") or "") != str(canvas_id):
+                continue
+            if project_dir is not None and str(data.get("project_dir") or "") != str(project_dir or ""):
+                continue
+            if best is None or int(data.get("updated_at") or 0) > int(best.get("updated_at") or 0):
+                best = data
+    except Exception:
+        return best
+    return best
+
+
+def _codex_agent_panel_state_preview(messages: Any) -> str:
+    for msg in (messages if isinstance(messages, list) else []):
+        for block in (msg.get("blocks") if isinstance(msg, dict) and isinstance(msg.get("blocks"), list) else []):
+            if not isinstance(block, dict):
+                continue
+            text = str(block.get("text") or "").strip()
+            if text:
+                return re.sub(r"\s+", " ", text)[:120]
+    return "画布 Agent 对话"
+
+
+def _codex_agent_panel_state_meta_quick(data: Dict[str, Any], path: Optional[_Path] = None) -> Dict[str, Any]:
+    updated = int(data.get("updated_at") or data.get("created_at") or 0)
+    if updated:
+        try:
+            dt = datetime.datetime.fromtimestamp(updated / 1000, tz=datetime.timezone.utc)
+            started_at = dt.strftime("%Y-%m-%d %H:%M:%SZ")
+        except Exception:
+            started_at = str(updated)
+    else:
+        started_at = ""
+    return {
+        "session_id": str(data.get("thread_id") or ""),
+        "thread_id": str(data.get("thread_id") or ""),
+        "panel_state_key": _codex_agent_panel_state_key(str(data.get("canvas_id") or ""), str(data.get("project_dir") or ""), str(data.get("thread_id") or "")),
+        "canvas_id": str(data.get("canvas_id") or ""),
+        "started_at": started_at,
+        "updated_at": updated,
+        "cwd": str(data.get("project_dir") or ""),
+        "model": "Codex Agent",
+        "preview": _codex_agent_panel_state_preview(data.get("messages")),
+        "preview_media": "",
+        "rollout_path": "",
+        "panel_state_path": str(path or ""),
+        "source": "panel",
+    }
+
+
+def _codex_agent_panel_state_metas(project_dir: str = "") -> List[Dict[str, Any]]:
+    if not CODEX_AGENT_PANEL_STATE_DIR.exists():
+        return []
+    metas: List[Dict[str, Any]] = []
+    try:
+        for path in CODEX_AGENT_PANEL_STATE_DIR.glob("*.json"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            cwd = str(data.get("project_dir") or "")
+            if project_dir and cwd != project_dir:
+                continue
+            if not cwd:
+                continue
+            metas.append(_codex_agent_panel_state_meta_quick(data, path))
+    except Exception:
+        return metas
+    metas.sort(key=lambda item: int(item.get("updated_at") or 0), reverse=True)
+    return metas
+
+
+def _codex_agent_task_public(task: Dict[str, Any], after: int = 0) -> Dict[str, Any]:
+    events = task.get("events") or []
+    start = max(0, int(after or 0))
+    return {
+        "task_id": task.get("task_id", ""),
+        "project_dir": task.get("project_dir", ""),
+        "canvas_id": task.get("canvas_id", ""),
+        "thread_id": task.get("thread_id", ""),
+        "conversation_id": task.get("conversation_id", ""),
+        "runtime_key": task.get("runtime_key", ""),
+        "status": task.get("status", "unknown"),
+        "created_at": task.get("created_at", 0),
+        "updated_at": task.get("updated_at", 0),
+        "started_at": task.get("started_at", 0),
+        "completed_at": task.get("completed_at", 0),
+        "error": task.get("error", ""),
+        "event_count": len(events),
+        "next_event_index": len(events),
+        "events": events[start:],
+        "summary": task.get("summary", {}),
+    }
+
+
+def _codex_agent_add_task_event(task_id: str, event: Dict[str, Any]) -> None:
+    with _codex_agent_task_lock:
+        task = _codex_agent_tasks.get(task_id)
+        if not task:
+            return
+        task.setdefault("events", []).append(event)
+        task["updated_at"] = _codex_agent_now()
+
+
+def _codex_agent_set_task_status(task_id: str, status: str, **extra: Any) -> None:
+    with _codex_agent_task_lock:
+        task = _codex_agent_tasks.get(task_id)
+        if not task:
+            return
+        task["status"] = status
+        task["updated_at"] = _codex_agent_now()
+        if status == "running" and not task.get("started_at"):
+            task["started_at"] = task["updated_at"]
+        if status in {"completed", "failed", "stopped"}:
+            task["completed_at"] = task["updated_at"]
+        task.update(extra)
+
+
+def _codex_agent_canvas_id_from_payload(payload: CodexAgentTurnRequest) -> str:
+    if payload.canvas_id:
+        return str(payload.canvas_id).strip()
+    ctx = payload.canvas_context or {}
+    native = ctx.get("native") if isinstance(ctx, dict) else {}
+    if isinstance(native, dict):
+        value = native.get("canvasId") or native.get("canvas_id")
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _codex_agent_extract_canvas_action_blocks(text: str) -> List[str]:
+    raw = str(text or "")
+    blocks: List[str] = []
+    for m in re.finditer(r"```(?:canvas_agent_action|canvas-agent-action)\s*([\s\S]*?)```", raw, re.I):
+        body = (m.group(1) or "").strip()
+        if body:
+            blocks.append(body)
+    for m in re.finditer(r"<canvas_agent_action>([\s\S]*?)</canvas_agent_action>", raw, re.I):
+        body = (m.group(1) or "").strip()
+        if body:
+            blocks.append(body)
+    return blocks
+
+
+def _codex_agent_extract_canvas_tool_blocks(text: str) -> List[str]:
+    raw = str(text or "")
+    blocks: List[str] = []
+    for m in re.finditer(r"```(?:canvas_agent_tool|canvas-agent-tool|canvas_tool|canvas-tool)\s*([\s\S]*?)```", raw, re.I):
+        body = (m.group(1) or "").strip()
+        if body:
+            blocks.append(body)
+    for m in re.finditer(r"<(?:canvas_agent_tool|canvas_tool)>([\s\S]*?)</(?:canvas_agent_tool|canvas_tool)>", raw, re.I):
+        body = (m.group(1) or "").strip()
+        if body:
+            blocks.append(body)
+    return blocks
+
+
+def _codex_agent_parse_canvas_tool_calls(raw: str) -> List[Dict[str, Any]]:
+    try:
+        payload = json.loads(str(raw or "").strip())
+    except Exception as exc:
+        raise ValueError(f"Canvas Tool JSON 解析失败：{exc}") from exc
+    if isinstance(payload, list):
+        calls = payload
+    elif isinstance(payload, dict):
+        for key in ("tools", "tool_calls", "calls"):
+            if isinstance(payload.get(key), list):
+                calls = payload.get(key)
+                break
+        else:
+            calls = [payload]
+    else:
+        calls = []
+    out: List[Dict[str, Any]] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        tool = str(call.get("tool") or call.get("name") or call.get("type") or "").strip()
+        args = call.get("args") if isinstance(call.get("args"), dict) else call.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"value": args}
+        if not isinstance(args, dict):
+            args = {}
+        if tool:
+            out.append({"tool": tool, "args": args})
+    return out
+
+
+def _codex_agent_media_kind(url: str, fallback: str = "image") -> str:
+    clean = str(url or "").split("?", 1)[0].split("#", 1)[0].lower()
+    if re.search(r"\.(mp4|mov|webm|m4v|avi|mkv)$", clean):
+        return "video"
+    if re.search(r"\.(mp3|wav|m4a|aac|ogg|flac)$", clean):
+        return "audio"
+    return fallback or "image"
+
+
+def _codex_agent_name_from_url(url: str, fallback: str = "asset") -> str:
+    try:
+        path = urllib.parse.urlparse(str(url or "")).path
+        name = os.path.basename(urllib.parse.unquote(path))
+    except Exception:
+        name = ""
+    return name or fallback
+
+
+def _codex_agent_canvas_url_for_path(path_or_url: str) -> str:
+    raw = str(path_or_url or "").strip()
+    if not raw:
+        return ""
+    if re.match(r"^(https?:|data:|/)", raw, re.I):
+        return raw
+    return _codex_agent_file_view_url(raw)
+
+
+def _codex_agent_uid(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}{int(time.time() * 1000):x}"[-64:]
+
+
+def _codex_agent_context_node_rects(canvas_context: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
+    native = ctx.get("native") if isinstance(ctx.get("native"), dict) else {}
+    items: List[Any] = []
+    for key in ("allNodes", "selectedNodes"):
+        values = native.get(key)
+        if isinstance(values, list):
+            items.extend(values)
+    rects: Dict[str, Dict[str, float]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        node_id = str(item.get("id") or "").strip()
+        if not node_id:
+            continue
+        try:
+            width = float(item.get("width") or item.get("w") or 0)
+            height = float(item.get("height") or item.get("h") or 0)
+            if width <= 0 or height <= 0:
+                continue
+            rects[node_id] = {
+                "x": float(item.get("x") or 0),
+                "y": float(item.get("y") or 0),
+                "width": width,
+                "height": height,
+            }
+        except Exception:
+            continue
+    return rects
+
+
+def _codex_agent_node_rect(node: Dict[str, Any], context_rects: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, float]:
+    node_id = str(node.get("id") or "")
+    captured = (context_rects or {}).get(node_id)
+    if captured:
+        return {
+            "x": float(node.get("x") if node.get("x") is not None else captured.get("x") or 0),
+            "y": float(node.get("y") if node.get("y") is not None else captured.get("y") or 0),
+            "width": max(1, float(captured.get("width") or 1)),
+            "height": max(1, float(captured.get("height") or 1)),
+        }
+    ntype = str(node.get("type") or "smart-image")
+    if ntype == "smart-prompt":
+        w = max(float(node.get("w") or 316), 316)
+        text_len = len(str(node.get("text") or ""))
+        h = max(float(node.get("h") or 240), 240, min(560, 190 + text_len / 7))
+    elif ntype == "smart-loop":
+        w = float(node.get("w") or 340)
+        h = float(node.get("h") or 168)
+    elif ntype == "smart-group":
+        w = float(node.get("w") or 340)
+        h = float(node.get("h") or 220)
+    else:
+        count = max(1, len(node.get("images") or []))
+        scale = float(node.get("scale") or (0.72 if count > 1 else 1))
+        explicit_w = float(node.get("w") or 0)
+        explicit_h = float(node.get("h") or 0)
+        if count <= 1:
+            w = max(explicit_w, 260 * scale)
+            h = max(explicit_h, 260 * scale)
+        else:
+            w = max(explicit_w, min(560, 190 * min(count, 3)) * scale)
+            h = max(explicit_h, min(460, 190 * ((count + 2) // 3)) * scale)
+    return {
+        "x": float(node.get("x") or 0),
+        "y": float(node.get("y") or 0),
+        "width": max(1, w),
+        "height": max(1, h),
+    }
+
+
+def _codex_agent_node_summary(node: Dict[str, Any]) -> Dict[str, Any]:
+    rect = _codex_agent_node_rect(node)
+    return {
+        "id": node.get("id", ""),
+        "type": node.get("type") or "smart-image",
+        "title": node.get("title") or "",
+        "x": round(float(node.get("x") or 0)),
+        "y": round(float(node.get("y") or 0)),
+        "width": round(rect["width"]),
+        "height": round(rect["height"]),
+        "text": node.get("text") or node.get("variablePrompt") or "",
+        "images": [
+            {
+                "index": index,
+                "url": img.get("url") or "",
+                "name": img.get("name") or "",
+                "kind": img.get("kind") or _codex_agent_media_kind(img.get("url") or ""),
+            }
+            for index, img in enumerate(node.get("images") or [])
+            if isinstance(img, dict)
+        ],
+    }
+
+
+def _codex_agent_selected_ids(canvas_context: Optional[Dict[str, Any]]) -> List[str]:
+    ctx = canvas_context or {}
+    native = ctx.get("native") if isinstance(ctx, dict) else {}
+    ids = []
+    if isinstance(native, dict) and isinstance(native.get("selectedNodeIds"), list):
+        ids = native.get("selectedNodeIds") or []
+    return [str(x).strip() for x in ids if str(x or "").strip()]
+
+
+def _codex_agent_ref_attachment(value: Any, refs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    m = re.match(r"^@?ref[_-]?(\d+)$", text, re.I) or re.match(r"^@?图\s*(\d+)$", text)
+    if not m:
+        return None
+    idx = max(0, int(m.group(1)) - 1)
+    return refs[idx] if 0 <= idx < len(refs) else None
+
+
+def _codex_agent_resolve_node_ids(item: Any, nodes: List[Dict[str, Any]], refs: List[Dict[str, Any]], selected_ids: List[str]) -> List[str]:
+    data = {"ref": item} if isinstance(item, str) else (item if isinstance(item, dict) else {})
+    existing = {str(node.get("id")) for node in nodes}
+    out: List[str] = []
+
+    def add(value: Any) -> None:
+        node_id = str(value or "").strip()
+        if node_id and node_id in existing and node_id not in out:
+            out.append(node_id)
+
+    add(data.get("node_id") or data.get("nodeId") or data.get("id"))
+    for key in ("node_ids", "nodeIds", "ids"):
+        values = data.get(key)
+        if isinstance(values, list):
+            for value in values:
+                add(value)
+    ref_value = data.get("ref") or data.get("ref_id") or data.get("refId") or data.get("target_ref") or data.get("targetRef") or data.get("target")
+    ref = _codex_agent_ref_attachment(ref_value, refs)
+    if ref:
+        add(ref.get("nodeId") or ref.get("node_id"))
+    if data.get("selected") or data.get("scope") == "selected":
+        for node_id in selected_ids:
+            add(node_id)
+    return out
+
+
+def _codex_agent_visible_world(canvas_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
+    native = ctx.get("native") if isinstance(ctx.get("native"), dict) else {}
+    raw = native.get("visibleWorld") or native.get("visible_world") or ctx.get("visibleWorld") or ctx.get("visible_world") or {}
+    if not isinstance(raw, dict):
+        return None
+    try:
+        width = float(raw.get("width") or 0)
+        height = float(raw.get("height") or 0)
+        if width <= 0 or height <= 0:
+            return None
+        x = float(raw.get("x") or 0)
+        y = float(raw.get("y") or 0)
+        return {
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+            "centerX": float(raw.get("centerX", raw.get("center_x", x + width / 2)) or (x + width / 2)),
+            "centerY": float(raw.get("centerY", raw.get("center_y", y + height / 2)) or (y + height / 2)),
+        }
+    except Exception:
+        return None
+
+
+def _codex_agent_direction_from(options: Dict[str, Any], canvas_context: Optional[Dict[str, Any]]) -> str:
+    data = _codex_agent_placement_options(options)
+    values = []
+    for key in ("side", "placement", "position", "direction", "anchor", "align"):
+        if isinstance(data, dict) and data.get(key) is not None:
+            values.append(str(data.get(key) or ""))
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
+    values.append(str(ctx.get("_agent_user_text") or ""))
+    text = " ".join(values).lower()
+    if re.search(r"\b(left|west)\b|左侧|左边|左方|左面|左上|左下|往左|放左|画布左|当前画面左", text):
+        return "left"
+    if re.search(r"\b(right|east)\b|右侧|右边|右方|右面|右上|右下|往右|放右|画布右|当前画面右", text):
+        return "right"
+    if re.search(r"\b(top|up|above|north)\b|上方|上面|顶部|往上|放上|画布上|当前画面上", text):
+        return "top"
+    if re.search(r"\b(bottom|down|below|south)\b|下方|下面|底部|往下|放下|画布下|当前画面下", text):
+        return "bottom"
+    if re.search(r"\b(center|middle)\b|中间|中央|居中", text):
+        return "center"
+    return "right"
+
+
+def _codex_agent_placement_options(options: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(options or {}) if isinstance(options, dict) else {}
+    placement = data.get("placement")
+    if isinstance(placement, dict):
+        merged = dict(placement)
+        merged.update({k: v for k, v in data.items() if k != "placement"})
+        return merged
+    return data
+
+
+def _codex_agent_placement_scope_from(options: Dict[str, Any], canvas_context: Optional[Dict[str, Any]]) -> str:
+    data = _codex_agent_placement_options(options)
+    direct = str(
+        data.get("scope")
+        or data.get("placement_scope")
+        or data.get("coordinate_space")
+        or data.get("relative_to")
+        or ""
+    ).strip().lower()
+    if direct in {"viewport", "view", "current", "visible", "screen"}:
+        return "viewport"
+    if direct in {"global", "canvas", "board", "overview", "all"}:
+        return "global"
+    if direct in {"node", "anchor", "selection", "selected", "ref", "reference"}:
+        return "node"
+
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
+    text = " ".join([
+        str(data.get("side") or ""),
+        str(data.get("placement") or ""),
+        str(data.get("position") or ""),
+        str(data.get("anchor") or ""),
+        str(ctx.get("_agent_user_text") or ""),
+    ]).lower()
+    if re.search(r"当前|现在看到|可见|视口|眼前|这块|这片|当前画面|当前视野|屏幕里|visible|viewport|current view", text):
+        return "viewport"
+    if re.search(r"这张图|这幅图|这个图|这张|这个节点|选中|所选|节点|素材|ref[_-]?\d+|图\s*\d+|旁边|附近|挨着|相邻|node|selected|anchor", text):
+        return "node"
+    if re.search(r"全局|整个画布|全画布|所有内容|所有节点|整体|版图|总览|z\s*键|快捷键\s*z|缩放后的画布|global|overview|whole canvas", text):
+        return "global"
+    return "viewport"
+
+
+def _codex_agent_bounds_from_rects(rects: List[Dict[str, float]]) -> Optional[Dict[str, float]]:
+    if not rects:
+        return None
+    min_x = min(r["x"] for r in rects)
+    min_y = min(r["y"] for r in rects)
+    max_x = max(r["x"] + r["width"] for r in rects)
+    max_y = max(r["y"] + r["height"] for r in rects)
+    return {"x": min_x, "y": min_y, "width": max_x - min_x, "height": max_y - min_y}
+
+
+def _codex_agent_viewport_local_bounds(visible: Dict[str, float], rects: List[Dict[str, float]]) -> Optional[Dict[str, float]]:
+    if not visible or not rects:
+        return None
+    expanded = {
+        "x": visible["x"] - visible["width"] * 0.15,
+        "y": visible["y"] - visible["height"] * 0.15,
+        "width": visible["width"] * 1.3,
+        "height": visible["height"] * 1.3,
+    }
+    local = [rect for rect in rects if _codex_agent_rect_intersects(rect, expanded, 0)]
+    return _codex_agent_bounds_from_rects(local)
+
+
+def _codex_agent_anchor_rect_from(
+    options: Dict[str, Any],
+    nodes: List[Dict[str, Any]],
+    refs: List[Dict[str, Any]],
+    selected_ids: List[str],
+    canvas_context: Optional[Dict[str, Any]],
+    context_rects: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Optional[Dict[str, float]]:
+    data = _codex_agent_placement_options(options)
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
+    text = str(ctx.get("_agent_user_text") or "")
+    probe = dict(data)
+    for key in ("anchor_node_id", "anchorNodeId", "target_node_id", "targetNodeId"):
+        if data.get(key):
+            probe["node_id"] = data.get(key)
+            break
+    if not any(probe.get(key) for key in ("node_id", "nodeId", "id", "ref", "ref_id", "refId")):
+        m = re.search(r"ref[_-]?(\d+)|图\s*(\d+)", text, re.I)
+        if m:
+            probe["ref"] = f"ref_{m.group(1) or m.group(2)}"
+        elif re.search(r"选中|所选|这张图|这个节点|这张|这个图|素材", text):
+            probe["selected"] = True
+    ids = _codex_agent_resolve_node_ids(probe, nodes, refs, selected_ids)
+    rects = [_codex_agent_node_rect(node, context_rects) for node in nodes if str(node.get("id")) in set(ids)]
+    return _codex_agent_bounds_from_rects(rects)
+
+
+def _codex_agent_rect_intersects(a: Dict[str, float], b: Dict[str, float], pad: float = 36) -> bool:
+    return not (
+        a["x"] + a["width"] + pad <= b["x"]
+        or b["x"] + b["width"] + pad <= a["x"]
+        or a["y"] + a["height"] + pad <= b["y"]
+        or b["y"] + b["height"] + pad <= a["y"]
+    )
+
+
+def _codex_agent_viewport_overlap_score(rect: Dict[str, float], visible: Optional[Dict[str, float]]) -> float:
+    if not visible:
+        return 0.0
+    x1 = max(rect["x"], visible["x"])
+    y1 = max(rect["y"], visible["y"])
+    x2 = min(rect["x"] + rect["width"], visible["x"] + visible["width"])
+    y2 = min(rect["y"] + rect["height"], visible["y"] + visible["height"])
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    return (x2 - x1) * (y2 - y1)
+
+
+def _codex_agent_new_node_point(
+    canvas: Dict[str, Any],
+    index: int,
+    total: int,
+    options: Dict[str, Any],
+    width: float = 220,
+    height: float = 220,
+    canvas_context: Optional[Dict[str, Any]] = None,
+    refs: Optional[List[Dict[str, Any]]] = None,
+    selected_ids: Optional[List[str]] = None,
+    context_rects: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, int]:
+    nodes = canvas.get("nodes") or []
+    placement = _codex_agent_placement_options(options)
+    if placement.get("x") is not None or placement.get("y") is not None:
+        base_x = float(placement.get("x") or 0)
+        base_y = float(placement.get("y") or 0)
+        cols = max(1, int(placement.get("cols") or min(max(total, 1), 3)))
+        cell_x = float(placement.get("cellX") or 360)
+        cell_y = float(placement.get("cellY") or 280)
+        return {"x": round(base_x + (index % cols) * cell_x), "y": round(base_y + (index // cols) * cell_y)}
+
+    visible = _codex_agent_visible_world(canvas_context)
+    scope = _codex_agent_placement_scope_from(placement, canvas_context)
+    direction = _codex_agent_direction_from(placement, canvas_context)
+    pad = float(placement.get("pad") or 56)
+    cell_x = float(placement.get("cellX") or max(360, width + 110))
+    cell_y = float(placement.get("cellY") or max(260, height + 70))
+    existing = [_codex_agent_node_rect(node, context_rects) for node in nodes]
+
+    def choose(candidates: List[Dict[str, float]], local_anchor: Optional[Dict[str, float]] = None) -> Optional[Dict[str, int]]:
+        open_candidates = []
+        for point in candidates:
+            rect = {"x": point["x"], "y": point["y"], "width": width, "height": height}
+            if not any(_codex_agent_rect_intersects(rect, other, 72) for other in existing):
+                open_candidates.append(point)
+        if not open_candidates:
+            return None
+        if local_anchor:
+            anchor_cx = local_anchor["x"] + local_anchor["width"] / 2
+            anchor_cy = local_anchor["y"] + local_anchor["height"] / 2
+            open_candidates.sort(key=lambda p: (abs((p["x"] + width / 2) - anchor_cx) + abs((p["y"] + height / 2) - anchor_cy), p["y"], p["x"]))
+        chosen = open_candidates[min(index, max(0, len(open_candidates) - 1))]
+        return {"x": round(chosen["x"]), "y": round(chosen["y"])}
+
+    if scope == "node":
+        anchor = _codex_agent_anchor_rect_from(placement, nodes, refs or [], selected_ids or [], canvas_context, context_rects)
+        if anchor:
+            rows = max(1, min(8, total + 3))
+            cols = max(1, min(8, total + 3))
+            candidates: List[Dict[str, float]] = []
+            if direction == "left":
+                base_x = anchor["x"] - width - pad
+                base_y = anchor["y"]
+                candidates = [{"x": base_x - step * cell_x, "y": base_y + row * cell_y} for step in range(0, 3) for row in range(rows)]
+            elif direction == "top":
+                base_x = anchor["x"]
+                base_y = anchor["y"] - height - pad
+                candidates = [{"x": base_x + col * cell_x, "y": base_y - step * cell_y} for step in range(0, 3) for col in range(cols)]
+            elif direction == "bottom":
+                base_x = anchor["x"]
+                base_y = anchor["y"] + anchor["height"] + pad
+                candidates = [{"x": base_x + col * cell_x, "y": base_y + step * cell_y} for step in range(0, 3) for col in range(cols)]
+            elif direction == "center":
+                candidates = [{"x": anchor["x"] + anchor["width"] / 2 - width / 2, "y": anchor["y"] + anchor["height"] / 2 - height / 2}]
+            else:
+                base_x = anchor["x"] + anchor["width"] + pad
+                base_y = anchor["y"]
+                candidates = [{"x": base_x + step * cell_x, "y": base_y + row * cell_y} for step in range(0, 3) for row in range(rows)]
+            picked = choose(candidates, anchor)
+            if picked:
+                return picked
+
+    global_bounds = _codex_agent_bounds_from_rects(existing)
+    if scope == "global" and global_bounds:
+        rows = max(1, min(10, total + 4))
+        cols = max(1, min(10, total + 4))
+        candidates: List[Dict[str, float]] = []
+        if direction == "left":
+            candidates = [{"x": global_bounds["x"] - width - pad - step * cell_x, "y": global_bounds["y"] + row * cell_y} for step in range(0, 3) for row in range(rows)]
+        elif direction == "top":
+            candidates = [{"x": global_bounds["x"] + col * cell_x, "y": global_bounds["y"] - height - pad - step * cell_y} for step in range(0, 3) for col in range(cols)]
+        elif direction == "bottom":
+            candidates = [{"x": global_bounds["x"] + col * cell_x, "y": global_bounds["y"] + global_bounds["height"] + pad + step * cell_y} for step in range(0, 3) for col in range(cols)]
+        elif direction == "center":
+            candidates = [{"x": global_bounds["x"] + global_bounds["width"] / 2 - width / 2, "y": global_bounds["y"] + global_bounds["height"] / 2 - height / 2}]
+        else:
+            candidates = [{"x": global_bounds["x"] + global_bounds["width"] + pad + step * cell_x, "y": global_bounds["y"] + row * cell_y} for step in range(0, 3) for row in range(rows)]
+        picked = choose(candidates, global_bounds)
+        if picked:
+            return picked
+
+    if visible:
+        local_bounds = _codex_agent_viewport_local_bounds(visible, existing)
+        if local_bounds:
+            rows = max(1, min(12, int(local_bounds["height"] // max(1, cell_y)) + total + 2))
+            cols = max(1, min(12, int(local_bounds["width"] // max(1, cell_x)) + total + 2))
+            candidates: List[Dict[str, float]] = []
+            if direction == "left":
+                candidates = [
+                    {"x": local_bounds["x"] - width - pad - step * cell_x, "y": local_bounds["y"] + row * cell_y}
+                    for step in range(0, 6)
+                    for row in range(rows)
+                ]
+            elif direction == "top":
+                candidates = [
+                    {"x": local_bounds["x"] + col * cell_x, "y": local_bounds["y"] - height - pad - step * cell_y}
+                    for step in range(0, 6)
+                    for col in range(cols)
+                ]
+            elif direction == "bottom":
+                candidates = [
+                    {"x": local_bounds["x"] + col * cell_x, "y": local_bounds["y"] + local_bounds["height"] + pad + step * cell_y}
+                    for step in range(0, 6)
+                    for col in range(cols)
+                ]
+            elif direction == "center":
+                candidates = [{"x": local_bounds["x"] + local_bounds["width"] / 2 - width / 2, "y": local_bounds["y"] + local_bounds["height"] / 2 - height / 2}]
+            else:
+                candidates = [
+                    {"x": local_bounds["x"] + local_bounds["width"] + pad + step * cell_x, "y": local_bounds["y"] + row * cell_y}
+                    for step in range(0, 6)
+                    for row in range(rows)
+                ]
+            picked = choose(candidates, local_bounds)
+            if picked:
+                return picked
+
+        view_x = visible["x"]
+        view_y = visible["y"]
+        view_w = visible["width"]
+        view_h = visible["height"]
+        band_w = max(width + pad * 2, min(view_w, view_w * 0.38))
+        band_h = max(height + pad * 2, min(view_h, view_h * 0.38))
+
+        if direction == "left":
+            x0, x1 = view_x + pad, min(view_x + band_w, view_x + view_w - width - pad)
+            y0, y1 = view_y + pad, view_y + view_h - height - pad
+        elif direction == "top":
+            x0, x1 = view_x + pad, view_x + view_w - width - pad
+            y0, y1 = view_y + pad, min(view_y + band_h, view_y + view_h - height - pad)
+        elif direction == "bottom":
+            x0, x1 = view_x + pad, view_x + view_w - width - pad
+            y0, y1 = max(view_y + pad, view_y + view_h - band_h), view_y + view_h - height - pad
+        elif direction == "center":
+            center_x = visible["centerX"] - width / 2
+            center_y = visible["centerY"] - height / 2
+            x0, x1 = center_x - cell_x, center_x + cell_x
+            y0, y1 = center_y - cell_y, center_y + cell_y
+        else:
+            x0, x1 = max(view_x + pad, view_x + view_w - band_w), view_x + view_w - width - pad
+            y0, y1 = view_y + pad, view_y + view_h - height - pad
+
+        if x1 < x0:
+            x0 = x1 = visible["centerX"] - width / 2
+        if y1 < y0:
+            y0 = y1 = visible["centerY"] - height / 2
+
+        candidates: List[Dict[str, float]] = []
+        y = y0
+        while y <= y1 + 1 and len(candidates) < 80:
+            x_values: List[float] = []
+            x = x0
+            while x <= x1 + 1 and len(x_values) < 20:
+                x_values.append(x)
+                x += cell_x
+            if direction in {"right", "bottom"}:
+                x_values = list(reversed(x_values))
+            for x in x_values:
+                candidates.append({"x": x, "y": y})
+            y += cell_y
+
+        # If the requested side is crowded, step just outside the visible edge,
+        # but stay close to the current viewport instead of chasing infinite-canvas bounds.
+        if direction == "left":
+            candidates.extend({"x": view_x - width - pad - step * cell_x, "y": view_y + pad + row * cell_y} for step in range(1, 3) for row in range(max(1, min(6, total + 2))))
+        elif direction == "right":
+            candidates.extend({"x": view_x + view_w + pad + (step - 1) * cell_x, "y": view_y + pad + row * cell_y} for step in range(1, 3) for row in range(max(1, min(6, total + 2))))
+        elif direction == "top":
+            candidates.extend({"x": view_x + pad + col * cell_x, "y": view_y - height - pad - step * cell_y} for step in range(1, 3) for col in range(max(1, min(6, total + 2))))
+        elif direction == "bottom":
+            candidates.extend({"x": view_x + pad + col * cell_x, "y": view_y + view_h + pad + (step - 1) * cell_y} for step in range(1, 3) for col in range(max(1, min(6, total + 2))))
+
+        picked = choose(candidates, visible)
+        if picked:
+            return picked
+        return {"x": round(visible["centerX"] - width / 2), "y": round(visible["centerY"] - height / 2)}
+
+    elif nodes:
+        rects = [_codex_agent_node_rect(node, context_rects) for node in nodes]
+        base_x = max(r["x"] + r["width"] for r in rects) + 80
+        base_y = min(r["y"] for r in rects)
+    else:
+        base_x = 120
+        base_y = 120
+    cols = max(1, int(options.get("cols") or min(max(total, 1), 3))) if isinstance(options, dict) else 3
+    cell_x = float(options.get("cellX") or 360) if isinstance(options, dict) else 360
+    cell_y = float(options.get("cellY") or 280) if isinstance(options, dict) else 280
+    return {"x": round(base_x + (index % cols) * cell_x), "y": round(base_y + (index // cols) * cell_y)}
+
+
+def _codex_agent_name_with_existing_ext(name: str, media: Dict[str, Any]) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    if re.search(r"\.[a-z0-9]{2,8}$", text, re.I):
+        return text
+    source = str(media.get("name") or media.get("url") or "").split("?", 1)[0]
+    m = re.search(r"(\.[a-z0-9]{2,8})$", source, re.I)
+    return f"{text}{m.group(1)}" if m else text
+
+
+async def _codex_agent_apply_canvas_actions(
+    canvas_id: str,
+    actions: List[Dict[str, Any]],
+    refs: List[Dict[str, Any]],
+    canvas_context: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not canvas_id:
+        return {"ok": False, "message": "no canvas_id", "results": [], "changed": 0, "skipped": 0}
+    canvas = load_canvas(canvas_id)
+    if normalize_canvas_kind(canvas.get("kind")) != "smart":
+        return {"ok": False, "message": "only smart canvas is supported", "results": [], "changed": 0, "skipped": 0}
+    nodes = canvas.setdefault("nodes", [])
+    connections = canvas.setdefault("connections", [])
+    selected_ids = _codex_agent_selected_ids(canvas_context)
+    context_rects = _codex_agent_context_node_rects(canvas_context)
+    results: List[Dict[str, Any]] = []
+    changed = 0
+    skipped = 0
+
+    def node_by_id(node_id: str) -> Optional[Dict[str, Any]]:
+        return next((node for node in nodes if str(node.get("id")) == str(node_id)), None)
+
+    def result(action_type: str, status: str, message: str = "", items: Optional[List[Any]] = None) -> None:
+        nonlocal skipped
+        if status == "skipped":
+            skipped += 1
+        results.append({"type": action_type, "status": status, "message": message, "items": items or []})
+
+    for raw_action in actions:
+        action = raw_action if isinstance(raw_action, dict) else {}
+        action_type = str(action.get("type") or action.get("action") or "").lower().replace("-", "_")
+        options = action.get("options") if isinstance(action.get("options"), dict) else {}
+        try:
+            if action_type in {"remember_preference", "remember_preferences", "save_preference"}:
+                note = str(action.get("note") or action.get("text") or action.get("content") or action.get("preference") or "").strip()
+                if note:
+                    _codex_agent_append_preference(note)
+                    result(action_type, "done", "preference saved")
+                else:
+                    result(action_type, "skipped", "empty preference")
+                continue
+
+            if action_type in {"add_media", "add_image", "add_video", "add_media_nodes"}:
+                source_items = action.get("items") or action.get("media") or action.get("images") or action.get("videos") or [action]
+                items = source_items if isinstance(source_items, list) else [source_items]
+                created = []
+                for index, item in enumerate(items):
+                    data = {"url": item} if isinstance(item, str) else (item if isinstance(item, dict) else {})
+                    raw_url = str(data.get("url") or data.get("path") or data.get("src") or "").strip()
+                    if not raw_url:
+                        continue
+                    url = _codex_agent_canvas_url_for_path(raw_url)
+                    media = {
+                        "url": url,
+                        "name": data.get("name") or _codex_agent_name_from_url(raw_url),
+                        "kind": data.get("kind") or data.get("mediaKind") or _codex_agent_media_kind(raw_url),
+                    }
+                    if data.get("prompt"):
+                        media["prompt"] = str(data.get("prompt"))
+                    point = _codex_agent_new_node_point(canvas, index, len(items), options, 220, 220, canvas_context, refs, selected_ids, context_rects)
+                    node = {
+                        "id": _codex_agent_uid("smart"),
+                        "type": "smart-image",
+                        "x": point["x"],
+                        "y": point["y"],
+                        "title": "Image",
+                        "images": [media],
+                        "scale": 1,
+                        "created_at": _codex_agent_now(),
+                    }
+                    nodes.append(node)
+                    created.append(_codex_agent_node_summary(node))
+                changed += len(created)
+                result(action_type, "done" if created else "skipped", f"created {len(created)} media nodes", created)
+                continue
+
+            if action_type in {"add_prompt", "add_text", "add_prompt_nodes"}:
+                source_items = action.get("items") or action.get("prompts") or action.get("texts") or [action]
+                items = source_items if isinstance(source_items, list) else [source_items]
+                created = []
+                for index, item in enumerate(items):
+                    data = {"text": item} if isinstance(item, str) else (item if isinstance(item, dict) else {})
+                    text = str(data.get("text") or data.get("prompt") or "").strip()
+                    title = str(data.get("title") or "Prompt").strip() or "Prompt"
+                    if not text and not title:
+                        continue
+                    point = _codex_agent_new_node_point(canvas, index, len(items), options, 316, 240, canvas_context, refs, selected_ids, context_rects)
+                    node = {
+                        "id": _codex_agent_uid("prompt"),
+                        "type": "smart-prompt",
+                        "x": point["x"],
+                        "y": point["y"],
+                        "w": 316,
+                        "h": 240,
+                        "title": title,
+                        "text": text,
+                        "promptSeparator": ";",
+                        "promptSplitEnabled": False,
+                        "llmEnabled": False,
+                        "llmSystemEnabled": False,
+                        "llmSystemPrompt": "You are a helpful prompt assistant.",
+                        "llmInstruction": "",
+                        "created_at": _codex_agent_now(),
+                    }
+                    nodes.append(node)
+                    created.append(_codex_agent_node_summary(node))
+                changed += len(created)
+                result(action_type, "done" if created else "skipped", f"created {len(created)} prompt nodes", created)
+                continue
+
+            if action_type in {"add_loop", "add_loop_nodes"}:
+                source_items = action.get("items") or action.get("loops") or [action]
+                items = source_items if isinstance(source_items, list) else [source_items]
+                created = []
+                for index, item in enumerate(items):
+                    data = {"variablePrompt": item} if isinstance(item, str) else (item if isinstance(item, dict) else {})
+                    point = _codex_agent_new_node_point(canvas, index, len(items), options, 340, 168, canvas_context, refs, selected_ids, context_rects)
+                    node = {
+                        "id": _codex_agent_uid("loop"),
+                        "type": "smart-loop",
+                        "x": point["x"],
+                        "y": point["y"],
+                        "w": 340,
+                        "h": 168,
+                        "title": str(data.get("title") or "Loop"),
+                        "count": max(1, int(float(data.get("count") or 1))),
+                        "mode": data.get("mode") or "serial",
+                        "showPrompt": False,
+                        "imageInput": False,
+                        "loopStart": 1,
+                        "imageBatchSize": 1,
+                        "variablePrompt": str(data.get("variablePrompt") or data.get("text") or data.get("prompt") or ""),
+                        "created_at": _codex_agent_now(),
+                    }
+                    nodes.append(node)
+                    created.append(_codex_agent_node_summary(node))
+                changed += len(created)
+                result(action_type, "done" if created else "skipped", f"created {len(created)} loop nodes", created)
+                continue
+
+            if action_type in {"rename_node", "rename_nodes", "set_node_title", "set_node_titles"}:
+                source_items = action.get("items") or action.get("nodes") or action.get("targets") or [action]
+                items = source_items if isinstance(source_items, list) else [source_items]
+                touched = []
+                missing = 0
+                for item in items:
+                    data = item if isinstance(item, dict) else {"ref": item}
+                    name = str(data.get("name") or data.get("title") or data.get("label") or data.get("text") or "").strip()
+                    if not name:
+                        continue
+                    wants_title = str(data.get("field") or data.get("target_field") or data.get("rename_field") or "").lower() in {"node_title", "title"} or data.get("node_title") is True or data.get("renameNodeTitle") is True
+                    ids = _codex_agent_resolve_node_ids(data, nodes, refs, selected_ids)
+                    if not ids:
+                        missing += 1
+                    for node_id in ids:
+                        node = node_by_id(node_id)
+                        if not node:
+                            missing += 1
+                            continue
+                        image_index_raw = data.get("image_index", data.get("imageIndex"))
+                        image_index = int(float(image_index_raw)) if image_index_raw is not None and str(image_index_raw) != "" else (0 if len(node.get("images") or []) == 1 else -1)
+                        if wants_title:
+                            node["title"] = name
+                            touched.append(_codex_agent_node_summary(node))
+                        elif 0 <= image_index < len(node.get("images") or []):
+                            node["images"][image_index]["name"] = _codex_agent_name_with_existing_ext(name, node["images"][image_index])
+                            touched.append(_codex_agent_node_summary(node))
+                        else:
+                            missing += 1
+                changed += len(touched)
+                result(action_type, "done" if touched else "skipped", f"renamed {len(touched)} nodes, skipped {missing}", touched)
+                skipped += missing
+                continue
+
+            if action_type in {"move_node", "move_nodes", "position_node", "position_nodes"}:
+                source_items = action.get("items") or action.get("nodes") or action.get("targets") or [action]
+                items = source_items if isinstance(source_items, list) else [source_items]
+                touched = []
+                missing = 0
+                for item in items:
+                    data = item if isinstance(item, dict) else {"ref": item}
+                    ids = _codex_agent_resolve_node_ids(data, nodes, refs, selected_ids)
+                    if not ids:
+                        missing += 1
+                    for node_id in ids:
+                        node = node_by_id(node_id)
+                        if not node:
+                            missing += 1
+                            continue
+                        has_x = data.get("x") is not None
+                        has_y = data.get("y") is not None
+                        dx = float(data.get("dx", data.get("offset_x", data.get("offsetX", 0))) or 0)
+                        dy = float(data.get("dy", data.get("offset_y", data.get("offsetY", 0))) or 0)
+                        node["x"] = round(float(data.get("x")) if has_x else float(node.get("x") or 0) + dx)
+                        node["y"] = round(float(data.get("y")) if has_y else float(node.get("y") or 0) + dy)
+                        touched.append(_codex_agent_node_summary(node))
+                changed += len(touched)
+                result(action_type, "done" if touched else "skipped", f"moved {len(touched)} nodes, skipped {missing}", touched)
+                skipped += missing
+                continue
+
+            if action_type in {"arrange_node", "arrange_nodes", "layout_nodes", "organize_nodes"}:
+                source_items = action.get("items") or action.get("nodes") or action.get("targets") or []
+                ids: List[str] = []
+                for item in (source_items if isinstance(source_items, list) else [source_items]):
+                    for node_id in _codex_agent_resolve_node_ids(item, nodes, refs, selected_ids):
+                        if node_id not in ids:
+                            ids.append(node_id)
+                if not ids and (options.get("selected") or options.get("scope") == "selected"):
+                    ids = [node_id for node_id in selected_ids if node_by_id(node_id)]
+                if not ids and (options.get("all") or options.get("scope") in {"all", "canvas"}):
+                    ids = [str(node.get("id")) for node in nodes if node.get("id")]
+                target_nodes = [node_by_id(node_id) for node_id in ids]
+                target_nodes = [node for node in target_nodes if node]
+                if not target_nodes:
+                    result(action_type, "skipped", "no nodes to arrange")
+                    continue
+                rects = [_codex_agent_node_rect(node, context_rects) for node in target_nodes]
+                min_x = float(options.get("x")) if options.get("x") is not None else min(r["x"] for r in rects)
+                min_y = float(options.get("y")) if options.get("y") is not None else min(r["y"] for r in rects)
+                cell_x = float(options.get("cellX") or max(420, max(r["width"] for r in rects) + 110))
+                cell_y = float(options.get("cellY") or max(260, max(r["height"] for r in rects) + 54))
+                cols = max(1, int(options.get("cols") or (1 if str(options.get("mode") or options.get("layout") or "").lower() in {"vertical", "column"} else len(target_nodes))))
+                touched = []
+                for index, node in enumerate(sorted(target_nodes, key=lambda n: (float(n.get("y") or 0), float(n.get("x") or 0), str(n.get("id"))))):
+                    node["x"] = round(min_x + (index % cols) * cell_x)
+                    node["y"] = round(min_y + (index // cols) * cell_y)
+                    touched.append(_codex_agent_node_summary(node))
+                changed += len(touched)
+                result(action_type, "done", f"arranged {len(touched)} nodes", touched)
+                continue
+
+            if action_type in {"group_node", "group_nodes", "create_group", "create_group_node"}:
+                source_items = action.get("items") or action.get("nodes") or action.get("targets") or []
+                ids: List[str] = []
+                for item in (source_items if isinstance(source_items, list) else [source_items]):
+                    for node_id in _codex_agent_resolve_node_ids(item, nodes, refs, selected_ids):
+                        node = node_by_id(node_id)
+                        if node and node.get("type") != "smart-group" and node_id not in ids:
+                            ids.append(node_id)
+                if not ids and (options.get("selected") or options.get("scope") == "selected"):
+                    ids = [node_id for node_id in selected_ids if node_by_id(node_id)]
+                selected = [node_by_id(node_id) for node_id in ids]
+                selected = [node for node in selected if node and node.get("type") != "smart-group"]
+                if not selected:
+                    result(action_type, "skipped", "no nodes to group")
+                    continue
+                rects = [_codex_agent_node_rect(node, context_rects) for node in selected]
+                min_x = min(r["x"] for r in rects)
+                min_y = min(r["y"] for r in rects)
+                max_x = max(r["x"] + r["width"] for r in rects)
+                max_y = max(r["y"] + r["height"] for r in rects)
+                group = {
+                    "id": _codex_agent_uid("group"),
+                    "type": "smart-group",
+                    "x": round(min_x - 18),
+                    "y": round(min_y - 44),
+                    "w": max(340, round(max_x - min_x + 36)),
+                    "h": max(220, round(max_y - min_y + 72)),
+                    "title": str(options.get("title") or options.get("name") or "智能分组"),
+                    "items": ids,
+                    "images": [],
+                    "created_at": _codex_agent_now(),
+                }
+                nodes.append(group)
+                changed += 1
+                result(action_type, "done", f"grouped {len(ids)} nodes", [_codex_agent_node_summary(group)])
+                continue
+
+            if action_type in {"ungroup_node", "ungroup_nodes", "split_group", "split_group_node"}:
+                source_items = action.get("items") or action.get("nodes") or action.get("targets") or []
+                ids: List[str] = []
+                for item in (source_items if isinstance(source_items, list) else [source_items]):
+                    for node_id in _codex_agent_resolve_node_ids(item, nodes, refs, selected_ids):
+                        if node_id not in ids:
+                            ids.append(node_id)
+                before = len(nodes)
+                nodes[:] = [node for node in nodes if not (str(node.get("id")) in ids and node.get("type") == "smart-group")]
+                removed = before - len(nodes)
+                changed += removed
+                result(action_type, "done" if removed else "skipped", f"ungrouped {removed} groups")
+                continue
+
+            if action_type in {"generate_image", "generate_images", "create_image", "create_images", "generate_video", "generate_videos", "create_video", "create_videos"}:
+                result(action_type, "skipped", "backend generation handoff is not implemented yet")
+                continue
+
+            result(action_type or "unknown", "skipped", "unsupported action")
+        except Exception as exc:
+            result(action_type or "unknown", "error", str(exc))
+
+    if changed:
+        canvas["nodes"] = nodes
+        canvas["connections"] = connections
+        save_canvas(canvas)
+        await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or _codex_agent_now()), "codex-agent")
+    return {"ok": True, "results": results, "changed": changed, "skipped": skipped, "canvas_updated_at": canvas.get("updated_at", 0)}
+
+
+def _codex_agent_action_type(action: Dict[str, Any]) -> str:
+    return str(action.get("type") or action.get("action") or "").strip().lower().replace("-", "_")
+
+
+def _codex_agent_action_item_count(action: Dict[str, Any]) -> int:
+    for key in ("items", "nodes", "targets", "actions"):
+        value = action.get(key)
+        if isinstance(value, list):
+            return len(value)
+    return 1
+
+
+def _codex_agent_public_action_summary(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for action in actions[:20]:
+        if not isinstance(action, dict):
+            continue
+        atype = _codex_agent_action_type(action)
+        options = action.get("options") if isinstance(action.get("options"), dict) else {}
+        out.append({
+            "type": atype or "unknown",
+            "count": _codex_agent_action_item_count(action),
+            "title": str(options.get("title") or action.get("title") or action.get("name") or ""),
+            "scope": str(options.get("scope") or action.get("scope") or ""),
+        })
+    return out
+
+
+def _codex_agent_action_approval_requirement(actions: List[Dict[str, Any]], canvas_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
+    agent_input = ctx.get("agentInput") if isinstance(ctx.get("agentInput"), dict) else {}
+    policy = str(agent_input.get("approvalPolicy") or agent_input.get("approval_policy") or "auto").strip().lower()
+    if policy in {"auto", "automatic", "none", ""}:
+        return {"required": False}
+    if policy in {"confirm", "always", "manual"}:
+        return {"required": True, "risk": "normal", "reason": "当前策略要求执行前确认"}
+
+    risky_types = {
+        "generate_video", "generate_videos", "create_video", "create_videos",
+        "ungroup_node", "ungroup_nodes", "split_group", "split_group_node",
+        "remember_preference", "remember_preferences", "save_preference",
+    }
+    moderate_types = {
+        "rename_nodes", "rename_node", "move_nodes", "move_node", "position_nodes", "position_node",
+        "arrange_nodes", "arrange_node", "layout_nodes", "organize_nodes",
+        "group_nodes", "group_node", "create_group", "create_group_node",
+        "generate_image", "generate_images", "create_image", "create_images",
+    }
+    reasons: List[str] = []
+    risk = "normal"
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        atype = _codex_agent_action_type(action)
+        count = _codex_agent_action_item_count(action)
+        options = action.get("options") if isinstance(action.get("options"), dict) else {}
+        scope = str(options.get("scope") or action.get("scope") or "").lower()
+        if atype in risky_types:
+            risk = "high"
+            reasons.append(f"{atype} 属于高风险/高成本动作")
+        elif atype in moderate_types and (count >= 3 or scope in {"all", "canvas", "global"}):
+            risk = "high"
+            reasons.append(f"{atype} 将影响 {count} 项或全画布范围")
+        elif atype in moderate_types and risk != "high":
+            risk = "medium"
+    if policy in {"confirm-risky", "risky", "high-risk"} and risk == "high":
+        return {"required": True, "risk": risk, "reason": "；".join(reasons[:3]) or "检测到高风险画布动作"}
+    return {"required": False}
+
+
+async def _codex_agent_execute_actions_from_text(task_id: str, text: str, refs: List[Dict[str, Any]], canvas_context: Optional[Dict[str, Any]]) -> None:
+    with _codex_agent_task_lock:
+        task = _codex_agent_tasks.get(task_id) or {}
+        canvas_id = task.get("canvas_id", "")
+        seen = task.setdefault("executed_action_keys", set())
+    blocks = _codex_agent_extract_canvas_action_blocks(text)
+    if not blocks:
+        return
+    for raw in blocks:
+        with _codex_agent_task_lock:
+            task = _codex_agent_tasks.get(task_id) or {}
+            seen = task.setdefault("executed_action_keys", set())
+            if raw in seen:
+                continue
+            seen.add(raw)
+        try:
+            payload = json.loads(raw)
+            actions = payload if isinstance(payload, list) else (payload.get("actions") if isinstance(payload, dict) and isinstance(payload.get("actions"), list) else [payload])
+            actions = [action for action in actions if isinstance(action, dict)]
+        except Exception as exc:
+            _codex_agent_add_task_event(task_id, {"method": "canvas/action_result", "params": {"status": "error", "message": f"画布动作 JSON 解析失败：{exc}"}})
+            continue
+        approval = _codex_agent_action_approval_requirement(actions, canvas_context)
+        if approval.get("required"):
+            approval_id = _codex_agent_uid("approval")
+            with _codex_agent_task_lock:
+                task = _codex_agent_tasks.get(task_id)
+                if task is not None:
+                    task.setdefault("pending_action_approvals", {})[approval_id] = {
+                        "approval_id": approval_id,
+                        "actions": actions,
+                        "refs": refs,
+                        "canvas_context": canvas_context,
+                        "created_at": _codex_agent_now(),
+                        "status": "pending",
+                        "reason": approval.get("reason", ""),
+                        "risk": approval.get("risk", "normal"),
+                    }
+            _codex_agent_add_task_event(task_id, {
+                "method": "canvas/action_pending",
+                "params": {
+                    "task_id": task_id,
+                    "approval_id": approval_id,
+                    "actions": _codex_agent_public_action_summary(actions),
+                    "reason": approval.get("reason", "需要确认后执行"),
+                    "risk": approval.get("risk", "normal"),
+                    "count": len(actions),
+                },
+            })
+            continue
+        result = await _codex_agent_apply_canvas_actions(canvas_id, actions, refs, canvas_context)
+        _codex_agent_add_task_event(task_id, {"method": "canvas/action_result", "params": result})
+
+
+def _codex_agent_canvas_tool_is_query(tool: str) -> bool:
+    return str(tool or "").strip().lower().replace("-", "_") in {
+        "get_selected_nodes",
+        "get_viewport_nodes",
+        "get_node_detail",
+        "get_connected_nodes",
+        "get_canvas_summary",
+    }
+
+
+def _codex_agent_canvas_tool_result_text(results: List[Dict[str, Any]]) -> str:
+    compact: List[Dict[str, Any]] = []
+    for item in results[:12]:
+        if not isinstance(item, dict):
+            continue
+        data = item.get("result") if isinstance(item.get("result"), dict) else {}
+        clean = {
+            "tool": item.get("tool") or data.get("tool") or "",
+            "ok": data.get("ok", item.get("ok", True)),
+        }
+        for key in ("node_count", "connection_count", "selected_count", "type_counts", "bounds", "visible_world", "changed", "skipped"):
+            if key in data:
+                clean[key] = data.get(key)
+        if isinstance(data.get("nodes"), list):
+            clean["nodes"] = data.get("nodes")[:40]
+        if isinstance(data.get("connections"), list):
+            clean["connections"] = data.get("connections")[:80]
+        if isinstance(data.get("results"), list):
+            clean["results"] = data.get("results")[:20]
+        if data.get("message"):
+            clean["message"] = data.get("message")
+        compact.append(clean)
+    return (
+        "<canvas_tool_result>\n"
+        + json.dumps(compact, ensure_ascii=False)
+        + "\n</canvas_tool_result>\n"
+        + "请基于这些工具结果继续回答用户。不要暴露 canvas_agent_tool/canvas_agent_action/internal id；如涉及节点，用名称、图序、位置或简短描述表达。"
+    )
+
+
+async def _codex_agent_execute_tools_from_text(
+    task_id: str,
+    text: str,
+    refs: List[Dict[str, Any]],
+    canvas_context: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    with _codex_agent_task_lock:
+        task = _codex_agent_tasks.get(task_id) or {}
+        canvas_id = str(task.get("canvas_id") or "")
+    blocks = _codex_agent_extract_canvas_tool_blocks(text)
+    if not blocks:
+        return []
+    executed: List[Dict[str, Any]] = []
+    for raw in blocks:
+        with _codex_agent_task_lock:
+            task = _codex_agent_tasks.get(task_id) or {}
+            seen = task.setdefault("executed_tool_keys", set())
+            if raw in seen:
+                continue
+            seen.add(raw)
+        try:
+            calls = _codex_agent_parse_canvas_tool_calls(raw)
+        except Exception as exc:
+            result = {"ok": False, "tool": "parse", "message": str(exc)}
+            executed.append({"tool": "parse", "query": False, "result": result})
+            _codex_agent_add_task_event(task_id, {"method": "canvas/tool_result", "params": result})
+            continue
+        for call in calls:
+            tool = str(call.get("tool") or "").strip().lower().replace("-", "_")
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            query = _codex_agent_canvas_tool_is_query(tool)
+            _codex_agent_add_task_event(task_id, {
+                "method": "canvas/tool_call",
+                "params": {"tool": tool, "args": args, "query": query},
+            })
+            try:
+                payload = CodexAgentCanvasToolRequest(
+                    canvas_id=canvas_id,
+                    tool=tool,
+                    args=args,
+                    refs=refs,
+                    canvas_context=canvas_context,
+                )
+                result = await _codex_agent_run_canvas_tool(payload)
+            except HTTPException as exc:
+                result = {"ok": False, "tool": tool, "message": str(exc.detail)}
+            except Exception as exc:
+                result = {"ok": False, "tool": tool, "message": str(exc)}
+            executed.append({"tool": tool, "query": query, "result": result})
+            _codex_agent_add_task_event(task_id, {
+                "method": "canvas/tool_result",
+                "params": {"tool": tool, "query": query, "result": result},
+            })
+    return executed
+
+
+async def _codex_agent_add_generated_image(task_id: str, path: str, prompt: str, refs: List[Dict[str, Any]], canvas_context: Optional[Dict[str, Any]]) -> None:
+    if not path:
+        return
+    action = {"type": "add_media", "items": [{"path": path, "name": _codex_agent_name_from_url(path, "codex-image.png"), "kind": "image", "prompt": prompt}], "options": {"cols": 1}}
+    with _codex_agent_task_lock:
+        task = _codex_agent_tasks.get(task_id) or {}
+        key = f"generated-image:{path}"
+        seen = task.setdefault("executed_action_keys", set())
+        if key in seen:
+            return
+        seen.add(key)
+    result = await _codex_agent_apply_canvas_actions(str(task.get("canvas_id") or ""), [action], refs, canvas_context)
+    _codex_agent_add_task_event(task_id, {"method": "canvas/action_result", "params": result})
+
+
+def _codex_agent_canvas_nodes(canvas_id: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    canvas = load_canvas(canvas_id)
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas not found")
+    nodes = canvas.get("nodes") if isinstance(canvas.get("nodes"), list) else []
+    connections = canvas.get("connections") if isinstance(canvas.get("connections"), list) else []
+    return canvas, [node for node in nodes if isinstance(node, dict)], [conn for conn in connections if isinstance(conn, dict)]
+
+
+def _codex_agent_connection_value(conn: Dict[str, Any], keys: Tuple[str, ...]) -> str:
+    for key in keys:
+        value = conn.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _codex_agent_tool_query_canvas(payload: CodexAgentCanvasToolRequest) -> Dict[str, Any]:
+    tool = str(payload.tool or "").strip().lower()
+    args = payload.args if isinstance(payload.args, dict) else {}
+    canvas_id = str(payload.canvas_id or "").strip()
+    if not canvas_id:
+        raise HTTPException(status_code=400, detail="缺少 canvas_id")
+    canvas, nodes, connections = _codex_agent_canvas_nodes(canvas_id)
+    context_rects = _codex_agent_context_node_rects(payload.canvas_context)
+    selected_ids = _codex_agent_selected_ids(payload.canvas_context)
+    by_id = {str(node.get("id")): node for node in nodes if node.get("id")}
+
+    if tool == "get_canvas_summary":
+        type_counts: Dict[str, int] = {}
+        rects = []
+        for node in nodes:
+            ntype = str(node.get("type") or "smart-image")
+            type_counts[ntype] = type_counts.get(ntype, 0) + 1
+            rects.append(_codex_agent_node_rect(node, context_rects))
+        bounds = {}
+        if rects:
+            min_x = min(rect["x"] for rect in rects)
+            min_y = min(rect["y"] for rect in rects)
+            max_x = max(rect["x"] + rect["width"] for rect in rects)
+            max_y = max(rect["y"] + rect["height"] for rect in rects)
+            bounds = {"x": round(min_x), "y": round(min_y), "width": round(max_x - min_x), "height": round(max_y - min_y)}
+        return {
+            "ok": True,
+            "tool": tool,
+            "canvas_id": canvas_id,
+            "title": canvas.get("name") or canvas.get("title") or "",
+            "node_count": len(nodes),
+            "connection_count": len(connections),
+            "selected_count": len(selected_ids),
+            "type_counts": type_counts,
+            "bounds": bounds,
+        }
+
+    if tool == "get_selected_nodes":
+        return {
+            "ok": True,
+            "tool": tool,
+            "canvas_id": canvas_id,
+            "nodes": [_codex_agent_node_summary(by_id[node_id]) for node_id in selected_ids if node_id in by_id],
+        }
+
+    if tool == "get_viewport_nodes":
+        visible = _codex_agent_visible_world(payload.canvas_context)
+        if not visible:
+            return {"ok": True, "tool": tool, "canvas_id": canvas_id, "nodes": [], "visible_world": None}
+        pad = float(args.get("pad") or 80)
+        result_nodes = []
+        for node in nodes:
+            rect = _codex_agent_node_rect(node, context_rects)
+            if not (
+                rect["x"] + rect["width"] + pad < visible["x"] or
+                visible["x"] + visible["width"] + pad < rect["x"] or
+                rect["y"] + rect["height"] + pad < visible["y"] or
+                visible["y"] + visible["height"] + pad < rect["y"]
+            ):
+                result_nodes.append(_codex_agent_node_summary(node))
+        return {"ok": True, "tool": tool, "canvas_id": canvas_id, "visible_world": visible, "nodes": result_nodes[:120]}
+
+    if tool == "get_node_detail":
+        raw_ids = args.get("node_ids") or args.get("nodeIds") or args.get("ids") or args.get("node_id") or args.get("id") or []
+        ids = raw_ids if isinstance(raw_ids, list) else [raw_ids]
+        ids = [str(node_id).strip() for node_id in ids if str(node_id or "").strip()]
+        if not ids and len(selected_ids) == 1:
+            ids = [selected_ids[0]]
+        return {
+            "ok": True,
+            "tool": tool,
+            "canvas_id": canvas_id,
+            "nodes": [_codex_agent_node_summary(by_id[str(node_id)]) for node_id in ids if str(node_id) in by_id],
+        }
+
+    if tool == "get_connected_nodes":
+        node_id = str(args.get("node_id") or args.get("nodeId") or args.get("id") or "").strip()
+        if not node_id and len(selected_ids) == 1:
+            node_id = selected_ids[0]
+        if not node_id:
+            return {
+                "ok": False,
+                "tool": tool,
+                "canvas_id": canvas_id,
+                "message": "缺少 node_id，且当前没有唯一选中节点",
+                "nodes": [],
+                "connections": [],
+            }
+        connected_ids: List[str] = []
+        edge_rows = []
+        for conn in connections:
+            source = _codex_agent_connection_value(conn, ("source", "sourceId", "from", "fromNodeId", "start"))
+            target = _codex_agent_connection_value(conn, ("target", "targetId", "to", "toNodeId", "end"))
+            if node_id in {source, target}:
+                other = target if source == node_id else source
+                if other and other not in connected_ids:
+                    connected_ids.append(other)
+                edge_rows.append({"source": source, "target": target})
+        return {
+            "ok": True,
+            "tool": tool,
+            "canvas_id": canvas_id,
+            "node_id": node_id,
+            "connections": edge_rows,
+            "nodes": [_codex_agent_node_summary(by_id[item]) for item in connected_ids if item in by_id],
+        }
+
+    raise HTTPException(status_code=400, detail=f"不支持的查询工具: {tool}")
+
+
+async def _codex_agent_run_canvas_tool(payload: CodexAgentCanvasToolRequest) -> Dict[str, Any]:
+    tool = str(payload.tool or "").strip().lower().replace("-", "_")
+    query_tools = {"get_selected_nodes", "get_viewport_nodes", "get_node_detail", "get_connected_nodes", "get_canvas_summary"}
+    if tool in query_tools:
+        return _codex_agent_tool_query_canvas(payload)
+    action_map = {
+        "move_nodes": "move_nodes",
+        "arrange_nodes": "arrange_nodes",
+        "rename_assets": "rename_nodes",
+        "group_nodes": "group_nodes",
+        "ungroup_nodes": "ungroup_nodes",
+    }
+    if tool not in action_map:
+        raise HTTPException(status_code=400, detail=f"不支持的 Canvas Tool: {tool}")
+    args = payload.args if isinstance(payload.args, dict) else {}
+    actions = args.get("actions")
+    if not isinstance(actions, list):
+        action = dict(args)
+        action["type"] = action_map[tool]
+        actions = [action]
+    refs = [item for item in (payload.refs or []) if isinstance(item, dict)]
+    return await _codex_agent_apply_canvas_actions(str(payload.canvas_id or ""), actions, refs, payload.canvas_context)
+
+
+async def _codex_agent_run_background_task(task_id: str, payload: CodexAgentTurnRequest) -> None:
+    _codex_agent_set_task_status(task_id, "running")
+    _codex_agent_add_task_event(task_id, {"method": "task/started", "params": {"task_id": task_id}})
+    try:
+        runtime = await _codex_agent_runtime_for_payload(payload)
+    except Exception as exc:
+        _codex_agent_set_task_status(task_id, "failed", error=f"Agent Runtime 未打开: {payload.project_dir}")
+        _codex_agent_add_task_event(task_id, {"method": "error", "params": {"message": f"Agent Runtime 未打开: {payload.project_dir}: {exc}"}})
+        return
+    if runtime.resume_warning:
+        _codex_agent_add_task_event(task_id, {"method": "warning", "params": {"message": runtime.resume_warning, "thread_id": runtime.thread_id}})
+    refs: List[Dict[str, Any]] = []
+    ref_errors: List[str] = []
+    try:
+        task_canvas_context = dict(payload.canvas_context or {}) if isinstance(payload.canvas_context, dict) else {}
+        task_canvas_context["_agent_user_text"] = payload.text
+        if payload.attachments:
+            async with httpx.AsyncClient() as client:
+                for item in payload.attachments:
+                    try:
+                        refs.append(await _codex_agent_prepare_local_image(item, _codex_agent_effective_project_dir(payload.project_dir), client))
+                    except Exception as e:
+                        ref_errors.append(f"{item}: {e}")
+        image_refs = [ref for ref in refs if str(ref.get("kind") or "image").lower() == "image"]
+        context_text = _codex_agent_build_turn_context_text(payload.project_dir, refs, task_canvas_context, payload)
+        turn_text = f"{context_text}\n\n用户请求：\n{payload.text}" if context_text else payload.text
+        for err in ref_errors:
+            _codex_agent_add_task_event(task_id, {"method": "error", "params": {"message": f"ref download failed: {err}"}})
+        pending_turn_text = turn_text
+        pending_image_refs = image_refs
+        for tool_round in range(3):
+            query_results_for_followup: List[Dict[str, Any]] = []
+            async for event in runtime.send_user_message(pending_turn_text, pending_image_refs):
+                _codex_agent_add_task_event(task_id, event)
+                method = str(event.get("method") or "")
+                params = event.get("params") or {}
+                item = params.get("item") if isinstance(params, dict) else {}
+                if method == "item/completed" and isinstance(item, dict):
+                    if str(item.get("type") or "") == "agentMessage":
+                        agent_text = str(item.get("text") or "")
+                        tool_results = await _codex_agent_execute_tools_from_text(task_id, agent_text, refs, task_canvas_context)
+                        query_results_for_followup.extend([res for res in tool_results if res.get("query")])
+                        await _codex_agent_execute_actions_from_text(task_id, agent_text, refs, task_canvas_context)
+                    if str(item.get("type") or "") == "imageGeneration":
+                        await _codex_agent_add_generated_image(task_id, str(item.get("savedPath") or item.get("path") or ""), str(item.get("prompt") or ""), refs, task_canvas_context)
+                if method == "turn/completed":
+                    if query_results_for_followup and tool_round < 2:
+                        pending_turn_text = _codex_agent_canvas_tool_result_text(query_results_for_followup)
+                        pending_image_refs = []
+                        _codex_agent_add_task_event(task_id, {
+                            "method": "canvas/tool_followup",
+                            "params": {"round": tool_round + 1, "count": len(query_results_for_followup)},
+                        })
+                        break
+                    _codex_agent_set_task_status(task_id, "completed")
+                    _codex_agent_add_task_event(task_id, {"method": "task/completed", "params": {"task_id": task_id}})
+                    return
+                if method in {"fatal", "error", "turn/timeout"}:
+                    message = ""
+                    if isinstance(params, dict):
+                        message = str(params.get("message") or params.get("error") or "")
+                    _codex_agent_set_task_status(task_id, "failed", error=message)
+                    _codex_agent_add_task_event(task_id, {"method": "task/completed", "params": {"task_id": task_id, "status": "failed"}})
+                    return
+            else:
+                break
+        _codex_agent_set_task_status(task_id, "completed")
+        _codex_agent_add_task_event(task_id, {"method": "task/completed", "params": {"task_id": task_id}})
+    except asyncio.CancelledError:
+        _codex_agent_set_task_status(task_id, "stopped", error="stopped by user")
+        _codex_agent_add_task_event(task_id, {"method": "task/completed", "params": {"task_id": task_id, "status": "stopped"}})
+        raise
+    except Exception as exc:
+        _codex_agent_set_task_status(task_id, "failed", error=str(exc))
+        _codex_agent_add_task_event(task_id, {"method": "error", "params": {"message": str(exc)}})
+        _codex_agent_add_task_event(task_id, {"method": "task/completed", "params": {"task_id": task_id, "status": "failed"}})
+
+
 @app.post("/api/codex-agent/board/open")
 async def codex_agent_board_open(payload: CodexAgentBoardOpenRequest):
-    """打开（或复用）一个项目目录的 Codex session。"""
-    project_dir = payload.project_dir
-    if not project_dir or not os.path.isdir(project_dir):
-        raise HTTPException(status_code=400, detail=f"项目目录不存在: {project_dir}")
-
-    with _codex_agent_lock:
-        sess = _codex_agent_sessions.get(project_dir)
-        if sess is None:
-            sess = CodexAppServerSession(project_dir)
-            _codex_agent_sessions[project_dir] = sess
-
-    try:
-        thread_id = await sess.start(thread_id=payload.thread_id)
-    except HTTPException:
-        with _codex_agent_lock:
-            _codex_agent_sessions.pop(project_dir, None)
-        raise
-    except Exception as e:
-        with _codex_agent_lock:
-            _codex_agent_sessions.pop(project_dir, None)
-        raise HTTPException(status_code=500, detail=f"启动 Codex session 失败: {e}")
-
-    return {
-        "project_dir": project_dir,
-        "thread_id": thread_id,
-        "is_new": payload.thread_id is None,
-    }
+    """打开（或复用）一个 Canvas Agent Runtime。Codex thread 只是底层执行指针。"""
+    project_dir = str(payload.project_dir or "").strip()
+    return await _codex_agent_open_runtime(
+        project_dir=project_dir,
+        thread_id=str(payload.thread_id or ""),
+        canvas_id=str(payload.canvas_id or ""),
+        conversation_id=str(payload.conversation_id or ""),
+    )
 
 
 @app.post("/api/codex-agent/board/close")
 async def codex_agent_board_close(payload: CodexAgentBoardCloseRequest):
-    """关闭一个项目目录的 Codex session。"""
-    with _codex_agent_lock:
-        sess = _codex_agent_sessions.pop(payload.project_dir, None)
-    if sess:
-        await sess.stop()
+    """关闭一个 Agent Runtime。没有指定 thread/conversation 时关闭该目录下的运行时。"""
+    closed = await _codex_agent_close_runtime(
+        project_dir=str(payload.project_dir or ""),
+        canvas_id=str(payload.canvas_id or ""),
+        conversation_id=str(payload.conversation_id or ""),
+        thread_id=str(payload.thread_id or ""),
+    )
+    return {"ok": True, "closed": closed}
+
+
+@app.get("/api/codex-agent/history/projects")
+async def codex_agent_history_projects(canvas_id: str = "", include_hidden: bool = False):
+    return {
+        "projects": _codex_agent_history_projects(canvas_id, include_hidden),
+        "home": str(CODEX_AGENT_HISTORY_DB),
+    }
+
+
+@app.get("/api/codex-agent/history/conversations")
+async def codex_agent_history_conversations(project_dir: Optional[str] = None, canvas_id: str = "", include_archived: bool = False):
+    return {
+        "conversations": _codex_agent_history_conversations(project_dir, canvas_id, include_archived),
+        "home": str(CODEX_AGENT_HISTORY_DB),
+    }
+
+
+@app.post("/api/codex-agent/history/project-visibility")
+async def codex_agent_history_project_visibility(payload: CodexAgentProjectVisibilityRequest):
+    try:
+        _codex_agent_set_project_visibility(payload.canvas_id, payload.project_dir, payload.hidden)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True}
+
+
+@app.get("/api/codex-agent/workdirs/presets")
+async def codex_agent_workdir_presets_get():
+    return {"presets": _codex_agent_read_workdir_presets(), "home": str(CODEX_AGENT_WORKDIR_PRESETS_FILE)}
+
+
+@app.post("/api/codex-agent/workdirs/presets")
+async def codex_agent_workdir_presets_add(payload: CodexAgentWorkdirPresetRequest):
+    path = str(payload.path or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="缺少预设路径")
+    try:
+        resolved = str(_Path(path).expanduser().resolve())
+    except Exception:
+        raise HTTPException(status_code=400, detail="预设路径格式不正确")
+    if not os.path.isdir(resolved):
+        raise HTTPException(status_code=400, detail=f"预设路径不存在: {resolved}")
+    presets = _codex_agent_read_workdir_presets()
+    if resolved not in presets:
+        presets.append(resolved)
+        _codex_agent_write_workdir_presets(presets)
+    return {"ok": True, "presets": presets}
+
+
+@app.delete("/api/codex-agent/workdirs/presets")
+async def codex_agent_workdir_presets_delete(payload: CodexAgentWorkdirPresetRequest):
+    path = str(payload.path or "").strip()
+    try:
+        resolved = str(_Path(path).expanduser().resolve()) if path else ""
+    except Exception:
+        resolved = path
+    presets = [item for item in _codex_agent_read_workdir_presets() if item != resolved and item != path]
+    _codex_agent_write_workdir_presets(presets)
+    return {"ok": True, "presets": presets}
+
+
+@app.get("/api/codex-agent/workdirs/children")
+async def codex_agent_workdir_children(root: str = ""):
+    root = str(root or "").strip()
+    if not root:
+        return {"children": []}
+    try:
+        resolved = _Path(root).expanduser().resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail="根目录格式不正确")
+    if not resolved.is_dir():
+        raise HTTPException(status_code=400, detail=f"根目录不存在: {resolved}")
+    children = []
+    try:
+        for child in resolved.iterdir():
+            if child.is_dir() and not child.name.startswith("."):
+                children.append({"path": str(child), "name": child.name})
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"没有权限读取目录: {resolved}")
+    children.sort(key=lambda item: item["name"].lower())
+    return {"children": children}
+
+
+@app.get("/api/codex-agent/history/conversation")
+async def codex_agent_history_conversation(conversation_id: str = ""):
+    if not conversation_id:
+        raise HTTPException(status_code=400, detail="缺少 conversation_id")
+    data = _codex_agent_history_conversation_state(conversation_id)
+    return _codex_agent_panel_state_public(data)
+
+
+@app.get("/api/codex-agent/history/latest")
+async def codex_agent_history_latest(canvas_id: str = "", project_dir: Optional[str] = None):
+    data = _codex_agent_history_latest_state(canvas_id, project_dir)
+    return _codex_agent_panel_state_public(data)
+
+
+@app.get("/api/codex-agent/panel-state")
+async def codex_agent_panel_state_get(canvas_id: str = "", project_dir: str = "", thread_id: str = ""):
+    data = _codex_agent_read_panel_state(canvas_id, project_dir, thread_id)
+    return _codex_agent_panel_state_public(data)
+
+
+@app.get("/api/codex-agent/panel-state/latest")
+async def codex_agent_panel_state_latest(canvas_id: str = "", project_dir: Optional[str] = None):
+    data = _codex_agent_latest_panel_state(canvas_id, project_dir)
+    return _codex_agent_panel_state_public(data)
+
+
+@app.post("/api/codex-agent/panel-state")
+async def codex_agent_panel_state_save(payload: CodexAgentPanelStateRequest):
+    data = _codex_agent_write_panel_state(payload)
+    return {"ok": True, **_codex_agent_panel_state_public(data)}
 
 
 @app.post("/api/codex-agent/preferences/remember")
@@ -17581,9 +20333,7 @@ async def codex_agent_turn(payload: CodexAgentTurnRequest):
     每个 event 是 {"method": "item/started" | "item/updated" | "item/completed" | "turn/completed" | "error", "params": {...}}
     最终一条：{"method": "done"}
     """
-    sess = _codex_agent_sessions.get(payload.project_dir)
-    if not sess or not sess.thread_id:
-        raise HTTPException(status_code=400, detail=f"项目 session 未打开: {payload.project_dir}")
+    runtime = await _codex_agent_runtime_for_payload(payload)
 
     # 处理 attachments：把所有形式（file:// / 本地路径 / HTTP URL / data URL）转成
     # Codex app-server 稳定支持的本地 localImage 路径。
@@ -17593,34 +20343,171 @@ async def codex_agent_turn(payload: CodexAgentTurnRequest):
         async with httpx.AsyncClient() as client:
             for item in payload.attachments:
                 try:
-                    refs.append(await _codex_agent_prepare_local_image(item, payload.project_dir, client))
+                    refs.append(await _codex_agent_prepare_local_image(item, _codex_agent_effective_project_dir(payload.project_dir), client))
                 except Exception as e:
                     ref_errors.append(f"{item}: {e}")
 
     image_refs = [ref for ref in refs if str(ref.get("kind") or "image").lower() == "image"]
-    context_text = _codex_agent_ref_context_text(payload.project_dir, refs, payload.canvas_context)
+    context_text = _codex_agent_build_turn_context_text(payload.project_dir, refs, payload.canvas_context, payload)
     turn_text = f"{context_text}\n\n用户请求：\n{payload.text}" if context_text else payload.text
 
     async def event_stream():
+        if runtime.resume_warning:
+            data = json.dumps({"method": "warning", "params": {"message": runtime.resume_warning, "thread_id": runtime.thread_id}}, ensure_ascii=False)
+            yield f"data: {data}\n\n"
         for err in ref_errors:
             data = json.dumps({"method": "error", "params": {"message": f"ref download failed: {err}"}}, ensure_ascii=False)
             yield f"data: {data}\n\n"
         try:
-            async for event in sess.send_user_message(turn_text, image_refs):
+            async for event in runtime.send_user_message(turn_text, image_refs):
                 data = json.dumps(event, ensure_ascii=False)
                 yield f"data: {data}\n\n"
         except Exception as e:
             if isinstance(e, HTTPException) and e.status_code == 504:
-                with _codex_agent_lock:
-                    stale = _codex_agent_sessions.pop(payload.project_dir, None)
-                if stale:
-                    await stale.stop()
+                await _codex_agent_close_runtime(
+                    project_dir=str(payload.project_dir or ""),
+                    canvas_id=_codex_agent_canvas_id_from_payload(payload),
+                    conversation_id=str(payload.conversation_id or ""),
+                    thread_id=str(payload.thread_id or ""),
+                )
             err = {"method": "error", "params": {"message": str(e)}}
             yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
         finally:
             yield "data: {\"method\":\"done\"}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/api/codex-agent/turn/background")
+async def codex_agent_turn_background(payload: CodexAgentTurnRequest):
+    """
+    后台托管 Agent turn。页面刷新/关闭后，只要服务进程还在，任务会继续运行；
+    前端通过 /turn/status 轮询事件日志恢复展示。
+    """
+    runtime = await _codex_agent_runtime_for_payload(payload)
+    canvas_id = _codex_agent_canvas_id_from_payload(payload)
+    task_id = uuid.uuid4().hex
+    task: Dict[str, Any] = {
+        "task_id": task_id,
+        "project_dir": payload.project_dir,
+        "canvas_id": canvas_id,
+        "thread_id": runtime.thread_id,
+        "conversation_id": str(payload.conversation_id or ""),
+        "runtime_key": runtime.runtime_key,
+        "status": "queued",
+        "created_at": _codex_agent_now(),
+        "updated_at": _codex_agent_now(),
+        "events": [],
+        "summary": {},
+        "executed_action_keys": set(),
+    }
+    with _codex_agent_task_lock:
+        _codex_agent_tasks[task_id] = task
+    bg_task = asyncio.create_task(_codex_agent_run_background_task(task_id, payload))
+    with _codex_agent_task_lock:
+        _codex_agent_tasks[task_id]["asyncio_task"] = bg_task
+    return _codex_agent_task_public(task)
+
+
+@app.get("/api/codex-agent/turn/status")
+async def codex_agent_turn_status(task_id: str, after: int = 0):
+    with _codex_agent_task_lock:
+        task = _codex_agent_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Agent task not found")
+        return _codex_agent_task_public(task, after)
+
+
+@app.get("/api/codex-agent/turn/active")
+async def codex_agent_turn_active(project_dir: Optional[str] = None, canvas_id: str = "", conversation_id: str = ""):
+    with _codex_agent_task_lock:
+        tasks = list(_codex_agent_tasks.values())
+        tasks = [
+            task for task in tasks
+            if (project_dir is None or task.get("project_dir") == str(project_dir or ""))
+            and (not canvas_id or task.get("canvas_id") == canvas_id)
+            and (not conversation_id or task.get("conversation_id") == conversation_id)
+            and task.get("status") in {"queued", "running"}
+        ]
+        tasks.sort(key=lambda task: int(task.get("updated_at") or task.get("created_at") or 0), reverse=True)
+        if not tasks:
+            return {"task": None}
+        return {"task": _codex_agent_task_public(tasks[0], 0)}
+
+
+@app.post("/api/codex-agent/turn/stop")
+async def codex_agent_turn_stop(payload: CodexAgentTaskStatusRequest):
+    with _codex_agent_task_lock:
+        task = _codex_agent_tasks.get(payload.task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Agent task not found")
+        async_task = task.get("asyncio_task")
+        project_dir = task.get("project_dir", "")
+        canvas_id = task.get("canvas_id", "")
+        conversation_id = task.get("conversation_id", "")
+        thread_id = task.get("thread_id", "")
+    if async_task and not async_task.done():
+        async_task.cancel()
+    await _codex_agent_close_runtime(
+        project_dir=str(project_dir or ""),
+        canvas_id=str(canvas_id or ""),
+        conversation_id=str(conversation_id or ""),
+        thread_id=str(thread_id or ""),
+    )
+    _codex_agent_set_task_status(payload.task_id, "stopped", error="stopped by user")
+    _codex_agent_add_task_event(payload.task_id, {"method": "task/completed", "params": {"task_id": payload.task_id, "status": "stopped"}})
+    return {"ok": True, "task": _codex_agent_task_public(_codex_agent_tasks[payload.task_id])}
+
+
+@app.post("/api/codex-agent/action/resolve")
+async def codex_agent_action_resolve(payload: CodexAgentActionResolveRequest):
+    decision = str(payload.decision or "approve").strip().lower()
+    with _codex_agent_task_lock:
+        task = _codex_agent_tasks.get(payload.task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Agent task not found")
+        pending = task.setdefault("pending_action_approvals", {}).get(payload.approval_id)
+        if not pending:
+            raise HTTPException(status_code=404, detail="待确认动作不存在或已处理")
+        if pending.get("status") != "pending":
+            raise HTTPException(status_code=409, detail="待确认动作已处理")
+        pending["status"] = "resolving" if decision in {"approve", "run", "execute"} else "skipped"
+        canvas_id = task.get("canvas_id", "")
+
+    if decision not in {"approve", "run", "execute"}:
+        _codex_agent_add_task_event(payload.task_id, {
+            "method": "canvas/action_result",
+            "params": {"ok": True, "approval_id": payload.approval_id, "changed": 0, "skipped": len(pending.get("actions") or []), "results": [], "message": "用户跳过了待确认画布动作"},
+        })
+        return {"ok": True, "decision": "skipped", "result": {"changed": 0, "skipped": len(pending.get("actions") or [])}}
+
+    result = await _codex_agent_apply_canvas_actions(
+        str(canvas_id or ""),
+        pending.get("actions") if isinstance(pending.get("actions"), list) else [],
+        pending.get("refs") if isinstance(pending.get("refs"), list) else [],
+        pending.get("canvas_context") if isinstance(pending.get("canvas_context"), dict) else {},
+    )
+    with _codex_agent_task_lock:
+        task = _codex_agent_tasks.get(payload.task_id)
+        if task:
+            stored = task.setdefault("pending_action_approvals", {}).get(payload.approval_id)
+            if stored:
+                stored["status"] = "approved"
+                stored["resolved_at"] = _codex_agent_now()
+    event_result = dict(result)
+    event_result["approval_id"] = payload.approval_id
+    _codex_agent_add_task_event(payload.task_id, {"method": "canvas/action_result", "params": event_result})
+    return {"ok": True, "decision": "approved", "result": event_result}
+
+
+@app.post("/api/codex-agent/tools/canvas")
+async def codex_agent_canvas_tool(payload: CodexAgentCanvasToolRequest):
+    """
+    Internal Canvas Tools bridge.
+    v1 exposes structured query tools and low-risk canvas operations while the model-facing path
+    still uses canvas_agent_action as a compatibility protocol.
+    """
+    return await _codex_agent_run_canvas_tool(payload)
 
 
 @app.get("/api/codex-agent/threads/replay")
@@ -17784,7 +20671,15 @@ async def codex_agent_status():
         "sessions_dir_exists": sessions_dir.exists(),
         "skills_dir_exists": skills_dir.exists(),
         "sessions_count_hint": _codex_agent_sessions_count_quick(),
-        "active_sessions": list(_codex_agent_sessions.keys()),
+        "runtime_env": _codex_agent_env_summary(),
+        "active_sessions": [
+            {
+                "runtime_key": key,
+                "project_dir": runtime.project_dir,
+                "thread_id": runtime.thread_id,
+            }
+            for key, runtime in _codex_agent_sessions.items()
+        ],
     }
 
 
@@ -17811,30 +20706,47 @@ async def codex_agent_sessions_list(project_dir: str = ""):
       }
     """
     sd = CODEX_AGENT_HOME / "sessions"
-    if not sd.exists():
-        return {"by_project": {}, "total": 0, "home": str(sd)}
-
     by_project: Dict[str, list] = {}
     total = 0
 
-    try:
-        for path in sd.rglob("*.jsonl"):
-            total += 1
-            try:
-                meta = _codex_session_meta_quick(path)
-            except Exception:
-                continue
-            cwd = meta.get("cwd") or "(unknown)"
-            if project_dir and cwd != project_dir:
-                continue
-            by_project.setdefault(cwd, []).append(meta)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"扫描会话失败: {e}")
+    if sd.exists():
+        try:
+            for path in sd.rglob("*.jsonl"):
+                total += 1
+                try:
+                    meta = _codex_session_meta_quick(path)
+                except Exception:
+                    continue
+                meta["source"] = meta.get("source") or "codex"
+                cwd = meta.get("cwd") or "(unknown)"
+                if project_dir and cwd != project_dir:
+                    continue
+                by_project.setdefault(cwd, []).append(meta)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"扫描会话失败: {e}")
+
+    seen_panel_keys = set()
+    for meta in _codex_agent_panel_state_metas(project_dir):
+        cwd = meta.get("cwd") or "(unknown)"
+        panel_key = meta.get("panel_state_key") or f"{cwd}:{meta.get('session_id')}"
+        if panel_key in seen_panel_keys:
+            continue
+        seen_panel_keys.add(panel_key)
+        existing = by_project.setdefault(cwd, [])
+        same_thread = next((item for item in existing if item.get("session_id") and item.get("session_id") == meta.get("session_id")), None)
+        if same_thread:
+            same_thread["panel_state_path"] = meta.get("panel_state_path", "")
+            same_thread["canvas_id"] = meta.get("canvas_id", "")
+            same_thread["source"] = "codex+panel"
+            if meta.get("updated_at"):
+                same_thread["updated_at"] = meta.get("updated_at")
+        else:
+            existing.append(meta)
 
     for k in by_project:
-        by_project[k].sort(key=lambda x: x.get("started_at", ""), reverse=True)
+        by_project[k].sort(key=lambda x: (int(x.get("updated_at") or 0), str(x.get("started_at") or "")), reverse=True)
 
-    return {"by_project": by_project, "total": total, "home": str(sd)}
+    return {"by_project": by_project, "total": total, "home": str(sd), "panel_home": str(CODEX_AGENT_PANEL_STATE_DIR)}
 
 
 def _codex_session_meta_quick(path: _Path) -> Dict[str, Any]:
