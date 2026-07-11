@@ -199,6 +199,10 @@ async def startup_event():
         await asyncio.to_thread(migrate_mislabeled_image_extensions)
     except Exception as exc:
         print(f"纠正图片扩展名失败: {exc}")
+    try:
+        await _codex_agent_restore_generation_tasks()
+    except Exception as exc:
+        print(f"恢复画布生成任务失败: {exc}")
 
 @app.websocket("/ws/stats")
 async def websocket_endpoint(websocket: WebSocket, client_id: str = None):
@@ -2417,6 +2421,7 @@ class ImageTaskQueryRequest(BaseModel):
 
 CANVAS_TASKS: Dict[str, Dict[str, Any]] = {}
 CANVAS_TASK_LOCK = Lock()
+CANVAS_TASK_WORKERS: Dict[str, asyncio.Task] = {}
 
 class CanvasVideoRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=VIDEO_PROMPT_MAX_LENGTH)
@@ -12622,6 +12627,7 @@ async def run_canvas_image_task(task_id: str, payload: OnlineImageRequest):
         if task_id in CANVAS_TASKS:
             CANVAS_TASKS[task_id]["status"] = "running"
             CANVAS_TASKS[task_id]["updated_at"] = time.time()
+            _canvas_generation_task_persist(CANVAS_TASKS[task_id], _canvas_task_payload_dict(payload))
     try:
         result = await build_online_image_result(payload)
         with CANVAS_TASK_LOCK:
@@ -12631,6 +12637,7 @@ async def run_canvas_image_task(task_id: str, payload: OnlineImageRequest):
                 "error": "",
                 "updated_at": time.time(),
             })
+            _canvas_generation_task_persist(CANVAS_TASKS[task_id], _canvas_task_payload_dict(payload))
     except JimengPendingError as exc:
         # 即梦云端还在排队：标记为 jimeng_pending，前端据 submit_id 持久续查（任务未丢失）
         info = jimeng_pending_payload(exc)
@@ -12645,6 +12652,7 @@ async def run_canvas_image_task(task_id: str, payload: OnlineImageRequest):
                 "error": "",
                 "updated_at": time.time(),
             })
+            _canvas_generation_task_persist(CANVAS_TASKS[task_id], _canvas_task_payload_dict(payload))
     except Exception as exc:
         detail = getattr(exc, "detail", None) or str(exc)
         status_code = getattr(exc, "status_code", 500)
@@ -12657,6 +12665,7 @@ async def run_canvas_image_task(task_id: str, payload: OnlineImageRequest):
                 "upstream_task_id": upstream_task_id,
                 "updated_at": time.time(),
             })
+            _canvas_generation_task_persist(CANVAS_TASKS[task_id], _canvas_task_payload_dict(payload))
 
 @app.post("/api/canvas-image-tasks")
 async def create_canvas_image_task(payload: OnlineImageRequest):
@@ -12672,8 +12681,10 @@ async def create_canvas_image_task(payload: OnlineImageRequest):
             "error": "",
             "provider_id": payload.provider_id,
             "model": payload.model,
+            "payload": _canvas_task_payload_dict(payload),
         }
-    asyncio.create_task(run_canvas_image_task(task_id, payload))
+        _canvas_generation_task_persist(CANVAS_TASKS[task_id], _canvas_task_payload_dict(payload))
+    CANVAS_TASK_WORKERS[task_id] = asyncio.create_task(run_canvas_image_task(task_id, payload))
     return {"task_id": task_id, "status": "queued"}
 
 @app.get("/api/canvas-image-tasks/{task_id}")
@@ -13702,6 +13713,7 @@ async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
         if task_id in CANVAS_TASKS:
             CANVAS_TASKS[task_id]["status"] = "running"
             CANVAS_TASKS[task_id]["updated_at"] = time.time()
+            _canvas_generation_task_persist(CANVAS_TASKS[task_id], _canvas_task_payload_dict(payload))
     try:
         result = await canvas_video(payload)
         with CANVAS_TASK_LOCK:
@@ -13711,6 +13723,7 @@ async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
                 "error": "",
                 "updated_at": time.time(),
             })
+            _canvas_generation_task_persist(CANVAS_TASKS[task_id], _canvas_task_payload_dict(payload))
     except JimengPendingError as exc:
         info = jimeng_pending_payload(exc)
         with CANVAS_TASK_LOCK:
@@ -13724,6 +13737,7 @@ async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
                 "error": "",
                 "updated_at": time.time(),
             })
+            _canvas_generation_task_persist(CANVAS_TASKS[task_id], _canvas_task_payload_dict(payload))
     except Exception as exc:
         detail = getattr(exc, "detail", None) or str(exc)
         status_code = getattr(exc, "status_code", 500)
@@ -13736,6 +13750,7 @@ async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
                 "upstream_task_id": upstream_task_id,
                 "updated_at": time.time(),
             })
+            _canvas_generation_task_persist(CANVAS_TASKS[task_id], _canvas_task_payload_dict(payload))
 
 @app.post("/api/canvas-video-tasks")
 async def create_canvas_video_task(payload: CanvasVideoRequest):
@@ -13751,8 +13766,10 @@ async def create_canvas_video_task(payload: CanvasVideoRequest):
             "error": "",
             "provider_id": payload.provider_id,
             "model": payload.model,
+            "payload": _canvas_task_payload_dict(payload),
         }
-    asyncio.create_task(run_canvas_video_task(task_id, payload))
+        _canvas_generation_task_persist(CANVAS_TASKS[task_id], _canvas_task_payload_dict(payload))
+    CANVAS_TASK_WORKERS[task_id] = asyncio.create_task(run_canvas_video_task(task_id, payload))
     return {"task_id": task_id, "status": "queued"}
 
 @app.get("/api/canvas-video-tasks/{task_id}")
@@ -16900,6 +16917,107 @@ def _codex_agent_app_server_env(project_dir: str) -> Dict[str, str]:
     return env
 
 
+# Native App Server dynamic tools. Keep this registry as the single source for
+# registered schemas, policy classification, UI wording, and action conversion.
+CODEX_AGENT_DYNAMIC_TOOL_NAMESPACE = "infinite_canvas"
+CODEX_AGENT_DYNAMIC_TOOL_REGISTRY_VERSION = 1
+
+
+def _codex_agent_canvas_tool_registry() -> Dict[str, Dict[str, Any]]:
+    options_schema = {
+        "type": "object",
+        "properties": {
+            "scope": {"type": "string", "enum": ["selected", "viewport", "canvas", "all", "node"]},
+            "selected": {"type": "boolean"}, "all": {"type": "boolean"}, "cols": {"type": "integer", "minimum": 1, "maximum": 12},
+            "mode": {"type": "string", "enum": ["grid", "horizontal", "vertical", "column"]},
+            "layout": {"type": "string", "enum": ["grid", "horizontal", "vertical", "column"]},
+            "x": {"type": "number"}, "y": {"type": "number"}, "cellX": {"type": "number", "minimum": 80, "maximum": 4000}, "cellY": {"type": "number", "minimum": 80, "maximum": 4000},
+            "title": {"type": "string", "maxLength": 160}, "name": {"type": "string", "maxLength": 160},
+        }, "additionalProperties": False,
+    }
+    target_schema = {
+        "type": "object",
+        "properties": {
+            "node_id": {"type": "string"},
+            "ref": {"type": "string"},
+            "scope": {"type": "string", "enum": ["selected", "viewport", "canvas"]},
+            "items": {"type": "array", "maxItems": 100, "items": {"type": "object", "properties": {"node_id": {"type": "string"}, "ref": {"type": "string"}, "selected": {"type": "boolean"}, "x": {"type": "number"}, "y": {"type": "number"}, "dx": {"type": "number"}, "dy": {"type": "number"}, "name": {"type": "string", "maxLength": 180}, "field": {"type": "string", "enum": ["title", "node_title"]}, "image_index": {"type": "integer", "minimum": 0}}, "additionalProperties": False}},
+            "nodes": {"type": "array", "maxItems": 100, "items": {"type": "object", "properties": {"node_id": {"type": "string"}, "ref": {"type": "string"}, "selected": {"type": "boolean"}}, "additionalProperties": False}},
+            "targets": {"type": "array", "maxItems": 100, "items": {"type": "object", "properties": {"node_id": {"type": "string"}, "ref": {"type": "string"}, "selected": {"type": "boolean"}}, "additionalProperties": False}},
+            "options": options_schema,
+        },
+        "additionalProperties": False,
+    }
+    create_schema = {
+        "type": "object",
+        "properties": {
+            "items": {"type": "array", "minItems": 1, "maxItems": 24, "items": {"type": "object", "properties": {"prompt": {"type": "string", "maxLength": 12000}, "text": {"type": "string", "maxLength": 12000}, "title": {"type": "string", "maxLength": 160}, "url": {"type": "string", "maxLength": 4000}, "path": {"type": "string", "maxLength": 4000}, "name": {"type": "string", "maxLength": 240}, "kind": {"type": "string", "enum": ["image", "video", "audio"]}, "provider_id": {"type": "string", "maxLength": 120}, "model": {"type": "string", "maxLength": 180}, "count": {"type": "integer", "minimum": 1, "maximum": 8}, "size": {"type": "string", "maxLength": 40}, "quality": {"type": "string", "maxLength": 40}, "duration": {"type": "integer", "minimum": 1, "maximum": 60}, "aspect_ratio": {"type": "string", "maxLength": 20}, "resolution": {"type": "string", "maxLength": 40}, "camerafixed": {"type": "boolean"}, "generate_audio": {"type": "boolean"}, "reference_images": {"type": "array", "maxItems": 8, "items": {"type": "object", "properties": {"url": {"type": "string", "maxLength": 4000}, "name": {"type": "string", "maxLength": 240}, "kind": {"type": "string", "enum": ["image", "video"]}}, "required": ["url"], "additionalProperties": False}}}, "additionalProperties": False}},
+            "options": options_schema,
+        },
+        "required": ["items"], "additionalProperties": False,
+    }
+    return {
+        "get_selected_nodes": {"query": True, "label": "查询选中节点", "description": "读取发送本消息时画布中选中的节点。", "input_schema": {"type": "object", "additionalProperties": False}},
+        "get_viewport_nodes": {"query": True, "label": "查询可见节点", "description": "读取发送本消息时视口范围内的节点。", "input_schema": {"type": "object", "properties": {"pad": {"type": "number"}, "limit": {"type": "integer", "minimum": 1, "maximum": 120}}, "additionalProperties": False}},
+        "get_canvas_summary": {"query": True, "label": "查询画布摘要", "description": "读取画布节点数量、类型统计和连接数量。", "input_schema": {"type": "object", "additionalProperties": False}},
+        "search_canvas_nodes": {"query": True, "label": "搜索画布节点", "description": "在发送本消息时的画布快照中按名称、标题、文本或类型搜索节点；结果分页且限量返回。", "input_schema": {"type": "object", "properties": {"query": {"type": "string"}, "types": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "minimum": 1, "maximum": 80}, "cursor": {"type": "integer", "minimum": 0}}, "additionalProperties": False}},
+        "get_node_detail": {"query": True, "label": "查询节点详情", "description": "读取指定节点，或唯一选中节点的详细信息。", "input_schema": target_schema},
+        "get_connected_nodes": {"query": True, "label": "查询关联节点", "description": "读取指定节点，或唯一选中节点的连接关系和相邻节点。", "input_schema": target_schema},
+        "get_generation_queue": {"query": True, "label": "查看生成队列", "description": "查看当前画布由 Agent 提交的图片和视频生成任务及状态。", "input_schema": {"type": "object", "properties": {"statuses": {"type": "array", "items": {"type": "string", "enum": ["queued", "running", "jimeng_pending", "interrupted", "failed", "succeeded", "cancelled"]}}}, "additionalProperties": False}},
+        "get_generation_task": {"query": True, "label": "获取生成任务详情", "description": "读取当前画布中指定生成任务的状态和错误信息。", "input_schema": {"type": "object", "properties": {"task_id": {"type": "string", "minLength": 1}}, "required": ["task_id"], "additionalProperties": False}},
+        "create_media_nodes": {"action": "add_media", "label": "添加媒体节点", "description": "在画布上添加已有图片或视频媒体节点；不移动或重命名真实文件。", "input_schema": create_schema},
+        "create_prompt_nodes": {"action": "add_prompt", "label": "添加提示词节点", "description": "在画布上添加提示词节点。", "input_schema": create_schema},
+        "create_text_nodes": {"action": "add_text", "label": "添加文本节点", "description": "在画布上添加文本节点。", "input_schema": create_schema},
+        "create_loop_nodes": {"action": "add_loop", "label": "添加循环节点", "description": "在画布上添加循环节点。", "input_schema": create_schema},
+        "generate_images": {"action": "generate_image", "label": "生成图片", "description": "按当前画布的图片模型设置直接提交图片生成；高风险确认时可改为仅创建配置节点。", "input_schema": create_schema},
+        "generate_videos": {"action": "generate_video", "label": "生成视频", "description": "按当前画布的视频模型设置直接提交视频生成；高风险确认时可改为仅创建配置节点。", "input_schema": create_schema},
+        "create_image_generation_nodes": {"action": "create_image_generation_node", "label": "创建图片生成节点", "description": "仅创建并配置图片生成节点，不提交图片生成任务。", "input_schema": create_schema},
+        "create_video_generation_nodes": {"action": "create_video_generation_node", "label": "创建视频生成节点", "description": "仅创建并配置视频生成节点，不提交视频生成任务。", "input_schema": create_schema},
+        "cancel_generation_task": {"action": "cancel_generation_task", "label": "取消生成任务", "description": "仅取消尚未提交上游的排队任务；任务一旦已提交上游即不可取消，节点继续运行。", "input_schema": {"type": "object", "properties": {"task_id": {"type": "string", "minLength": 1}}, "required": ["task_id"], "additionalProperties": False}},
+        "retry_generation_task": {"action": "retry_generation_task", "label": "重试生成任务", "description": "重试当前画布中一个失败、中断或已取消的 Agent 生成任务。", "input_schema": {"type": "object", "properties": {"task_id": {"type": "string", "minLength": 1}}, "required": ["task_id"], "additionalProperties": False}},
+        "delete_nodes": {"action": "delete_nodes", "label": "删除节点", "description": "删除指定或选中的智能画布节点，并移除其连接；始终需要高风险确认。", "input_schema": target_schema},
+        "undo_last_agent_action": {"action": "undo_last_agent_action", "label": "撤销最近 Agent 动作", "description": "恢复最近一次 Agent 修改前的节点和连线状态；始终需要高风险确认。", "input_schema": {"type": "object", "additionalProperties": False}},
+        "rename_assets": {"action": "rename_nodes", "label": "重命名素材", "description": "修改节点内素材显示名；仅在明确要求时才修改节点标题。", "input_schema": target_schema},
+        "move_nodes": {"action": "move_nodes", "label": "移动节点", "description": "移动指定节点的位置。", "input_schema": target_schema},
+        "arrange_nodes": {"action": "arrange_nodes", "label": "排列节点", "description": "排列指定、选中或全画布节点。", "input_schema": target_schema},
+        "group_nodes": {"action": "group_nodes", "label": "分组节点", "description": "为指定或选中节点创建智能分组。", "input_schema": target_schema},
+        "ungroup_nodes": {"action": "ungroup_nodes", "label": "取消分组", "description": "删除指定智能分组外框，不删除其内部节点。", "input_schema": target_schema},
+        "remember_preference": {"action": "remember_preference", "label": "保存偏好", "description": "保存用户明确要求记住的画布偏好。", "input_schema": {"type": "object", "properties": {"note": {"type": "string"}}, "required": ["note"], "additionalProperties": False}},
+    }
+
+
+def _codex_agent_dynamic_tool_specs() -> List[Dict[str, Any]]:
+    registry = _codex_agent_canvas_tool_registry()
+    return [{
+        "type": "namespace",
+        "name": CODEX_AGENT_DYNAMIC_TOOL_NAMESPACE,
+        "description": f"Infinite Canvas smart-canvas tools v{CODEX_AGENT_DYNAMIC_TOOL_REGISTRY_VERSION}. Query context first when needed; mutate only through these tools.",
+        "tools": [
+            {
+                "type": "function",
+                "name": name,
+                "description": str(spec["description"]),
+                "inputSchema": spec["input_schema"],
+            }
+            for name, spec in registry.items()
+        ],
+    }]
+
+
+def _codex_agent_is_dynamic_tools_registration_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    markers = ("dynamictools", "dynamic tools", "unknown field", "unknown parameter", "experimentalapi", "experimental api")
+    return any(marker in text for marker in markers)
+
+
+def _codex_agent_dynamic_tool_response(result: Dict[str, Any], success: Optional[bool] = None) -> Dict[str, Any]:
+    ok = bool(result.get("ok", True)) if success is None else bool(success)
+    return {
+        "success": ok,
+        "contentItems": [{"type": "inputText", "text": json.dumps(result, ensure_ascii=False)}],
+    }
+
+
 class CodexAppServerSession:
     """
     单个项目目录对应一个 codex app-server 子进程（JSON-RPC over stdio）。
@@ -16919,10 +17037,14 @@ class CodexAppServerSession:
         self._stderr_task: Optional[asyncio.Task] = None
         self._next_id = 1
         self._pending: Dict[int, asyncio.Future] = {}
+        # Server-initiated JSON-RPC requests (currently native dynamic Tool calls).
+        # They must be answered with the original request id, rather than via turn/start.
+        self._server_requests: Dict[int, Dict[str, Any]] = {}
         self._event_queues: List[asyncio.Queue] = []
         self._stderr_tail: List[str] = []
         self._lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
+        self.native_tools_enabled = True
 
     async def start(self, thread_id: Optional[str] = None) -> str:
         """启动 codex app-server + 握手 + 创建/恢复 thread。返回 threadId。"""
@@ -16957,23 +17079,34 @@ class CodexAppServerSession:
                     "title": None,
                     "version": "0.1.0",
                 },
-                "capabilities": None,
+                "capabilities": {"experimentalApi": True},
             }, timeout=15)
 
             # initialized 通知
             await self._notify("initialized", {})
 
-            # thread/start 或 thread/resume
-            if thread_id:
-                resp = await self._request("thread/resume", {
-                    "threadId": thread_id,
-                    "model": None,
-                }, timeout=30)
-            else:
-                resp = await self._request("thread/start", {
-                    "cwd": self.project_dir,
-                    "model": None,
-                }, timeout=30)
+            # Native dynamicTools are experimental. Prefer them, and only fall back to
+            # the legacy text protocol when this specific app-server cannot register them.
+            method = "thread/resume" if thread_id else "thread/start"
+            thread_params: Dict[str, Any] = {
+                "threadId": thread_id,
+                "model": None,
+                "dynamicTools": _codex_agent_dynamic_tool_specs(),
+            } if thread_id else {
+                "cwd": self.project_dir,
+                "model": None,
+                "dynamicTools": _codex_agent_dynamic_tool_specs(),
+            }
+            try:
+                resp = await self._request(method, thread_params, timeout=30)
+                self.native_tools_enabled = True
+            except HTTPException as exc:
+                if not _codex_agent_is_dynamic_tools_registration_error(exc):
+                    raise
+                self.native_tools_enabled = False
+                fallback_params = dict(thread_params)
+                fallback_params.pop("dynamicTools", None)
+                resp = await self._request(method, fallback_params, timeout=30)
 
             self.thread_id = (
                 resp.get("thread", {}).get("id")
@@ -16984,6 +17117,7 @@ class CodexAppServerSession:
             return self.thread_id
 
     async def stop(self):
+        await self.fail_pending_dynamic_tools("会话已停止，工具调用未执行")
         if self.proc and self.proc.returncode is None:
             try:
                 self.proc.terminate()
@@ -17001,6 +17135,31 @@ class CodexAppServerSession:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+
+    async def respond_dynamic_tool_call(self, request_id: Any, result: Dict[str, Any]) -> bool:
+        """Reply to App Server's item/tool/call server request."""
+        try:
+            rid = int(request_id)
+        except (TypeError, ValueError):
+            return False
+        request = self._server_requests.get(rid)
+        if not request or str(request.get("method") or "") != "item/tool/call":
+            return False
+        safe_result = {
+            "success": bool(result.get("success")),
+            "contentItems": result.get("contentItems") if isinstance(result.get("contentItems"), list) else [],
+        }
+        try:
+            await self._respond(rid, safe_result)
+        except Exception:
+            return False
+        self._server_requests.pop(rid, None)
+        return True
+
+    async def fail_pending_dynamic_tools(self, message: str) -> None:
+        pending = [rid for rid, request in self._server_requests.items() if str(request.get("method") or "") == "item/tool/call"]
+        for request_id in pending:
+            await self.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response({"ok": False, "message": message}, success=False))
 
     async def send_user_message(self, text: str, image_paths=None, timeout: int = 900):
         """
@@ -17088,6 +17247,14 @@ class CodexAppServerSession:
             self.proc.stdin.write(line)
             await self.proc.stdin.drain()
 
+    async def _respond(self, request_id: int, result: dict):
+        async with self._write_lock:
+            if not self.proc or not self.proc.stdin:
+                raise RuntimeError("Codex App Server is not running")
+            msg = {"jsonrpc": "2.0", "id": request_id, "result": result}
+            self.proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+            await self.proc.stdin.drain()
+
     async def _reader_loop(self):
         try:
             while True:
@@ -17099,7 +17266,20 @@ class CodexAppServerSession:
                 except Exception:
                     continue
 
-                if "id" in msg:
+                # App Server can initiate JSON-RPC requests (not notifications), so a
+                # request carries both method and id. Do not mistake it for a response.
+                if "id" in msg and "method" in msg:
+                    try:
+                        request_id = int(msg["id"])
+                        self._server_requests[request_id] = msg
+                    except (TypeError, ValueError):
+                        pass
+                    for q in self._event_queues:
+                        try:
+                            q.put_nowait(msg)
+                        except asyncio.QueueFull:
+                            pass
+                elif "id" in msg:
                     mid = msg["id"]
                     fut = self._pending.pop(mid, None)
                     if fut and not fut.done():
@@ -17168,6 +17348,16 @@ class CodexAppServerRuntime:
     async def send_user_message(self, text: str, image_paths=None):
         async for event in self.session.send_user_message(text, image_paths):
             yield event
+
+    @property
+    def native_tools_enabled(self) -> bool:
+        return bool(self.session.native_tools_enabled)
+
+    async def respond_dynamic_tool_call(self, request_id: Any, result: Dict[str, Any]) -> bool:
+        return await self.session.respond_dynamic_tool_call(request_id, result)
+
+    async def fail_pending_dynamic_tools(self, message: str) -> None:
+        await self.session.fail_pending_dynamic_tools(message)
 
 
 _codex_agent_sessions: Dict[str, CodexAppServerRuntime] = {}
@@ -17456,6 +17646,17 @@ async def _codex_agent_prepare_local_image(ref: Any, project_dir: str, client: O
     return {**ref_data, "url": ref_url, "source_path": str(local_path), "local_path": local_out, "kind": _codex_agent_media_kind_from_ref(ref_data, local_out)}
 
 
+async def _codex_agent_prepare_attachment(ref: Any, project_dir: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
+    """Keep prompt-node references as ordered text; media follows the local-image path."""
+    ref_data = _codex_agent_attachment_value(ref)
+    if str(ref_data.get("kind") or "").strip().lower() == "prompt":
+        text = str(ref_data.get("text") or ref_data.get("prompt") or "").strip()
+        if not text:
+            raise ValueError("empty prompt ref")
+        return {**ref_data, "kind": "prompt", "text": text[:12000], "local_path": ""}
+    return await _codex_agent_prepare_local_image(ref_data, project_dir, client)
+
+
 def _codex_agent_ensure_preferences_file() -> None:
     try:
         CODEX_AGENT_PREFS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -17578,6 +17779,7 @@ def _codex_agent_ref_context_text(project_dir: str, refs: List[Dict[str, Any]], 
             f"  node_id: {ref.get('nodeId') or ref.get('node_id') or ''}",
             f"  image_index: {ref.get('imageIndex') if ref.get('imageIndex') is not None else ''}",
             f"  node_title: {ref.get('nodeTitle') or ref.get('node_title') or ''}",
+            *([f"  prompt_text: {str(ref.get('text') or '')[:12000]}"] if str(ref.get('kind') or '') == 'prompt' else []),
         ])
     ctx = canvas_context if isinstance(canvas_context, dict) else {}
     native = ctx.get("native") if isinstance(ctx.get("native"), dict) else {}
@@ -17692,8 +17894,21 @@ def _codex_agent_save_context_snapshot(payload: "CodexAgentTurnRequest", canvas_
     native = ctx.get("native") if isinstance(ctx.get("native"), dict) else {}
     snapshot_id = f"snap_{uuid.uuid4().hex[:16]}"
     viewport_snapshot_id = f"vp_{uuid.uuid4().hex[:16]}"
+    canvas_snapshot: Dict[str, Any] = {}
+    try:
+        live_canvas = load_canvas(canvas_id)
+        if isinstance(live_canvas, dict):
+            canvas_snapshot = {
+                "title": live_canvas.get("name") or live_canvas.get("title") or "",
+                "nodes": live_canvas.get("nodes") if isinstance(live_canvas.get("nodes"), list) else [],
+                "connections": live_canvas.get("connections") if isinstance(live_canvas.get("connections"), list) else [],
+            }
+    except Exception:
+        # The frontend context remains a usable reduced snapshot for canvases that
+        # disappear between request receipt and snapshot persistence.
+        canvas_snapshot = {}
     data = {
-        "schema": 1,
+        "schema": 2,
         "snapshot_id": snapshot_id,
         "viewport_snapshot_id": viewport_snapshot_id,
         "project_dir": str(payload.project_dir or ""),
@@ -17702,6 +17917,7 @@ def _codex_agent_save_context_snapshot(payload: "CodexAgentTurnRequest", canvas_
         "thread_id": str(payload.thread_id or ""),
         "created_at": _codex_agent_now(),
         "context": ctx,
+        "canvas_snapshot": canvas_snapshot,
     }
     try:
         canvas_dir = CODEX_AGENT_CONTEXT_SNAPSHOT_DIR / hashlib.sha256(str(canvas_id).encode("utf-8", errors="replace")).hexdigest()[:16]
@@ -17724,7 +17940,9 @@ def _codex_agent_save_context_snapshot(payload: "CodexAgentTurnRequest", canvas_
 
 
 def _codex_agent_build_turn_context_text(project_dir: str, refs: List[Dict[str, Any]], canvas_context: Optional[Dict[str, Any]], payload: "CodexAgentTurnRequest") -> str:
-    ctx = dict(canvas_context or {}) if isinstance(canvas_context, dict) else {}
+    # Keep the snapshot reference on the task context too: native Tool calls later
+    # in this same turn must query the exact send-time snapshot, not mutable UI state.
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
     snapshot = _codex_agent_save_context_snapshot(payload, ctx)
     ctx["_contextSnapshot"] = snapshot
     return _codex_agent_context_envelope_text(project_dir, refs, ctx, payload, snapshot)
@@ -17768,16 +17986,20 @@ def _codex_agent_context_envelope_text(
         f"agent_approval_policy: {agent_input.get('approvalPolicy') or agent_input.get('approval_policy') or profile.get('approvalPolicy') or ''}",
         "你正在 Infinite-Canvas 的 Agent 面板中。默认围绕当前智能画布工作。",
         "不要向用户展示 internal node id、canvas_agent_tool、canvas_agent_action、context snapshot id 或工具协议细节。",
-        "按需查询画布时，先只输出隐藏 fenced canvas_agent_tool JSON，不要编造画布内容；收到 canvas_tool_result 后再回答用户。",
-        "查询工具: get_selected_nodes, get_viewport_nodes, get_node_detail, get_connected_nodes, get_canvas_summary。",
-        "低风险操作工具: move_nodes, arrange_nodes, rename_assets, group_nodes, ungroup_nodes。用户明确要求这些操作时优先用 canvas_agent_tool，工具结果会自动展示给用户。",
-        "canvas_agent_tool 格式: {\"tool\":\"get_viewport_nodes\",\"args\":{}} 或 {\"tools\":[{\"tool\":\"arrange_nodes\",\"args\":{\"items\":[{\"ref\":\"ref_1\"}]}}]}。",
-        "生成图片/视频、添加媒体/提示词/循环节点、记忆偏好暂时仍使用兼容的 fenced canvas_agent_action JSON；普通聊天不要输出动作块。",
+        "按需使用已注册的 infinite_canvas 原生工具查询或操作画布；不要编造画布内容，也不要输出任何 fenced 工具 JSON。",
+        "可用查询工具: get_selected_nodes, get_viewport_nodes, get_canvas_summary, search_canvas_nodes, get_node_detail, get_connected_nodes, get_generation_queue, get_generation_task。",
+        "可用操作工具: create_media_nodes, create_prompt_nodes, create_text_nodes, create_loop_nodes, generate_images, generate_videos, create_image_generation_nodes, create_video_generation_nodes, cancel_generation_task, retry_generation_task, delete_nodes, undo_last_agent_action, rename_assets, move_nodes, arrange_nodes, group_nodes, ungroup_nodes, remember_preference。delete_nodes 和 undo_last_agent_action 始终需要高风险确认。generate_images/generate_videos 会按当前审批策略直接提交任务或请求选择；create_*_generation_nodes 只创建节点。",
+        "get_node_detail/get_connected_nodes 必须传 node_id/ref，或 scope:\"selected\"（仅一个选中节点）；不要在没有目标时调用。",
         "位置信息以发送这一刻的 viewport_snapshot_id 为准；用户后续拖动画布不改变本轮语义。",
         "rename_nodes 默认只修改素材显示名 images[index].name，不改真实文件名、不改节点标题，除非用户明确要求。",
         "高成本或模糊生成任务先简短确认；用户明确说直接执行/按默认/不用问时可继续。",
         no_project_rule if not project_dir else "",
     ]
+    if not bool(ctx.get("_native_tools_enabled", True)):
+        lines[lines.index("按需使用已注册的 infinite_canvas 原生工具查询或操作画布；不要编造画布内容，也不要输出任何 fenced 工具 JSON。")] = "按需查询画布时，先只输出隐藏 fenced canvas_agent_tool JSON；收到 canvas_tool_result 后再回答用户。"
+        lines[lines.index("可用查询工具: get_selected_nodes, get_viewport_nodes, get_canvas_summary, search_canvas_nodes, get_node_detail, get_connected_nodes, get_generation_queue, get_generation_task。")] = "查询工具: get_selected_nodes, get_viewport_nodes, get_node_detail, get_connected_nodes, get_canvas_summary。"
+        lines[lines.index("可用操作工具: create_media_nodes, create_prompt_nodes, create_text_nodes, create_loop_nodes, generate_images, generate_videos, create_image_generation_nodes, create_video_generation_nodes, cancel_generation_task, retry_generation_task, delete_nodes, undo_last_agent_action, rename_assets, move_nodes, arrange_nodes, group_nodes, ungroup_nodes, remember_preference。delete_nodes 和 undo_last_agent_action 始终需要高风险确认。generate_images/generate_videos 会按当前审批策略直接提交任务或请求选择；create_*_generation_nodes 只创建节点。")] = "低风险操作工具: move_nodes, arrange_nodes, rename_assets, group_nodes, ungroup_nodes；其余动作使用兼容 canvas_agent_action JSON。"
+        lines.append("canvas_agent_tool 格式: {\"tool\":\"get_viewport_nodes\",\"args\":{}}；生成和新增节点使用 canvas_agent_action。")
     if isinstance(node_counts, dict) and node_counts:
         lines.extend([
             "canvas_counts:",
@@ -17801,6 +18023,7 @@ def _codex_agent_context_envelope_text(
                 f"  node_id: {ref.get('nodeId') or ref.get('node_id') or ''}",
                 f"  image_index: {ref.get('imageIndex') if ref.get('imageIndex') is not None else ''}",
                 f"  node_title: {ref.get('nodeTitle') or ref.get('node_title') or ''}",
+                *([f"  prompt_text: {str(ref.get('text') or '')[:12000]}"] if str(ref.get('kind') or '') == 'prompt' else []),
             ])
     else:
         lines.append("selected_refs: (none)")
@@ -18158,6 +18381,32 @@ def _codex_agent_history_init() -> None:
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS canvas_generation_tasks (
+                task_id TEXT PRIMARY KEY,
+                canvas_id TEXT NOT NULL DEFAULT '',
+                node_id TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'queued',
+                provider_id TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                upstream_task_id TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_canvas_generation_tasks_status ON canvas_generation_tasks(status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_canvas_generation_tasks_canvas ON canvas_generation_tasks(canvas_id, updated_at);
+            CREATE TABLE IF NOT EXISTS canvas_agent_undo (
+                id TEXT PRIMARY KEY,
+                canvas_id TEXT NOT NULL,
+                action_json TEXT NOT NULL DEFAULT '[]',
+                snapshot_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                undone_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_canvas_agent_undo_latest ON canvas_agent_undo(canvas_id, undone_at, created_at);
             CREATE TABLE IF NOT EXISTS project_visibility (
                 canvas_id TEXT NOT NULL,
                 project_dir TEXT NOT NULL DEFAULT '',
@@ -18172,6 +18421,116 @@ def _codex_agent_history_init() -> None:
             conn.commit()
         finally:
             conn.close()
+
+
+def _canvas_generation_task_persist(task: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> None:
+    """Store agent-capable generation task state outside process memory."""
+    if not isinstance(task, dict) or not task.get("id"):
+        return
+    _codex_agent_history_init()
+    now = _codex_agent_now()
+    task_id = str(task.get("id") or "")
+    stored_payload = payload if isinstance(payload, dict) else task.get("payload")
+    stored_payload = stored_payload if isinstance(stored_payload, dict) else {}
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    with _codex_agent_history_lock:
+        conn = _codex_agent_history_connect()
+        try:
+            existing = conn.execute("SELECT created_at FROM canvas_generation_tasks WHERE task_id=?", (task_id,)).fetchone()
+            conn.execute("""
+                INSERT INTO canvas_generation_tasks(
+                    task_id, canvas_id, node_id, kind, status, provider_id, model,
+                    upstream_task_id, payload_json, result_json, error, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    canvas_id=excluded.canvas_id, node_id=excluded.node_id, kind=excluded.kind,
+                    status=excluded.status, provider_id=excluded.provider_id, model=excluded.model,
+                    upstream_task_id=excluded.upstream_task_id, payload_json=excluded.payload_json,
+                    result_json=excluded.result_json, error=excluded.error, updated_at=excluded.updated_at
+            """, (
+                task_id, str(task.get("canvas_id") or ""), str(task.get("node_id") or ""),
+                str(task.get("kind") or task.get("type") or ""), str(task.get("status") or "queued"),
+                str(task.get("provider_id") or ""), str(task.get("model") or ""),
+                str(task.get("submit_id") or task.get("upstream_task_id") or ""),
+                json.dumps(stored_payload, ensure_ascii=False), json.dumps(result, ensure_ascii=False),
+                str(task.get("error") or ""), int(existing["created_at"]) if existing else now, now,
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _canvas_generation_task_rows(statuses: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    _codex_agent_history_init()
+    with _codex_agent_history_lock:
+        conn = _codex_agent_history_connect()
+        try:
+            query = "SELECT * FROM canvas_generation_tasks"
+            values: List[Any] = []
+            if statuses:
+                query += " WHERE status IN (" + ",".join("?" for _ in statuses) + ")"
+                values.extend(statuses)
+            query += " ORDER BY updated_at DESC"
+            rows = conn.execute(query, values).fetchall()
+        finally:
+            conn.close()
+    out = []
+    for row in rows:
+        data = dict(row)
+        for key in ("payload_json", "result_json"):
+            try:
+                data[key[:-5]] = json.loads(data.get(key) or "{}")
+            except Exception:
+                data[key[:-5]] = {}
+        out.append(data)
+    return out
+
+
+def _canvas_task_payload_dict(payload: Any) -> Dict[str, Any]:
+    if isinstance(payload, dict):
+        return dict(payload)
+    try:
+        return payload.model_dump()
+    except Exception:
+        try:
+            return payload.dict()
+        except Exception:
+            return {}
+
+
+def _codex_agent_record_undo(canvas_id: str, actions: List[Dict[str, Any]], canvas: Dict[str, Any]) -> None:
+    _codex_agent_history_init()
+    snapshot = {"nodes": canvas.get("nodes") or [], "connections": canvas.get("connections") or []}
+    with _codex_agent_history_lock:
+        conn = _codex_agent_history_connect()
+        try:
+            conn.execute("INSERT INTO canvas_agent_undo(id, canvas_id, action_json, snapshot_json, created_at) VALUES(?, ?, ?, ?, ?)", (
+                _codex_agent_uid("undo"), canvas_id, json.dumps(actions, ensure_ascii=False), json.dumps(snapshot, ensure_ascii=False), _codex_agent_now(),
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+async def _codex_agent_undo_last_action(canvas_id: str) -> Dict[str, Any]:
+    _codex_agent_history_init()
+    with _codex_agent_history_lock:
+        conn = _codex_agent_history_connect()
+        try:
+            row = conn.execute("SELECT * FROM canvas_agent_undo WHERE canvas_id=? AND undone_at IS NULL ORDER BY created_at DESC LIMIT 1", (canvas_id,)).fetchone()
+            if not row:
+                return {"ok": False, "message": "没有可撤销的 Agent 画布动作", "results": [], "changed": 0, "skipped": 0}
+            snapshot = json.loads(row["snapshot_json"] or "{}")
+            conn.execute("UPDATE canvas_agent_undo SET undone_at=? WHERE id=?", (_codex_agent_now(), row["id"]))
+            conn.commit()
+        finally:
+            conn.close()
+    canvas = load_canvas(canvas_id)
+    canvas["nodes"] = snapshot.get("nodes") if isinstance(snapshot.get("nodes"), list) else []
+    canvas["connections"] = snapshot.get("connections") if isinstance(snapshot.get("connections"), list) else []
+    save_canvas(canvas)
+    await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or _codex_agent_now()), "codex-agent")
+    return {"ok": True, "changed": 1, "skipped": 0, "results": [{"type": "undo_last_agent_action", "status": "done"}], "message": "已撤销最近一次 Agent 画布动作"}
 
 
 def _codex_agent_message_preview(messages: Any) -> str:
@@ -18761,6 +19120,7 @@ def _codex_agent_task_public(task: Dict[str, Any], after: int = 0) -> Dict[str, 
         "thread_id": task.get("thread_id", ""),
         "conversation_id": task.get("conversation_id", ""),
         "runtime_key": task.get("runtime_key", ""),
+        "native_tools_enabled": bool(task.get("native_tools_enabled", False)),
         "status": task.get("status", "unknown"),
         "created_at": task.get("created_at", 0),
         "updated_at": task.get("updated_at", 0),
@@ -18857,8 +19217,9 @@ def _codex_agent_parse_canvas_tool_calls(raw: str) -> List[Dict[str, Any]]:
     for call in calls:
         if not isinstance(call, dict):
             continue
-        tool = str(call.get("tool") or call.get("name") or call.get("type") or "").strip()
-        args = call.get("args") if isinstance(call.get("args"), dict) else call.get("arguments")
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        tool = str(call.get("tool") or call.get("name") or call.get("type") or function.get("name") or "").strip()
+        args = call.get("args") if isinstance(call.get("args"), dict) else (call.get("arguments") if call.get("arguments") is not None else function.get("arguments"))
         if isinstance(args, str):
             try:
                 args = json.loads(args)
@@ -18866,6 +19227,13 @@ def _codex_agent_parse_canvas_tool_calls(raw: str) -> List[Dict[str, Any]]:
                 args = {"value": args}
         if not isinstance(args, dict):
             args = {}
+        # 兼容模型常见的简写：{"tool":"get_node_detail","node_id":"..."}。
+        # 旧逻辑只读取 args/arguments，会静默丢掉顶层参数，继而把查询误判为无目标。
+        inline_args = {
+            key: value for key, value in call.items()
+            if key not in {"tool", "name", "type", "function", "args", "arguments", "call_id", "tool_call_id"}
+        }
+        args = {**inline_args, **args}
         if tool:
             out.append({"tool": tool, "args": args})
     return out
@@ -19027,12 +19395,14 @@ def _codex_agent_resolve_node_ids(item: Any, nodes: List[Dict[str, Any]], refs: 
         if node_id and node_id in existing and node_id not in out:
             out.append(node_id)
 
-    add(data.get("node_id") or data.get("nodeId") or data.get("id"))
+    add(data.get("node_id") or data.get("nodeId") or data.get("id") or data.get("node") or data.get("target_node_id") or data.get("targetNodeId"))
     for key in ("node_ids", "nodeIds", "ids"):
         values = data.get(key)
         if isinstance(values, list):
             for value in values:
                 add(value)
+    # target/source 既可以是实际节点 id，也可以是 ref_1/图1；两种写法都支持。
+    add(data.get("target") or data.get("source") or data.get("anchor_node_id") or data.get("anchorNodeId"))
     ref_value = data.get("ref") or data.get("ref_id") or data.get("refId") or data.get("target_ref") or data.get("targetRef") or data.get("target")
     ref = _codex_agent_ref_attachment(ref_value, refs)
     if ref:
@@ -19424,16 +19794,48 @@ async def _codex_agent_apply_canvas_actions(
 ) -> Dict[str, Any]:
     if not canvas_id:
         return {"ok": False, "message": "no canvas_id", "results": [], "changed": 0, "skipped": 0}
+    raw_types = [_codex_agent_action_type(item) for item in actions if isinstance(item, dict)]
+    if raw_types and all(action_type in {"undo_last_agent_action", "undo_agent_action"} for action_type in raw_types):
+        return await _codex_agent_undo_last_action(canvas_id)
     canvas = load_canvas(canvas_id)
     if normalize_canvas_kind(canvas.get("kind")) != "smart":
         return {"ok": False, "message": "only smart canvas is supported", "results": [], "changed": 0, "skipped": 0}
     nodes = canvas.setdefault("nodes", [])
     connections = canvas.setdefault("connections", [])
+    undo_snapshot = {"nodes": json.loads(json.dumps(nodes)), "connections": json.loads(json.dumps(connections))}
     selected_ids = _codex_agent_selected_ids(canvas_context)
     context_rects = _codex_agent_context_node_rects(canvas_context)
     results: List[Dict[str, Any]] = []
     changed = 0
     skipped = 0
+
+    # Legacy add_nodes accepted heterogeneous node descriptors. Normalize it once
+    # into the same canonical creation actions used by native Tools.
+    normalized_actions: List[Dict[str, Any]] = []
+    for raw_action in actions:
+        action = raw_action if isinstance(raw_action, dict) else {}
+        action_type = _codex_agent_action_type(action)
+        if action_type not in {"add_node", "add_nodes"}:
+            normalized_actions.append(action)
+            continue
+        source_items = action.get("items") or action.get("nodes") or []
+        source_list = source_items if isinstance(source_items, list) else [source_items]
+        for item in source_list:
+            data = {"text": item} if isinstance(item, str) else (dict(item) if isinstance(item, dict) else {})
+            kind = str(data.get("node_type") or data.get("type") or data.get("kind") or "").lower().replace("-", "_")
+            if kind in {"loop", "smart_loop"}:
+                mapped = "add_loop"
+            elif kind in {"video_generation", "generate_video", "video"} and (data.get("prompt") or data.get("text")):
+                mapped = "create_video_generation_node"
+            elif kind in {"image_generation", "generate_image", "image"} and (data.get("prompt") or data.get("text")):
+                mapped = "create_image_generation_node"
+            elif kind in {"media", "asset", "file"} or data.get("url") or data.get("path") or data.get("src"):
+                mapped = "add_media"
+            elif kind in {"text", "note"}:
+                mapped = "add_text"
+            else:
+                mapped = "add_prompt"
+            normalized_actions.append({"type": mapped, "items": [data], "options": action.get("options") if isinstance(action.get("options"), dict) else {}})
 
     def node_by_id(node_id: str) -> Optional[Dict[str, Any]]:
         return next((node for node in nodes if str(node.get("id")) == str(node_id)), None)
@@ -19444,7 +19846,7 @@ async def _codex_agent_apply_canvas_actions(
             skipped += 1
         results.append({"type": action_type, "status": status, "message": message, "items": items or []})
 
-    for raw_action in actions:
+    for raw_action in normalized_actions:
         action = raw_action if isinstance(raw_action, dict) else {}
         action_type = str(action.get("type") or action.get("action") or "").lower().replace("-", "_")
         options = action.get("options") if isinstance(action.get("options"), dict) else {}
@@ -19456,6 +19858,24 @@ async def _codex_agent_apply_canvas_actions(
                     result(action_type, "done", "preference saved")
                 else:
                     result(action_type, "skipped", "empty preference")
+                continue
+
+            if action_type in {"delete_node", "delete_nodes", "remove_node", "remove_nodes"}:
+                source_items = action.get("items") or action.get("nodes") or action.get("targets") or [action]
+                target_ids: List[str] = []
+                for item in (source_items if isinstance(source_items, list) else [source_items]):
+                    for node_id in _codex_agent_resolve_node_ids(item if isinstance(item, dict) else {"ref": item}, nodes, refs, selected_ids):
+                        if node_id not in target_ids:
+                            target_ids.append(node_id)
+                deleted = [node for node in nodes if str(node.get("id") or "") in set(target_ids)]
+                if not deleted:
+                    result(action_type, "skipped", "no nodes to delete")
+                    continue
+                deleted_ids = {str(node.get("id") or "") for node in deleted}
+                nodes[:] = [node for node in nodes if str(node.get("id") or "") not in deleted_ids]
+                connections[:] = [conn for conn in connections if _codex_agent_connection_value(conn, ("source", "sourceId", "from", "fromNodeId", "start")) not in deleted_ids and _codex_agent_connection_value(conn, ("target", "targetId", "to", "toNodeId", "end")) not in deleted_ids]
+                changed += len(deleted)
+                result(action_type, "done", f"deleted {len(deleted)} nodes", [_codex_agent_node_summary(node) for node in deleted])
                 continue
 
             if action_type in {"add_media", "add_image", "add_video", "add_media_nodes"}:
@@ -19499,7 +19919,8 @@ async def _codex_agent_apply_canvas_actions(
                 for index, item in enumerate(items):
                     data = {"text": item} if isinstance(item, str) else (item if isinstance(item, dict) else {})
                     text = str(data.get("text") or data.get("prompt") or "").strip()
-                    title = str(data.get("title") or "Prompt").strip() or "Prompt"
+                    default_title = "Text" if action_type == "add_text" else "Prompt"
+                    title = str(data.get("title") or default_title).strip() or default_title
                     if not text and not title:
                         continue
                     point = _codex_agent_new_node_point(canvas, index, len(items), options, 316, 240, canvas_context, refs, selected_ids, context_rects)
@@ -19699,8 +20120,68 @@ async def _codex_agent_apply_canvas_actions(
                 result(action_type, "done" if removed else "skipped", f"ungrouped {removed} groups")
                 continue
 
-            if action_type in {"generate_image", "generate_images", "create_image", "create_images", "generate_video", "generate_videos", "create_video", "create_videos"}:
-                result(action_type, "skipped", "backend generation handoff is not implemented yet")
+            if action_type in {"create_image_generation_node", "create_image_generation_nodes", "create_video_generation_node", "create_video_generation_nodes", "generate_image", "generate_images", "create_image", "create_images", "generate_video", "generate_videos", "create_video", "create_videos"}:
+                source_items = action.get("items") or [action]
+                items = source_items if isinstance(source_items, list) else [source_items]
+                is_video = action_type.startswith("create_video")
+                native = canvas_context.get("native") if isinstance(canvas_context, dict) and isinstance(canvas_context.get("native"), dict) else {}
+                defaults = native.get("videoGeneration" if is_video else "imageGeneration") if isinstance(native, dict) else {}
+                defaults = defaults if isinstance(defaults, dict) else {}
+                created = []
+                for index, item in enumerate(items):
+                    data = {"prompt": item} if isinstance(item, str) else (item if isinstance(item, dict) else {})
+                    prompt = str(data.get("prompt") or data.get("text") or "").strip()
+                    if not prompt:
+                        continue
+                    point = _codex_agent_new_node_point(canvas, index, len(items), options, 360, 240, canvas_context, refs, selected_ids, context_rects)
+                    provider_id = str(data.get("provider_id") or data.get("providerId") or data.get("provider") or defaults.get("provider_id") or "")
+                    model = str(data.get("model") or defaults.get("model") or "")
+                    run_settings: Dict[str, Any] = {
+                        "engine": "api",
+                        "apiKind": "video" if is_video else "image",
+                        "provider_id": provider_id,
+                        "model": model,
+                        "count": max(1, min(8, int(data.get("count") or data.get("n") or defaults.get("count") or 1))),
+                    }
+                    if is_video:
+                        run_settings.update({
+                            "videoProvider": provider_id,
+                            "videoModel": model,
+                            "videoDuration": max(1, min(60, int(data.get("duration") or defaults.get("duration") or 5))),
+                            "videoAspect": data.get("aspect_ratio") or data.get("aspect") or defaults.get("aspect_ratio") or "16:9",
+                            "videoResolution": data.get("resolution") or defaults.get("resolution") or "",
+                            "videoCameraFixed": bool(data.get("camerafixed", data.get("camera_fixed", defaults.get("camerafixed", False)))),
+                            "videoGenerateAudio": bool(data.get("generate_audio", defaults.get("generate_audio", False))),
+                        })
+                    else:
+                        run_settings.update({
+                            "customSize": data.get("size") or defaults.get("size") or "",
+                            "quality": data.get("quality") or defaults.get("quality") or "auto",
+                        })
+                    node = {
+                        "id": _codex_agent_uid("smart"),
+                        "type": "smart-image",
+                        "x": point["x"],
+                        "y": point["y"],
+                        "w": 360,
+                        "h": 240,
+                        "title": str(data.get("title") or ("Video" if is_video else "Image")),
+                        "images": [],
+                        "scale": 1,
+                        "agentGenerated": True,
+                        "outputKind": "video" if is_video else "image",
+                        "runPrompt": prompt,
+                        "runModelPrompt": prompt,
+                        "runPromptRefs": [],
+                        "runInputRefs": [],
+                        "runSettings": run_settings,
+                        "runAt": _codex_agent_now(),
+                        "created_at": _codex_agent_now(),
+                    }
+                    nodes.append(node)
+                    created.append(_codex_agent_node_summary(node))
+                changed += len(created)
+                result(action_type, "done" if created else "skipped", f"created {len(created)} generation nodes", created)
                 continue
 
             result(action_type or "unknown", "skipped", "unsupported action")
@@ -19708,6 +20189,7 @@ async def _codex_agent_apply_canvas_actions(
             result(action_type or "unknown", "error", str(exc))
 
     if changed:
+        _codex_agent_record_undo(canvas_id, normalized_actions, undo_snapshot)
         canvas["nodes"] = nodes
         canvas["connections"] = connections
         save_canvas(canvas)
@@ -19747,6 +20229,9 @@ def _codex_agent_action_approval_requirement(actions: List[Dict[str, Any]], canv
     ctx = canvas_context if isinstance(canvas_context, dict) else {}
     agent_input = ctx.get("agentInput") if isinstance(ctx.get("agentInput"), dict) else {}
     policy = str(agent_input.get("approvalPolicy") or agent_input.get("approval_policy") or "auto").strip().lower()
+    always_confirm = {"delete_node", "delete_nodes", "remove_node", "remove_nodes", "undo_last_agent_action", "undo_agent_action"}
+    if any(_codex_agent_action_type(action) in always_confirm for action in actions if isinstance(action, dict)):
+        return {"required": True, "risk": "high", "reason": "删除节点或撤销画布动作必须由用户确认"}
     if policy in {"auto", "automatic", "none", ""}:
         return {"required": False}
     if policy in {"confirm", "always", "manual"}:
@@ -19754,14 +20239,17 @@ def _codex_agent_action_approval_requirement(actions: List[Dict[str, Any]], canv
 
     risky_types = {
         "generate_video", "generate_videos", "create_video", "create_videos",
+        "create_video_generation_node", "create_video_generation_nodes",
         "ungroup_node", "ungroup_nodes", "split_group", "split_group_node",
         "remember_preference", "remember_preferences", "save_preference",
+        "delete_node", "delete_nodes", "remove_node", "remove_nodes", "undo_last_agent_action", "undo_agent_action",
     }
     moderate_types = {
         "rename_nodes", "rename_node", "move_nodes", "move_node", "position_nodes", "position_node",
         "arrange_nodes", "arrange_node", "layout_nodes", "organize_nodes",
         "group_nodes", "group_node", "create_group", "create_group_node",
         "generate_image", "generate_images", "create_image", "create_images",
+        "create_image_generation_node", "create_image_generation_nodes",
     }
     reasons: List[str] = []
     risk = "normal"
@@ -19840,13 +20328,8 @@ async def _codex_agent_execute_actions_from_text(task_id: str, text: str, refs: 
 
 
 def _codex_agent_canvas_tool_is_query(tool: str) -> bool:
-    return str(tool or "").strip().lower().replace("-", "_") in {
-        "get_selected_nodes",
-        "get_viewport_nodes",
-        "get_node_detail",
-        "get_connected_nodes",
-        "get_canvas_summary",
-    }
+    spec = _codex_agent_canvas_tool_registry().get(str(tool or "").strip().lower().replace("-", "_"))
+    return bool(spec and spec.get("query"))
 
 
 def _codex_agent_canvas_tool_result_text(results: List[Dict[str, Any]]) -> str:
@@ -19959,6 +20442,35 @@ def _codex_agent_canvas_nodes(canvas_id: str) -> Tuple[Dict[str, Any], List[Dict
     return canvas, [node for node in nodes if isinstance(node, dict)], [conn for conn in connections if isinstance(conn, dict)]
 
 
+def _codex_agent_context_snapshot_data(canvas_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    ctx = canvas_context if isinstance(canvas_context, dict) else {}
+    meta = ctx.get("_contextSnapshot") if isinstance(ctx.get("_contextSnapshot"), dict) else {}
+    path_text = str(meta.get("snapshot_path") or "").strip()
+    if not path_text:
+        return {}
+    try:
+        root = CODEX_AGENT_CONTEXT_SNAPSHOT_DIR.resolve()
+        path = _Path(path_text).resolve()
+        if root not in path.parents or path.suffix != ".json" or not path.is_file():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _codex_agent_query_snapshot_canvas(payload: CodexAgentCanvasToolRequest) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], str]:
+    snapshot = _codex_agent_context_snapshot_data(payload.canvas_context)
+    stored = snapshot.get("canvas_snapshot") if isinstance(snapshot.get("canvas_snapshot"), dict) else {}
+    if stored:
+        nodes = stored.get("nodes") if isinstance(stored.get("nodes"), list) else []
+        connections = stored.get("connections") if isinstance(stored.get("connections"), list) else []
+        canvas = {"name": stored.get("title") or "", "nodes": nodes, "connections": connections}
+        return canvas, [item for item in nodes if isinstance(item, dict)], [item for item in connections if isinstance(item, dict)], str(snapshot.get("snapshot_id") or "")
+    canvas, nodes, connections = _codex_agent_canvas_nodes(str(payload.canvas_id or ""))
+    return canvas, nodes, connections, ""
+
+
 def _codex_agent_connection_value(conn: Dict[str, Any], keys: Tuple[str, ...]) -> str:
     for key in keys:
         value = conn.get(key)
@@ -19973,7 +20485,7 @@ def _codex_agent_tool_query_canvas(payload: CodexAgentCanvasToolRequest) -> Dict
     canvas_id = str(payload.canvas_id or "").strip()
     if not canvas_id:
         raise HTTPException(status_code=400, detail="缺少 canvas_id")
-    canvas, nodes, connections = _codex_agent_canvas_nodes(canvas_id)
+    canvas, nodes, connections, snapshot_id = _codex_agent_query_snapshot_canvas(payload)
     context_rects = _codex_agent_context_node_rects(payload.canvas_context)
     selected_ids = _codex_agent_selected_ids(payload.canvas_context)
     by_id = {str(node.get("id")): node for node in nodes if node.get("id")}
@@ -19996,6 +20508,7 @@ def _codex_agent_tool_query_canvas(payload: CodexAgentCanvasToolRequest) -> Dict
             "ok": True,
             "tool": tool,
             "canvas_id": canvas_id,
+            "snapshot_id": snapshot_id,
             "title": canvas.get("name") or canvas.get("title") or "",
             "node_count": len(nodes),
             "connection_count": len(connections),
@@ -20009,13 +20522,14 @@ def _codex_agent_tool_query_canvas(payload: CodexAgentCanvasToolRequest) -> Dict
             "ok": True,
             "tool": tool,
             "canvas_id": canvas_id,
+            "snapshot_id": snapshot_id,
             "nodes": [_codex_agent_node_summary(by_id[node_id]) for node_id in selected_ids if node_id in by_id],
         }
 
     if tool == "get_viewport_nodes":
         visible = _codex_agent_visible_world(payload.canvas_context)
         if not visible:
-            return {"ok": True, "tool": tool, "canvas_id": canvas_id, "nodes": [], "visible_world": None}
+            return {"ok": True, "tool": tool, "canvas_id": canvas_id, "snapshot_id": snapshot_id, "nodes": [], "visible_world": None}
         pad = float(args.get("pad") or 80)
         result_nodes = []
         for node in nodes:
@@ -20027,34 +20541,69 @@ def _codex_agent_tool_query_canvas(payload: CodexAgentCanvasToolRequest) -> Dict
                 visible["y"] + visible["height"] + pad < rect["y"]
             ):
                 result_nodes.append(_codex_agent_node_summary(node))
-        return {"ok": True, "tool": tool, "canvas_id": canvas_id, "visible_world": visible, "nodes": result_nodes[:120]}
+        limit = max(1, min(120, int(args.get("limit") or 120)))
+        return {"ok": True, "tool": tool, "canvas_id": canvas_id, "snapshot_id": snapshot_id, "visible_world": visible, "nodes": result_nodes[:limit]}
+
+    if tool == "search_canvas_nodes":
+        query = str(args.get("query") or "").strip().lower()
+        requested_types = {str(item).strip().lower() for item in (args.get("types") or []) if str(item).strip()} if isinstance(args.get("types"), list) else set()
+        limit = max(1, min(80, int(args.get("limit") or 30)))
+        cursor = max(0, int(args.get("cursor") or 0))
+        matches: List[Dict[str, Any]] = []
+        for node in nodes:
+            node_type = str(node.get("type") or "").lower()
+            if requested_types and node_type not in requested_types:
+                continue
+            image_text = " ".join(str(image.get("name") or image.get("kind") or "") for image in (node.get("images") or []) if isinstance(image, dict))
+            haystack = " ".join([node_type, str(node.get("title") or ""), str(node.get("text") or ""), image_text]).lower()
+            if not query or query in haystack:
+                matches.append(_codex_agent_node_summary(node))
+        page = matches[cursor:cursor + limit]
+        next_cursor: Optional[int] = cursor + len(page) if cursor + len(page) < len(matches) else None
+        return {"ok": True, "tool": tool, "canvas_id": canvas_id, "snapshot_id": snapshot_id, "nodes": page, "total": len(matches), "cursor": cursor, "next_cursor": next_cursor}
 
     if tool == "get_node_detail":
-        raw_ids = args.get("node_ids") or args.get("nodeIds") or args.get("ids") or args.get("node_id") or args.get("id") or []
-        ids = raw_ids if isinstance(raw_ids, list) else [raw_ids]
-        ids = [str(node_id).strip() for node_id in ids if str(node_id or "").strip()]
-        if not ids and len(selected_ids) == 1:
-            ids = [selected_ids[0]]
-        return {
-            "ok": True,
-            "tool": tool,
-            "canvas_id": canvas_id,
-            "nodes": [_codex_agent_node_summary(by_id[str(node_id)]) for node_id in ids if str(node_id) in by_id],
-        }
-
-    if tool == "get_connected_nodes":
-        node_id = str(args.get("node_id") or args.get("nodeId") or args.get("id") or "").strip()
-        if not node_id and len(selected_ids) == 1:
-            node_id = selected_ids[0]
-        if not node_id:
+        ids = _codex_agent_resolve_node_ids(args, nodes, payload.refs or [], selected_ids)
+        if not ids:
             return {
                 "ok": False,
                 "tool": tool,
                 "canvas_id": canvas_id,
-                "message": "缺少 node_id，且当前没有唯一选中节点",
+                "snapshot_id": snapshot_id,
+                "message": "缺少节点目标。请传 node_id/ref，或在画布中只选中一个节点",
+                "nodes": [],
+            }
+        return {
+            "ok": True,
+            "tool": tool,
+            "canvas_id": canvas_id,
+            "snapshot_id": snapshot_id,
+            "nodes": [_codex_agent_node_summary(by_id[node_id]) for node_id in ids if node_id in by_id],
+        }
+
+    if tool == "get_connected_nodes":
+        ids = _codex_agent_resolve_node_ids(args, nodes, payload.refs or [], selected_ids)
+        if not ids:
+            return {
+                "ok": False,
+                "tool": tool,
+                "canvas_id": canvas_id,
+                "snapshot_id": snapshot_id,
+                "message": "缺少节点目标。请传 node_id/ref，或在画布中只选中一个节点",
                 "nodes": [],
                 "connections": [],
             }
+        if len(ids) > 1:
+            return {
+                "ok": False,
+                "tool": tool,
+                "canvas_id": canvas_id,
+                "snapshot_id": snapshot_id,
+                "message": "get_connected_nodes 一次只能查询一个节点；请传一个 node_id/ref",
+                "nodes": [],
+                "connections": [],
+            }
+        node_id = ids[0]
         connected_ids: List[str] = []
         edge_rows = []
         for conn in connections:
@@ -20069,6 +20618,7 @@ def _codex_agent_tool_query_canvas(payload: CodexAgentCanvasToolRequest) -> Dict
             "ok": True,
             "tool": tool,
             "canvas_id": canvas_id,
+            "snapshot_id": snapshot_id,
             "node_id": node_id,
             "connections": edge_rows,
             "nodes": [_codex_agent_node_summary(by_id[item]) for item in connected_ids if item in by_id],
@@ -20079,26 +20629,617 @@ def _codex_agent_tool_query_canvas(payload: CodexAgentCanvasToolRequest) -> Dict
 
 async def _codex_agent_run_canvas_tool(payload: CodexAgentCanvasToolRequest) -> Dict[str, Any]:
     tool = str(payload.tool or "").strip().lower().replace("-", "_")
-    query_tools = {"get_selected_nodes", "get_viewport_nodes", "get_node_detail", "get_connected_nodes", "get_canvas_summary"}
-    if tool in query_tools:
-        return _codex_agent_tool_query_canvas(payload)
-    action_map = {
-        "move_nodes": "move_nodes",
-        "arrange_nodes": "arrange_nodes",
-        "rename_assets": "rename_nodes",
-        "group_nodes": "group_nodes",
-        "ungroup_nodes": "ungroup_nodes",
-    }
-    if tool not in action_map:
+    spec = _codex_agent_canvas_tool_registry().get(tool)
+    if not spec:
         raise HTTPException(status_code=400, detail=f"不支持的 Canvas Tool: {tool}")
+    if tool in {"get_generation_queue", "get_generation_task", "cancel_generation_task", "retry_generation_task"}:
+        return await _codex_agent_generation_control(tool, payload.args if isinstance(payload.args, dict) else {}, str(payload.canvas_id or ""))
+    if spec.get("query"):
+        return _codex_agent_tool_query_canvas(payload)
     args = payload.args if isinstance(payload.args, dict) else {}
     actions = args.get("actions")
     if not isinstance(actions, list):
         action = dict(args)
-        action["type"] = action_map[tool]
+        action["type"] = str(spec.get("action") or tool)
+        if tool == "remember_preference" and not action.get("note"):
+            action["note"] = action.get("text") or action.get("content") or ""
         actions = [action]
     refs = [item for item in (payload.refs or []) if isinstance(item, dict)]
     return await _codex_agent_apply_canvas_actions(str(payload.canvas_id or ""), actions, refs, payload.canvas_context)
+
+
+def _codex_agent_native_tool_actions(tool: str, args: Dict[str, Any]) -> List[Dict[str, Any]]:
+    spec = _codex_agent_canvas_tool_registry().get(tool) or {}
+    action_type = str(spec.get("action") or "")
+    if not action_type:
+        return []
+    action = dict(args)
+    action.pop("actions", None)  # Native tools never accept arbitrary legacy action batches.
+    action["type"] = action_type
+    options = dict(action.get("options") or {}) if isinstance(action.get("options"), dict) else {}
+    for key in ("scope", "all", "selected", "cols", "mode", "layout", "cellX", "cellY", "x", "y", "title", "name"):
+        if key in action and key not in options:
+            options[key] = action[key]
+    if options:
+        action["options"] = options
+    if tool == "remember_preference" and not action.get("note"):
+        action["note"] = action.get("text") or action.get("content") or ""
+    return [action]
+
+
+def _codex_agent_generation_request(tool: str, args: Dict[str, Any], canvas_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if tool not in {"generate_images", "generate_videos"}:
+        return None
+    is_video = tool == "generate_videos"
+    native = canvas_context.get("native") if isinstance(canvas_context, dict) and isinstance(canvas_context.get("native"), dict) else {}
+    defaults = native.get("videoGeneration" if is_video else "imageGeneration") if isinstance(native, dict) else {}
+    defaults = defaults if isinstance(defaults, dict) else {}
+    raw_items = args.get("items") or args.get("prompts") or ([args] if args else [])
+    source_items = raw_items if isinstance(raw_items, list) else [raw_items]
+    items: List[Dict[str, Any]] = []
+    image_count = 0
+    for raw in source_items:
+        item = {"prompt": raw} if isinstance(raw, str) else (dict(raw) if isinstance(raw, dict) else {})
+        prompt = str(item.get("prompt") or item.get("text") or "").strip()
+        if not prompt:
+            continue
+        if is_video:
+            item.setdefault("duration", item.get("seconds") or defaults.get("duration") or 5)
+        else:
+            count = max(1, min(8, int(item.get("count") or item.get("n") or defaults.get("count") or 1)))
+            item["count"] = count
+            image_count += count
+        item.setdefault("provider_id", defaults.get("provider_id") or "")
+        item.setdefault("model", defaults.get("model") or "")
+        items.append(item)
+    if not items:
+        return None
+    video_count = len(items) if is_video else 0
+    node_action = "create_video_generation_node" if is_video else "create_image_generation_node"
+    options = args.get("options") if isinstance(args.get("options"), dict) else {}
+    provider = str(items[0].get("provider_id") or "")
+    model = str(items[0].get("model") or "")
+    # Providers do not share a reliable credit/pricing schema. We only surface a
+    # conservative workload warning, never a made-up credit estimate.
+    high_workload = (video_count >= 2) or (image_count >= 4) or (len(items) >= 4)
+    return {
+        "kind": "video" if is_video else "image",
+        "items": items,
+        "options": options,
+        "node_actions": [{"type": node_action, "items": items, "options": options}],
+        "node_count": len(items),
+        "image_count": image_count,
+        "video_count": video_count,
+        "provider_id": provider,
+        "model": model,
+        "high_workload": high_workload,
+        "workload_warning": "本次任务规模较大，可能消耗大量积分" if high_workload else "",
+    }
+
+
+def _codex_agent_generation_summary_text(generation: Dict[str, Any]) -> str:
+    nodes = int(generation.get("node_count") or 0)
+    images = int(generation.get("image_count") or 0)
+    videos = int(generation.get("video_count") or 0)
+    parts = [f"将创建 {nodes} 个生成节点"]
+    if images:
+        parts.append(f"提交 {images} 张图片生成")
+    if videos:
+        parts.append(f"提交 {videos} 个视频生成")
+    provider = str(generation.get("provider_id") or "")
+    model = str(generation.get("model") or "")
+    if provider or model:
+        parts.append(f"模型：{provider or '默认'} / {model or '默认'}")
+    if generation.get("workload_warning"):
+        parts.append(str(generation.get("workload_warning")))
+    parts.append("直接提交后由后端持续跟踪，页面刷新不影响任务")
+    return "；".join(parts)
+
+
+def _codex_agent_generation_reference_images(item: Dict[str, Any]) -> List[AIReference]:
+    raw_refs = item.get("reference_images") or item.get("references") or item.get("refs") or []
+    values = raw_refs if isinstance(raw_refs, list) else [raw_refs]
+    out: List[AIReference] = []
+    for raw in values[:8]:
+        if isinstance(raw, str):
+            raw = {"url": raw}
+        if not isinstance(raw, dict):
+            continue
+        url = str(raw.get("url") or raw.get("path") or "").strip()
+        if url:
+            out.append(AIReference(url=url, name=str(raw.get("name") or ""), role=str(raw.get("role") or ""), kind=str(raw.get("kind") or "image")))
+    return out
+
+
+async def _codex_agent_watch_generation_task(canvas_id: str, node_id: str, task_id: str, kind: str) -> None:
+    """Persist provider task completion into the smart canvas; browser lifetime is irrelevant."""
+    for _ in range(3600):  # one hour maximum; long provider tasks keep their pending id on the node.
+        await asyncio.sleep(1.5)
+        with CANVAS_TASK_LOCK:
+            task = dict(CANVAS_TASKS.get(task_id) or {})
+        status = str(task.get("status") or "").lower()
+        if status in {"queued", "running", ""}:
+            continue
+        if status == "jimeng_pending":
+            return
+        try:
+            canvas = load_canvas(canvas_id)
+            node = next((item for item in (canvas.get("nodes") or []) if str(item.get("id") or "") == node_id), None)
+            if not node:
+                return
+            if status == "succeeded":
+                result = task.get("result") if isinstance(task.get("result"), dict) else {}
+                raw_items = result.get("image_items") if kind == "image" else result.get("video_items")
+                if not isinstance(raw_items, list):
+                    raw_items = result.get("images") if kind == "image" else result.get("videos")
+                media = []
+                for index, raw in enumerate(raw_items or []):
+                    data = {"url": raw} if isinstance(raw, str) else (raw if isinstance(raw, dict) else {})
+                    url = str(data.get("url") or "").strip()
+                    if url:
+                        media.append({"url": url, "name": str(data.get("name") or f"output-{index + 1}.{'png' if kind == 'image' else 'mp4'}"), "kind": str(data.get("kind") or kind), "generatedResult": True})
+                node["images"] = media
+                node["title"] = "Video" if kind == "video" else ("Group" if len(media) > 1 else "Image")
+                node["outputKind"] = kind
+                node.pop("generationError", None)
+            else:
+                node["generationError"] = {"message": str(task.get("error") or "生成任务失败"), "kind": kind, "logged": False}
+            finished_at = _codex_agent_now()
+            started_at = int(node.get("runStartedAt") or node.get("runAt") or finished_at)
+            node["runStartedAt"] = started_at
+            node["runFinishedAt"] = finished_at
+            node["runElapsedMs"] = max(0, finished_at - started_at)
+            node["runTimerHidden"] = False
+            node["pending"] = 0
+            node["running"] = False
+            node["pendingTasks"] = [entry for entry in (node.get("pendingTasks") or []) if str(entry.get("taskId") or "") != task_id]
+            save_canvas(canvas)
+            await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or _codex_agent_now()), "codex-agent")
+        except Exception as exc:
+            print(f"[codex-agent] generation task sync failed: {exc}")
+        return
+
+
+async def _codex_agent_resume_jimeng_generation_task(task_id: str) -> None:
+    """Resume polling a persisted provider task after an app-server restart."""
+    for _ in range(3600):
+        with CANVAS_TASK_LOCK:
+            task = CANVAS_TASKS.get(task_id)
+            if not task or str(task.get("status") or "") in {"cancelled", "succeeded", "failed"}:
+                return
+            submit_id = str(task.get("submit_id") or task.get("upstream_task_id") or "")
+            kind = str(task.get("kind") or "image")
+        if not submit_id:
+            return
+        try:
+            queried = await jimeng_query_result(submit_id, kind)
+            urls = await jimeng_store_outputs(queried, kind, allow_query=False)
+            with CANVAS_TASK_LOCK:
+                task = CANVAS_TASKS.get(task_id)
+                if not task:
+                    return
+                task.update({
+                    "status": "succeeded",
+                    "result": {"image_items" if kind == "image" else "video_items": urls},
+                    "error": "",
+                    "updated_at": time.time(),
+                })
+                _canvas_generation_task_persist(task)
+                canvas_id = str(task.get("canvas_id") or "")
+                node_id = str(task.get("node_id") or "")
+            if canvas_id and node_id:
+                asyncio.create_task(_codex_agent_watch_generation_task(canvas_id, node_id, task_id, kind))
+            return
+        except JimengPendingError as exc:
+            with CANVAS_TASK_LOCK:
+                task = CANVAS_TASKS.get(task_id)
+                if task:
+                    task.update({"status": "jimeng_pending", "submit_id": exc.submit_id, "queue_info": exc.queue_info, "updated_at": time.time()})
+                    _canvas_generation_task_persist(task)
+            await asyncio.sleep(4)
+        except Exception as exc:
+            with CANVAS_TASK_LOCK:
+                task = CANVAS_TASKS.get(task_id)
+                if task:
+                    task.update({"status": "failed", "error": str(getattr(exc, "detail", None) or exc), "updated_at": time.time()})
+                    _canvas_generation_task_persist(task)
+            return
+
+
+async def _codex_agent_restore_generation_tasks() -> None:
+    """Rehydrate task/node links from SQLite. Known provider task ids resume polling safely."""
+    rows = _canvas_generation_task_rows(["queued", "running", "jimeng_pending"])
+    for row in rows:
+        task_id = str(row.get("task_id") or "")
+        if not task_id:
+            continue
+        task = {
+            "id": task_id,
+            "type": "canvas-video" if str(row.get("kind") or "") == "video" else "online-image",
+            "kind": str(row.get("kind") or "image"),
+            "status": str(row.get("status") or "queued"),
+            "created_at": int(row.get("created_at") or _codex_agent_now()) / 1000,
+            "updated_at": int(row.get("updated_at") or _codex_agent_now()) / 1000,
+            "provider_id": str(row.get("provider_id") or ""), "model": str(row.get("model") or ""),
+            "canvas_id": str(row.get("canvas_id") or ""), "node_id": str(row.get("node_id") or ""),
+            "submit_id": str(row.get("upstream_task_id") or ""), "payload": row.get("payload") or {},
+            "result": row.get("result") or {}, "error": str(row.get("error") or ""),
+        }
+        with CANVAS_TASK_LOCK:
+            CANVAS_TASKS[task_id] = task
+        if task["status"] == "jimeng_pending" and task["submit_id"]:
+            asyncio.create_task(_codex_agent_resume_jimeng_generation_task(task_id))
+        elif task["status"] in {"queued", "running"}:
+            # The provider never returned a durable upstream id. Do not blindly
+            # submit a duplicate billable job after restart; expose it for retry.
+            with CANVAS_TASK_LOCK:
+                task["status"] = "interrupted"
+                task["error"] = "服务重启时上游任务尚未返回可恢复任务号；可安全重试"
+                task["updated_at"] = time.time()
+                _canvas_generation_task_persist(task)
+        if task["canvas_id"] and task["node_id"]:
+            asyncio.create_task(_codex_agent_watch_generation_task(task["canvas_id"], task["node_id"], task_id, task["kind"]))
+
+
+def _codex_agent_generation_task_public(task: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "task_id": str(task.get("id") or task.get("task_id") or ""),
+        "kind": str(task.get("kind") or ("video" if task.get("type") == "canvas-video" else "image")),
+        "status": str(task.get("status") or "unknown"),
+        "provider_id": str(task.get("provider_id") or ""), "model": str(task.get("model") or ""),
+        "node_id": str(task.get("node_id") or ""), "canvas_id": str(task.get("canvas_id") or ""),
+        "upstream_task_id": str(task.get("submit_id") or task.get("upstream_task_id") or ""),
+        "error": str(task.get("error") or ""), "created_at": task.get("created_at"), "updated_at": task.get("updated_at"),
+    }
+
+
+async def _codex_agent_generation_control(tool: str, args: Dict[str, Any], canvas_id: str) -> Dict[str, Any]:
+    if tool == "get_generation_queue":
+        statuses = args.get("statuses") if isinstance(args.get("statuses"), list) else None
+        rows = _canvas_generation_task_rows([str(item) for item in statuses] if statuses else None)
+        tasks = [row for row in rows if not canvas_id or str(row.get("canvas_id") or "") == canvas_id]
+        return {"ok": True, "tool": tool, "tasks": [_codex_agent_generation_task_public(row) for row in tasks[:100]], "count": len(tasks)}
+    task_id = str(args.get("task_id") or "").strip()
+    with CANVAS_TASK_LOCK:
+        task = dict(CANVAS_TASKS.get(task_id) or {})
+    if not task:
+        task = next((row for row in _canvas_generation_task_rows() if str(row.get("task_id") or "") == task_id), {})
+        if task:
+            task["id"] = task_id
+    if not task or (canvas_id and str(task.get("canvas_id") or "") != canvas_id):
+        return {"ok": False, "tool": tool, "message": "未找到当前画布中的生成任务"}
+    if tool == "get_generation_task":
+        return {"ok": True, "tool": tool, "task": _codex_agent_generation_task_public(task)}
+    if tool == "cancel_generation_task":
+        status = str(task.get("status") or "").lower()
+        upstream_accepted = bool(task.get("submit_id") or task.get("upstream_task_id")) or status not in {"queued"}
+        if upstream_accepted:
+            return {"ok": False, "tool": tool, "message": "任务已提交上游，无法取消；对应节点将继续运行"}
+        worker = CANVAS_TASK_WORKERS.get(task_id)
+        if worker and not worker.done():
+            worker.cancel()
+        with CANVAS_TASK_LOCK:
+            live = CANVAS_TASKS.get(task_id, task)
+            live.update({"status": "cancelled", "error": "用户取消", "updated_at": time.time()})
+            CANVAS_TASKS[task_id] = live
+            _canvas_generation_task_persist(live)
+        if live.get("canvas_id") and live.get("node_id"):
+            canvas = load_canvas(str(live["canvas_id"]))
+            node = next((item for item in (canvas.get("nodes") or []) if str(item.get("id") or "") == str(live["node_id"])), None)
+            if node:
+                node["running"] = False
+                node["pending"] = 0
+                node["generationError"] = {"message": "已取消生成任务", "kind": live.get("kind") or "image", "logged": False}
+                node["pendingTasks"] = [entry for entry in (node.get("pendingTasks") or []) if str(entry.get("taskId") or "") != task_id]
+                save_canvas(canvas)
+                await manager.broadcast_canvas_updated(str(live["canvas_id"]), int(canvas.get("updated_at") or _codex_agent_now()), "codex-agent")
+        return {"ok": True, "tool": tool, "changed": 1, "task": _codex_agent_generation_task_public(live), "message": "已取消尚未提交上游的排队任务"}
+    if tool == "retry_generation_task":
+        if str(task.get("status") or "") not in {"failed", "interrupted", "cancelled"}:
+            return {"ok": False, "tool": tool, "message": "只有失败、中断或已取消的任务可以重试"}
+        payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        kind = str(task.get("kind") or "image")
+        try:
+            info = await (create_canvas_video_task(CanvasVideoRequest(**payload)) if kind == "video" else create_canvas_image_task(OnlineImageRequest(**payload)))
+        except Exception as exc:
+            return {"ok": False, "tool": tool, "message": f"重试创建失败：{exc}"}
+        new_id = str(info.get("task_id") or "")
+        with CANVAS_TASK_LOCK:
+            live = CANVAS_TASKS.get(new_id) or {}
+            live.update({"canvas_id": str(task.get("canvas_id") or ""), "node_id": str(task.get("node_id") or ""), "kind": kind})
+            _canvas_generation_task_persist(live)
+        if live.get("canvas_id") and live.get("node_id"):
+            canvas = load_canvas(str(live["canvas_id"]))
+            node = next((item for item in (canvas.get("nodes") or []) if str(item.get("id") or "") == str(live["node_id"])), None)
+            if node:
+                node.update({"pending": 1, "running": True, "runStartedAt": _codex_agent_now(), "runTimerHidden": False})
+                node.pop("runFinishedAt", None)
+                node.pop("runElapsedMs", None)
+                node.pop("generationError", None)
+                node["pendingTasks"] = [{"taskId": new_id, "kind": kind, "providerId": live.get("provider_id") or "", "model": live.get("model") or ""}]
+                save_canvas(canvas)
+                await manager.broadcast_canvas_updated(str(live["canvas_id"]), int(canvas.get("updated_at") or _codex_agent_now()), "codex-agent")
+        if live.get("canvas_id") and live.get("node_id"):
+            asyncio.create_task(_codex_agent_watch_generation_task(live["canvas_id"], live["node_id"], new_id, kind))
+        return {"ok": True, "tool": tool, "changed": 1, "task": _codex_agent_generation_task_public(live), "message": "已创建重试任务"}
+    return {"ok": False, "tool": tool, "message": "不支持的生成任务操作"}
+
+
+async def _codex_agent_submit_generation(
+    canvas_id: str,
+    generation: Dict[str, Any],
+    refs: List[Dict[str, Any]],
+    canvas_context: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    kind = str(generation.get("kind") or "image")
+    items = generation.get("items") if isinstance(generation.get("items"), list) else []
+    node_actions = generation.get("node_actions") if isinstance(generation.get("node_actions"), list) else []
+    created = await _codex_agent_apply_canvas_actions(canvas_id, node_actions, refs, canvas_context)
+    node_rows = [item for row in (created.get("results") or []) for item in (row.get("items") or []) if isinstance(item, dict)]
+    submitted = []
+    for index, node in enumerate(node_rows):
+        item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
+        prompt = str(item.get("prompt") or item.get("text") or "").strip()
+        if not prompt:
+            continue
+        if kind == "video":
+            request = CanvasVideoRequest(
+                prompt=prompt,
+                provider_id=str(item.get("provider_id") or "comfly"),
+                model=str(item.get("model") or ""),
+                duration=max(1, min(60, int(item.get("duration") or 5))),
+                aspect_ratio=str(item.get("aspect_ratio") or item.get("aspect") or "16:9"),
+                resolution=str(item.get("resolution") or ""),
+                images=_codex_agent_generation_reference_images(item),
+                camerafixed=bool(item.get("camerafixed", item.get("camera_fixed", False))),
+                generate_audio=bool(item.get("generate_audio", False)),
+            )
+            task_info = await create_canvas_video_task(request)
+        else:
+            request = OnlineImageRequest(
+                prompt=prompt,
+                provider_id=str(item.get("provider_id") or "comfly"),
+                model=str(item.get("model") or ""),
+                size=str(item.get("size") or "1024x1024"),
+                quality=str(item.get("quality") or "auto"),
+                n=max(1, min(8, int(item.get("count") or item.get("n") or 1))),
+                reference_images=_codex_agent_generation_reference_images(item),
+            )
+            task_info = await create_canvas_image_task(request)
+        task_id = str(task_info.get("task_id") or "")
+        with CANVAS_TASK_LOCK:
+            task = CANVAS_TASKS.get(task_id)
+            if task:
+                task.update({"canvas_id": canvas_id, "node_id": str(node.get("id") or ""), "kind": kind})
+                _canvas_generation_task_persist(task)
+        submitted.append({"node_id": node.get("id"), "task_id": task_id, "kind": kind})
+
+    canvas = load_canvas(canvas_id)
+    for item in submitted:
+        node = next((row for row in (canvas.get("nodes") or []) if str(row.get("id") or "") == str(item.get("node_id") or "")), None)
+        if not node:
+            continue
+        node["pending"] = 1
+        node["running"] = True
+        node["runStartedAt"] = _codex_agent_now()
+        node.pop("runFinishedAt", None)
+        node.pop("runElapsedMs", None)
+        node["runTimerHidden"] = False
+        node["pendingTasks"] = [{"taskId": item["task_id"], "kind": kind, "providerId": generation.get("provider_id") or "", "model": generation.get("model") or ""}]
+    if submitted:
+        save_canvas(canvas)
+        await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or _codex_agent_now()), "codex-agent")
+        for item in submitted:
+            asyncio.create_task(_codex_agent_watch_generation_task(canvas_id, str(item.get("node_id") or ""), str(item.get("task_id") or ""), kind))
+    return {"ok": bool(submitted), "changed": len(submitted), "skipped": max(0, len(items) - len(submitted)), "results": [{"type": "generate_" + kind, "status": "submitted", "items": node_rows}], "submitted": submitted, "message": _codex_agent_generation_summary_text(generation) + "；已由后端提交并持续跟踪"}
+
+
+async def _codex_agent_handle_native_tool_call(
+    task_id: str,
+    runtime: CodexAppServerRuntime,
+    event: Dict[str, Any],
+    refs: List[Dict[str, Any]],
+    canvas_context: Optional[Dict[str, Any]],
+) -> None:
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    request_id = event.get("id")
+    namespace = str(params.get("namespace") or "").strip()
+    tool = str(params.get("tool") or "").strip().lower().replace("-", "_")
+    raw_args = params.get("arguments")
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except Exception:
+            raw_args = {}
+    args = raw_args if isinstance(raw_args, dict) else {}
+    registry = _codex_agent_canvas_tool_registry()
+    spec = registry.get(tool)
+    if namespace and namespace != CODEX_AGENT_DYNAMIC_TOOL_NAMESPACE:
+        result = {"ok": False, "tool": tool or "unknown", "message": "不支持的原生命名空间"}
+        await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result, success=False))
+        return
+    if not spec:
+        result = {"ok": False, "tool": tool or "unknown", "message": "不支持的画布工具"}
+        await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result, success=False))
+        return
+
+    query = bool(spec.get("query"))
+    _codex_agent_add_task_event(task_id, {
+        "method": "canvas/tool_call",
+        "params": {"tool": tool, "args": args, "query": query, "native": True},
+    })
+    with _codex_agent_task_lock:
+        task = _codex_agent_tasks.get(task_id) or {}
+        canvas_id = str(task.get("canvas_id") or "")
+
+    try:
+        tool_payload = CodexAgentCanvasToolRequest(
+            canvas_id=canvas_id,
+            tool=tool,
+            args=args,
+            refs=refs,
+            canvas_context=canvas_context,
+        )
+        if query:
+            result = await _codex_agent_run_canvas_tool(tool_payload)
+            _codex_agent_add_task_event(task_id, {"method": "canvas/tool_result", "params": {"tool": tool, "query": True, "result": result, "native": True}})
+            await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result))
+            return
+
+        if tool in {"cancel_generation_task", "retry_generation_task"}:
+            result = await _codex_agent_generation_control(tool, args, canvas_id)
+            _codex_agent_add_task_event(task_id, {"method": "canvas/tool_result", "params": {"tool": tool, "query": False, "result": result, "native": True}})
+            await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result, success=bool(result.get("ok"))))
+            return
+        actions = _codex_agent_native_tool_actions(tool, args)
+        approval = _codex_agent_action_approval_requirement(actions, canvas_context)
+        generation = _codex_agent_generation_request(tool, args, canvas_context)
+        if generation:
+            agent_input = canvas_context.get("agentInput") if isinstance(canvas_context, dict) and isinstance(canvas_context.get("agentInput"), dict) else {}
+            generation_policy = str(agent_input.get("approvalPolicy") or agent_input.get("approval_policy") or "auto").strip().lower()
+            if generation_policy in {"confirm-risky", "risky", "high-risk"} and int(generation.get("image_count") or 0) >= 3 and not approval.get("required"):
+                approval = {"required": True, "risk": "high", "reason": f"将提交 {generation.get('image_count')} 张图片生成"}
+            if not approval.get("required"):
+                result = await _codex_agent_submit_generation(canvas_id, generation, refs, canvas_context)
+                result["tool"] = tool
+                _codex_agent_add_task_event(task_id, {"method": "canvas/tool_result", "params": {"tool": tool, "query": False, "result": result, "native": True}})
+                await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result))
+                return
+            approval_id = _codex_agent_uid("approval")
+            with _codex_agent_task_lock:
+                task = _codex_agent_tasks.get(task_id)
+                if task is not None:
+                    task.setdefault("pending_action_approvals", {})[approval_id] = {
+                        "approval_id": approval_id,
+                        "kind": "generation_action",
+                        "request_id": request_id,
+                        "call_id": str(params.get("callId") or ""),
+                        "tool": tool,
+                        "actions": generation.get("node_actions") or [],
+                        "generation": generation,
+                        "refs": refs,
+                        "canvas_context": canvas_context,
+                        "created_at": _codex_agent_now(),
+                        "status": "pending",
+                        "reason": approval.get("reason", ""),
+                        "risk": approval.get("risk", "normal"),
+                    }
+            _codex_agent_add_task_event(task_id, {
+                "method": "canvas/action_pending",
+                "params": {
+                    "task_id": task_id,
+                    "approval_id": approval_id,
+                    "actions": _codex_agent_public_action_summary(generation.get("node_actions") or []),
+                    "reason": _codex_agent_generation_summary_text(generation),
+                    "risk": approval.get("risk", "normal"),
+                    "count": int(generation.get("node_count") or 0),
+                    "tool": tool,
+                    "native": True,
+                    "options": [
+                        {"label": "直接提交生成", "value": "run_generation", "action": "resolve_canvas_action"},
+                        {"label": "仅创建生成节点", "value": "create_nodes", "action": "resolve_canvas_action"},
+                        {"label": "取消", "value": "skip", "action": "resolve_canvas_action"},
+                    ],
+                },
+            })
+            return
+        if approval.get("required"):
+            approval_id = _codex_agent_uid("approval")
+            with _codex_agent_task_lock:
+                task = _codex_agent_tasks.get(task_id)
+                if task is not None:
+                    task.setdefault("pending_action_approvals", {})[approval_id] = {
+                        "approval_id": approval_id,
+                        "kind": "native_tool",
+                        "request_id": request_id,
+                        "call_id": str(params.get("callId") or ""),
+                        "tool": tool,
+                        "actions": actions,
+                        "refs": refs,
+                        "canvas_context": canvas_context,
+                        "created_at": _codex_agent_now(),
+                        "status": "pending",
+                        "reason": approval.get("reason", ""),
+                        "risk": approval.get("risk", "normal"),
+                    }
+            _codex_agent_add_task_event(task_id, {
+                "method": "canvas/action_pending",
+                "params": {
+                    "task_id": task_id,
+                    "approval_id": approval_id,
+                    "actions": _codex_agent_public_action_summary(actions),
+                    "reason": approval.get("reason", "需要确认后执行"),
+                    "risk": approval.get("risk", "normal"),
+                    "count": len(actions),
+                    "tool": tool,
+                    "native": True,
+                },
+            })
+            return
+
+        result = await _codex_agent_apply_canvas_actions(canvas_id, actions, refs, canvas_context)
+        result["tool"] = tool
+        _codex_agent_add_task_event(task_id, {"method": "canvas/tool_result", "params": {"tool": tool, "query": False, "result": result, "native": True}})
+        await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result))
+    except HTTPException as exc:
+        result = {"ok": False, "tool": tool, "message": str(exc.detail)}
+        _codex_agent_add_task_event(task_id, {"method": "canvas/tool_result", "params": {"tool": tool, "query": query, "result": result, "native": True}})
+        await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result, success=False))
+    except Exception as exc:
+        result = {"ok": False, "tool": tool, "message": str(exc)}
+        _codex_agent_add_task_event(task_id, {"method": "canvas/tool_result", "params": {"tool": tool, "query": query, "result": result, "native": True}})
+        await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result, success=False))
+
+
+async def _codex_agent_execute_direct_native_tool_call(
+    runtime: CodexAppServerRuntime,
+    event: Dict[str, Any],
+    canvas_id: str,
+    refs: List[Dict[str, Any]],
+    canvas_context: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Compatibility handler for the legacy streaming endpoint, which has no approval UI."""
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    request_id = event.get("id")
+    tool = str(params.get("tool") or "").strip().lower().replace("-", "_")
+    namespace = str(params.get("namespace") or "").strip()
+    raw_args = params.get("arguments")
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except Exception:
+            raw_args = {}
+    args = raw_args if isinstance(raw_args, dict) else {}
+    spec = _codex_agent_canvas_tool_registry().get(tool)
+    query = bool(spec and spec.get("query"))
+    if (namespace and namespace != CODEX_AGENT_DYNAMIC_TOOL_NAMESPACE) or not spec:
+        result = {"ok": False, "tool": tool or "unknown", "message": "不支持的画布工具"}
+        await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result, success=False))
+        return {"tool": tool, "query": query, "result": result}
+    try:
+        payload = CodexAgentCanvasToolRequest(canvas_id=canvas_id, tool=tool, args=args, refs=refs, canvas_context=canvas_context)
+        if query:
+            result = await _codex_agent_run_canvas_tool(payload)
+        else:
+            actions = _codex_agent_native_tool_actions(tool, args)
+            approval = _codex_agent_action_approval_requirement(actions, canvas_context)
+            generation = _codex_agent_generation_request(tool, args, canvas_context)
+            if generation and not approval.get("required"):
+                result = await _codex_agent_submit_generation(canvas_id, generation, refs, canvas_context)
+                result["tool"] = tool
+            elif approval.get("required"):
+                result = {"ok": False, "tool": tool, "message": "此接口不支持交互确认；请在画布 Agent 面板中执行该操作"}
+            else:
+                result = await _codex_agent_apply_canvas_actions(canvas_id, actions, refs, canvas_context)
+                result["tool"] = tool
+        await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result))
+    except HTTPException as exc:
+        result = {"ok": False, "tool": tool, "message": str(exc.detail)}
+        await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result, success=False))
+    except Exception as exc:
+        result = {"ok": False, "tool": tool, "message": str(exc)}
+        await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result, success=False))
+    return {"tool": tool, "query": query, "result": result}
 
 
 async def _codex_agent_run_background_task(task_id: str, payload: CodexAgentTurnRequest) -> None:
@@ -20112,16 +21253,21 @@ async def _codex_agent_run_background_task(task_id: str, payload: CodexAgentTurn
         return
     if runtime.resume_warning:
         _codex_agent_add_task_event(task_id, {"method": "warning", "params": {"message": runtime.resume_warning, "thread_id": runtime.thread_id}})
+    with _codex_agent_task_lock:
+        task = _codex_agent_tasks.get(task_id)
+        if task is not None:
+            task["native_tools_enabled"] = runtime.native_tools_enabled
     refs: List[Dict[str, Any]] = []
     ref_errors: List[str] = []
     try:
         task_canvas_context = dict(payload.canvas_context or {}) if isinstance(payload.canvas_context, dict) else {}
         task_canvas_context["_agent_user_text"] = payload.text
+        task_canvas_context["_native_tools_enabled"] = runtime.native_tools_enabled
         if payload.attachments:
             async with httpx.AsyncClient() as client:
                 for item in payload.attachments:
                     try:
-                        refs.append(await _codex_agent_prepare_local_image(item, _codex_agent_effective_project_dir(payload.project_dir), client))
+                        refs.append(await _codex_agent_prepare_attachment(item, _codex_agent_effective_project_dir(payload.project_dir), client))
                     except Exception as e:
                         ref_errors.append(f"{item}: {e}")
         image_refs = [ref for ref in refs if str(ref.get("kind") or "image").lower() == "image"]
@@ -20131,23 +21277,27 @@ async def _codex_agent_run_background_task(task_id: str, payload: CodexAgentTurn
             _codex_agent_add_task_event(task_id, {"method": "error", "params": {"message": f"ref download failed: {err}"}})
         pending_turn_text = turn_text
         pending_image_refs = image_refs
-        for tool_round in range(3):
+        for tool_round in range(1 if runtime.native_tools_enabled else 3):
             query_results_for_followup: List[Dict[str, Any]] = []
             async for event in runtime.send_user_message(pending_turn_text, pending_image_refs):
                 _codex_agent_add_task_event(task_id, event)
                 method = str(event.get("method") or "")
                 params = event.get("params") or {}
                 item = params.get("item") if isinstance(params, dict) else {}
+                if method == "item/tool/call" and runtime.native_tools_enabled:
+                    await _codex_agent_handle_native_tool_call(task_id, runtime, event, refs, task_canvas_context)
+                    continue
                 if method == "item/completed" and isinstance(item, dict):
                     if str(item.get("type") or "") == "agentMessage":
                         agent_text = str(item.get("text") or "")
-                        tool_results = await _codex_agent_execute_tools_from_text(task_id, agent_text, refs, task_canvas_context)
-                        query_results_for_followup.extend([res for res in tool_results if res.get("query")])
-                        await _codex_agent_execute_actions_from_text(task_id, agent_text, refs, task_canvas_context)
+                        if not runtime.native_tools_enabled:
+                            tool_results = await _codex_agent_execute_tools_from_text(task_id, agent_text, refs, task_canvas_context)
+                            query_results_for_followup.extend([res for res in tool_results if res.get("query")])
+                            await _codex_agent_execute_actions_from_text(task_id, agent_text, refs, task_canvas_context)
                     if str(item.get("type") or "") == "imageGeneration":
                         await _codex_agent_add_generated_image(task_id, str(item.get("savedPath") or item.get("path") or ""), str(item.get("prompt") or ""), refs, task_canvas_context)
                 if method == "turn/completed":
-                    if query_results_for_followup and tool_round < 2:
+                    if not runtime.native_tools_enabled and query_results_for_followup and tool_round < 2:
                         pending_turn_text = _codex_agent_canvas_tool_result_text(query_results_for_followup)
                         pending_image_refs = []
                         _codex_agent_add_task_event(task_id, {
@@ -20159,6 +21309,7 @@ async def _codex_agent_run_background_task(task_id: str, payload: CodexAgentTurn
                     _codex_agent_add_task_event(task_id, {"method": "task/completed", "params": {"task_id": task_id}})
                     return
                 if method in {"fatal", "error", "turn/timeout"}:
+                    await runtime.fail_pending_dynamic_tools("本轮已超时或失败，工具调用未执行")
                     message = ""
                     if isinstance(params, dict):
                         message = str(params.get("message") or params.get("error") or "")
@@ -20170,10 +21321,18 @@ async def _codex_agent_run_background_task(task_id: str, payload: CodexAgentTurn
         _codex_agent_set_task_status(task_id, "completed")
         _codex_agent_add_task_event(task_id, {"method": "task/completed", "params": {"task_id": task_id}})
     except asyncio.CancelledError:
+        try:
+            await runtime.fail_pending_dynamic_tools("用户停止了当前任务，工具调用未执行")
+        except Exception:
+            pass
         _codex_agent_set_task_status(task_id, "stopped", error="stopped by user")
         _codex_agent_add_task_event(task_id, {"method": "task/completed", "params": {"task_id": task_id, "status": "stopped"}})
         raise
     except Exception as exc:
+        try:
+            await runtime.fail_pending_dynamic_tools("任务异常结束，工具调用未执行")
+        except Exception:
+            pass
         _codex_agent_set_task_status(task_id, "failed", error=str(exc))
         _codex_agent_add_task_event(task_id, {"method": "error", "params": {"message": str(exc)}})
         _codex_agent_add_task_event(task_id, {"method": "task/completed", "params": {"task_id": task_id, "status": "failed"}})
@@ -20343,13 +21502,16 @@ async def codex_agent_turn(payload: CodexAgentTurnRequest):
         async with httpx.AsyncClient() as client:
             for item in payload.attachments:
                 try:
-                    refs.append(await _codex_agent_prepare_local_image(item, _codex_agent_effective_project_dir(payload.project_dir), client))
+                    refs.append(await _codex_agent_prepare_attachment(item, _codex_agent_effective_project_dir(payload.project_dir), client))
                 except Exception as e:
                     ref_errors.append(f"{item}: {e}")
 
     image_refs = [ref for ref in refs if str(ref.get("kind") or "image").lower() == "image"]
-    context_text = _codex_agent_build_turn_context_text(payload.project_dir, refs, payload.canvas_context, payload)
+    direct_canvas_context = dict(payload.canvas_context or {}) if isinstance(payload.canvas_context, dict) else {}
+    direct_canvas_context["_native_tools_enabled"] = runtime.native_tools_enabled
+    context_text = _codex_agent_build_turn_context_text(payload.project_dir, refs, direct_canvas_context, payload)
     turn_text = f"{context_text}\n\n用户请求：\n{payload.text}" if context_text else payload.text
+    canvas_id = _codex_agent_canvas_id_from_payload(payload)
 
     async def event_stream():
         if runtime.resume_warning:
@@ -20360,6 +21522,11 @@ async def codex_agent_turn(payload: CodexAgentTurnRequest):
             yield f"data: {data}\n\n"
         try:
             async for event in runtime.send_user_message(turn_text, image_refs):
+                if str(event.get("method") or "") == "item/tool/call" and runtime.native_tools_enabled:
+                    native_result = await _codex_agent_execute_direct_native_tool_call(runtime, event, canvas_id, refs, direct_canvas_context)
+                    yield "data: " + json.dumps({"method": "canvas/tool_call", "params": {"tool": native_result.get("tool"), "query": native_result.get("query"), "native": True}}, ensure_ascii=False) + "\n\n"
+                    yield "data: " + json.dumps({"method": "canvas/tool_result", "params": {**native_result, "native": True}}, ensure_ascii=False) + "\n\n"
+                    continue
                 data = json.dumps(event, ensure_ascii=False)
                 yield f"data: {data}\n\n"
         except Exception as e:
@@ -20471,22 +21638,58 @@ async def codex_agent_action_resolve(payload: CodexAgentActionResolveRequest):
             raise HTTPException(status_code=404, detail="待确认动作不存在或已处理")
         if pending.get("status") != "pending":
             raise HTTPException(status_code=409, detail="待确认动作已处理")
-        pending["status"] = "resolving" if decision in {"approve", "run", "execute"} else "skipped"
+        if task.get("status") not in {"queued", "running"}:
+            raise HTTPException(status_code=409, detail="当前任务已结束，不能再执行待确认动作")
+        pending["status"] = "resolving" if decision in {"approve", "run", "execute", "run_generation", "create_nodes"} else "skipped"
         canvas_id = task.get("canvas_id", "")
+        runtime_key = str(task.get("runtime_key") or "")
 
-    if decision not in {"approve", "run", "execute"}:
+    native_tool = pending.get("kind") in {"native_tool", "generation_action"}
+    generation_action = pending.get("kind") == "generation_action"
+    runtime = None
+    if native_tool:
+        with _codex_agent_lock:
+            runtime = _codex_agent_sessions.get(runtime_key)
+        if not runtime:
+            with _codex_agent_task_lock:
+                task = _codex_agent_tasks.get(payload.task_id)
+                stored = task.get("pending_action_approvals", {}).get(payload.approval_id) if task else None
+                if isinstance(stored, dict):
+                    stored["status"] = "pending"
+            raise HTTPException(status_code=409, detail="原生工具会话已结束，不能继续执行")
+
+    if decision not in {"approve", "run", "execute", "run_generation", "create_nodes"}:
+        result = {
+            "ok": True,
+            "approval_id": payload.approval_id,
+            "tool": pending.get("tool") or "",
+            "changed": 0,
+            "skipped": len(pending.get("actions") or []),
+            "results": [],
+            "message": "用户跳过了待确认画布动作",
+        }
+        if native_tool:
+            await runtime.respond_dynamic_tool_call(pending.get("request_id"), _codex_agent_dynamic_tool_response({**result, "ok": False}, success=False))
         _codex_agent_add_task_event(payload.task_id, {
             "method": "canvas/action_result",
-            "params": {"ok": True, "approval_id": payload.approval_id, "changed": 0, "skipped": len(pending.get("actions") or []), "results": [], "message": "用户跳过了待确认画布动作"},
+            "params": result,
         })
-        return {"ok": True, "decision": "skipped", "result": {"changed": 0, "skipped": len(pending.get("actions") or [])}}
+        return {"ok": True, "decision": "skipped", "result": result}
 
-    result = await _codex_agent_apply_canvas_actions(
-        str(canvas_id or ""),
-        pending.get("actions") if isinstance(pending.get("actions"), list) else [],
-        pending.get("refs") if isinstance(pending.get("refs"), list) else [],
-        pending.get("canvas_context") if isinstance(pending.get("canvas_context"), dict) else {},
-    )
+    if generation_action and decision in {"approve", "run", "execute", "run_generation"}:
+        generation = pending.get("generation") if isinstance(pending.get("generation"), dict) else {}
+        result = await _codex_agent_submit_generation(
+            str(canvas_id or ""), generation,
+            pending.get("refs") if isinstance(pending.get("refs"), list) else [],
+            pending.get("canvas_context") if isinstance(pending.get("canvas_context"), dict) else {},
+        )
+    else:
+        result = await _codex_agent_apply_canvas_actions(
+            str(canvas_id or ""),
+            pending.get("actions") if isinstance(pending.get("actions"), list) else [],
+            pending.get("refs") if isinstance(pending.get("refs"), list) else [],
+            pending.get("canvas_context") if isinstance(pending.get("canvas_context"), dict) else {},
+        )
     with _codex_agent_task_lock:
         task = _codex_agent_tasks.get(payload.task_id)
         if task:
@@ -20496,8 +21699,14 @@ async def codex_agent_action_resolve(payload: CodexAgentActionResolveRequest):
                 stored["resolved_at"] = _codex_agent_now()
     event_result = dict(result)
     event_result["approval_id"] = payload.approval_id
+    if pending.get("tool"):
+        event_result["tool"] = pending.get("tool")
+    if native_tool:
+        responded = await runtime.respond_dynamic_tool_call(pending.get("request_id"), _codex_agent_dynamic_tool_response(event_result))
+        if not responded:
+            event_result["response_warning"] = "原生工具调用已结束，结果未能回传给 Agent"
     _codex_agent_add_task_event(payload.task_id, {"method": "canvas/action_result", "params": event_result})
-    return {"ok": True, "decision": "approved", "result": event_result}
+    return {"ok": bool(event_result.get("ok", True)), "decision": "approved", "result": event_result}
 
 
 @app.post("/api/codex-agent/tools/canvas")

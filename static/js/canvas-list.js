@@ -467,7 +467,7 @@ function openCanvas(c){
     const project = encodeURIComponent(c.project || currentProjectId || 'default');
     rememberProjectId(c.project || currentProjectId || 'default');
     window.location.href = (c.kind === 'smart')
-        ? `/static/smart-canvas.html?id=${enc}&project=${project}&v=2026.07.03.4`
+        ? `/static/smart-canvas.html?id=${enc}&project=${project}&v=2026.07.10.1`
         : `/static/canvas.html?id=${enc}&project=${project}&v=2026.07.03.4`;
 }
 

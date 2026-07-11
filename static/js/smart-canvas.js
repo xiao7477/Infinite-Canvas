@@ -6011,6 +6011,54 @@ function smartAgentFindOpenTopLeft(base, size, options={}){
         y:Math.round(base.y || 0)
     };
 }
+function smartAgentVisibleWorldRect(){
+    const scale = safeScale(viewport.scale);
+    const width = Math.max(1, shell?.clientWidth || window.innerWidth || 1) / scale;
+    const height = Math.max(1, shell?.clientHeight || window.innerHeight || 1) / scale;
+    return {x:-viewport.x / scale, y:-viewport.y / scale, width, height};
+}
+function smartAgentFindOpenInViewport(size, options={}){
+    const width = Number(size?.width) || Number(options.boxWidth) || 300;
+    const height = Number(size?.height) || Number(options.boxHeight) || 240;
+    const visible = smartAgentVisibleWorldRect();
+    const inset = Number(options.viewportInset) || 28;
+    if(width + inset * 2 > visible.width || height + inset * 2 > visible.height) return null;
+    const existing = nodes.map(nodeRect);
+    const cellX = Math.max(width + (Number(options.gapX) || 48), 160);
+    const cellY = Math.max(height + (Number(options.gapY) || 36), 140);
+    const center = {x:visible.x + visible.width / 2, y:visible.y + visible.height / 2};
+    // Start in the centre and expand in rings, so the closest visible blank area wins.
+    for(let ring = 0; ring <= 8; ring++){
+        for(let row = -ring; row <= ring; row++){
+            for(let col = -ring; col <= ring; col++){
+                if(Math.max(Math.abs(row), Math.abs(col)) !== ring) continue;
+                const rect = {
+                    x:Math.round(center.x - width / 2 + col * cellX),
+                    y:Math.round(center.y - height / 2 + row * cellY),
+                    width,
+                    height
+                };
+                if(rect.x < visible.x + inset || rect.y < visible.y + inset
+                    || rect.x + width > visible.x + visible.width - inset
+                    || rect.y + height > visible.y + visible.height - inset) continue;
+                if(!existing.some(other => smartAgentRectIntersects(rect, other, Number(options.collisionPad) || 36))){
+                    return {x:rect.x, y:rect.y};
+                }
+            }
+        }
+    }
+    return null;
+}
+function smartAgentVisibleNodesBounds(){
+    const visible = smartAgentVisibleWorldRect();
+    const visibleNodes = nodes.map(nodeRect).filter(rect => smartAgentRectIntersects(rect, visible, 0));
+    if(!visibleNodes.length) return null;
+    const left = Math.min(...visibleNodes.map(rect => rect.x));
+    const top = Math.min(...visibleNodes.map(rect => rect.y));
+    const right = Math.max(...visibleNodes.map(rect => rect.x + rect.width));
+    const bottom = Math.max(...visibleNodes.map(rect => rect.y + rect.height));
+    return {x:left, y:top, right, bottom, width:right - left, height:bottom - top};
+}
 function smartAgentGridPoint(index, total, options={}){
     const cellX = Number(options.cellX) || 360;
     const cellY = Number(options.cellY) || 330;
@@ -6028,6 +6076,21 @@ function smartAgentGridPoint(index, total, options={}){
         const topLeft = smartAgentFindOpenTopLeft(base, {width:boxWidth, height:boxHeight}, options);
         if(options.returnTopLeft) return {x:topLeft.x, y:topLeft.y};
         return {x:Math.round(topLeft.x + boxWidth / 2), y:Math.round(topLeft.y + boxHeight / 2)};
+    }
+    const hasExplicitPoint = Number.isFinite(Number(options.x)) || Number.isFinite(Number(options.y));
+    if(!hasExplicitPoint && boxWidth > 0 && boxHeight > 0){
+        const topLeft = smartAgentFindOpenInViewport({width:boxWidth, height:boxHeight}, options);
+        if(topLeft){
+            if(options.returnTopLeft) return topLeft;
+            return {x:Math.round(topLeft.x + boxWidth / 2), y:Math.round(topLeft.y + boxHeight / 2)};
+        }
+        // A full viewport: continue from the nearby visible node group instead of jumping away.
+        const group = baseRect || smartAgentVisibleNodesBounds();
+        if(group){
+            const nearby = smartAgentFindOpenTopLeft({x:group.right + 48, y:group.y}, {width:boxWidth, height:boxHeight}, options);
+            if(options.returnTopLeft) return nearby;
+            return {x:Math.round(nearby.x + boxWidth / 2), y:Math.round(nearby.y + boxHeight / 2)};
+        }
     }
     const baseX = Number.isFinite(Number(options.x))
         ? Number(options.x)
@@ -6067,14 +6130,13 @@ function smartAgentFocusNodes(ids=[]){
     const minY = Math.min(...rects.map(r => r.y));
     const maxX = Math.max(...rects.map(r => r.x + r.width));
     const maxY = Math.max(...rects.map(r => r.y + r.height));
-    if(targetNodes.length > 1){
-        const pad = 180;
-        const width = Math.max(1, maxX - minX + pad);
-        const height = Math.max(1, maxY - minY + pad);
-        viewport.scale = Math.max(0.08, Math.min(1.05, (shell.clientWidth - 80) / width, (shell.clientHeight - 80) / height));
-    }else{
-        viewport.scale = Math.max(0.18, Math.min(1.2, safeScale(viewport.scale)));
-    }
+    // 单节点使用视窗九宫格；多节点则将整体边界铺满约 90% 视口。
+    // 两种定位都不沿用用户当前缩放。
+    const width = Math.max(1, maxX - minX);
+    const height = Math.max(1, maxY - minY);
+    const targetWidth = targetNodes.length > 1 ? shell.clientWidth * .9 : shell.clientWidth / 3;
+    const targetHeight = targetNodes.length > 1 ? shell.clientHeight * .9 : shell.clientHeight / 3;
+    viewport.scale = Math.max(0.04, Math.min(4, targetWidth / width, targetHeight / height));
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
     viewport.x = shell.clientWidth / 2 - cx * viewport.scale;
@@ -6908,6 +6970,20 @@ function installSmartCanvasAgentApi(){
             const selected = selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean);
             const refs = [];
             selected.forEach(node => {
+                if(node.type === 'smart-prompt'){
+                    const text = String(node.text || '').trim();
+                    refs.push({
+                        refId:`ref_${refs.length + 1}`,
+                        name:node.title || '提示词节点',
+                        kind:'prompt',
+                        text,
+                        nodeId:node.id,
+                        imageIndex:'',
+                        nodeTitle:node.title || '',
+                        canvasKind:'smart'
+                    });
+                    return;
+                }
                 (node.images || []).forEach((img, index) => {
                     if(!img?.url) return;
                     refs.push({
@@ -6940,6 +7016,9 @@ function installSmartCanvasAgentApi(){
             }
             refs.forEach((ref, index) => { ref.refId = `ref_${index + 1}`; });
             return refs;
+        },
+        getSelectedNodeCount(){
+            return selectedNodeIds().length;
         },
         getAllAssets(){
             const refs = [];

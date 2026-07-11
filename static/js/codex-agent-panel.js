@@ -23,6 +23,10 @@
     sessions: [],
     histAllSessions: [],
     histMode: 'current',
+    historySort: 'last_used',
+    projectSort: 'last_used',
+    histSortMenuOpen: false,
+    projectSortMenuOpen: false,
     histExpandedDirs: {},
     attachments: [],      // [{url, name, kind, nodeId, imageIndex, canvasKind}] 待发给 Codex 的素材附件
     projectsLoading: false,
@@ -123,6 +127,10 @@
     return safeStr(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
   function escapeAttr(s) { return escapeHtml(safeStr(s)); }
+  function icon(name) { return `<i data-lucide="${escapeAttr(name)}" aria-hidden="true"></i>`; }
+  function refreshPanelIcons() {
+    if (window.lucide?.createIcons) window.lucide.createIcons({ attrs: { 'stroke-width': 1.8 } });
+  }
   function workdirLabel(dir) { return safeStr(dir).trim() || '无目录'; }
   function workdirMetaLabel(dir) { return safeStr(dir).trim() || '无目录'; }
   function hasWorkdirSelection() { return Boolean(state.workdirReady); }
@@ -220,7 +228,10 @@
   }
 
   function ensureProcessBlock(botMsg) {
-    let block = botMsg.blocks.find(b => b.type === 'process');
+    // 工具组只合并与自己相邻的调用。这样新的文字回复会自然把下一组
+    // 工具/命令放在它之后，而不是把整轮调用都堆到消息顶部。
+    let block = botMsg.blocks[botMsg.blocks.length - 1];
+    if (block?.type !== 'process') block = null;
     if (!block) {
       block = {
         type: 'process',
@@ -250,6 +261,7 @@
         }
       });
     });
+    if (status !== 'running' && !botMsg.completedAt) botMsg.completedAt = Date.now();
   }
 
   function addProcessStep(botMsg, step = {}) {
@@ -282,15 +294,16 @@
 
   function updateProcessToolResult(botMsg, params = {}, result = {}, nodes = []) {
     const tool = safeStr(params.tool || params.name || result.tool);
-    const block = ensureProcessBlock(botMsg);
-    const steps = Array.isArray(block.steps) ? block.steps : [];
     let step = null;
-    for (let i = steps.length - 1; i >= 0; i -= 1) {
-      const candidate = steps[i];
-      if (!candidate || candidate.kind !== 'canvas_query') continue;
-      if (!tool || safeStr(candidate.tool) === tool) {
-        step = candidate;
-        break;
+    for (let blockIndex = botMsg.blocks.length - 1; blockIndex >= 0 && !step; blockIndex -= 1) {
+      const steps = Array.isArray(botMsg.blocks[blockIndex]?.steps) ? botMsg.blocks[blockIndex].steps : [];
+      for (let i = steps.length - 1; i >= 0; i -= 1) {
+        const candidate = steps[i];
+        if (!candidate || candidate.kind !== 'canvas_query') continue;
+        if (!tool || safeStr(candidate.tool) === tool) {
+          step = candidate;
+          break;
+        }
       }
     }
     if (!step) {
@@ -353,9 +366,9 @@
         <button class="cm-proj" id="cm-proj" title="点击选择项目文件夹">
           <span class="cm-proj-empty">— 选择项目 —</span>
         </button>
-        <button class="cm-icon-btn" id="cm-new" title="新对话">＋</button>
-        <button class="cm-icon-btn" id="cm-history" title="历史会话">≡</button>
-        <button class="cm-icon-btn" id="cm-close" title="关闭">×</button>
+        <button class="cm-icon-btn" id="cm-new" title="新对话" aria-label="新对话">${icon('plus')}</button>
+        <button class="cm-icon-btn" id="cm-history" title="历史会话" aria-label="历史会话">${icon('history')}</button>
+        <button class="cm-icon-btn" id="cm-close" title="关闭" aria-label="关闭">${icon('x')}</button>
       </div>
       <div class="cm-popover" id="cm-proj-pop"></div>
       <div class="cm-popover" id="cm-hist-pop"></div>
@@ -368,11 +381,11 @@
       </div>
       <div class="cm-foot">
         <div class="cm-composer">
+          <div class="cm-ref-rail cm-attach-list" id="cm-attach-list"></div>
           <div class="cm-input cm-input-disabled" id="cm-input" contenteditable="false" data-placeholder="输入消息，回车发送（Shift+Enter 换行）"></div>
-          <span class="cm-attach-list" id="cm-attach-list"></span>
           <div class="cm-composer-bar">
             <div class="cm-toolbar-left">
-              <button class="cm-tool-btn" id="cm-attach-canvas" title="添加画布已选素材">＋<span id="cm-attach-count">0</span></button>
+              <button class="cm-tool-btn" id="cm-attach-canvas" title="添加当前画布选中节点">＋<span id="cm-attach-count">0</span></button>
               <button class="cm-tool-btn" id="cm-at" title="@ 引用附件或画布对象">@</button>
               <button class="cm-tool-btn" id="cm-slash" title="/ 命令">/</button>
             </div>
@@ -383,16 +396,26 @@
           </div>
         </div>
         <div class="cm-foot-row">
+          <span class="cm-foot-selection" id="cm-selection-hint">选中 0 节点</span>
           <span class="cm-foot-hint" id="cm-hint">未选项目</span>
         </div>
       </div>
     `;
     document.body.appendChild(panel);
+    refreshPanelIcons();
 
     $('#cm-close').addEventListener('click', togglePanel);
-    $('#cm-proj').addEventListener('click', toggleProjPop);
+    $('#cm-proj').addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleProjPop();
+    });
     $('#cm-new').addEventListener('click', onNewSession);
-    $('#cm-history').addEventListener('click', toggleHistPop);
+    $('#cm-history').addEventListener('click', (e) => {
+      // 图标 SVG 的点击会继续冒泡到 document；显式截断，避免刚打开的
+      // 历史下拉被全局“点到外面关闭”逻辑立即收起。
+      e.stopPropagation();
+      toggleHistPop();
+    });
     $('#cm-send').addEventListener('click', onSend);
     $('#cm-input').addEventListener('keydown', onInputKey);
     $('#cm-input').addEventListener('input', onInputAssist);
@@ -410,6 +433,7 @@
     restorePanelSnapshot();
     setStatusUI();
     renderAttach();
+    window.setInterval(updateSelectionHint, 450);
     queueMicrotask(bootstrapPanelRestore);
   }
 
@@ -568,6 +592,7 @@
           project_dir: safeStr(p.project_dir),
           session_count: Number(p.conversation_count || 0),
           last_active: p.last_conversation_at || p.updated_at || p.last_opened_at || '',
+          created_at: p.created_at || p.createdAt || 0,
           thread_id: p.latest_thread_id || '',
           conversation_id: p.latest_conversation_id || '',
           source: 'canvas-agent',
@@ -579,13 +604,14 @@
           project_dir: '',
           session_count: 0,
           last_active: '',
+          created_at: 0,
           thread_id: '',
           conversation_id: '',
           source: 'no-project',
           fixed: true,
         });
       }
-      state.projects.sort((a, b) => safeStr(b.last_active || '').localeCompare(safeStr(a.last_active || '')));
+      sortProjectsInPlace(state.projects);
       const latest = state.projects.find(p => p.conversation_id || p.thread_id);
       if (!options.noAutoSelect && !state.workdirReady && state.open && latest && !autoSelectProjectInFlight && !restoreInFlight) {
         autoSelectProjectInFlight = true;
@@ -644,9 +670,11 @@
         `);
       }
       html.push(`
-        <div class="cm-popover-footer">
-          <button class="cm-popover-action" id="cm-workdir-add" title="添加工作目录">＋</button>
-          <button class="cm-popover-action${state.projectDeleteMode ? ' cm-popover-action-active' : ''}" id="cm-workdir-manage" title="隐藏工作目录">－</button>
+        <div class="cm-popover-footer cm-popover-icon-actions">
+          <button class="cm-popover-action cm-popover-action-icon" id="cm-workdir-add" title="添加工作目录" aria-label="添加工作目录">${icon('folder-plus')}</button>
+          <button class="cm-popover-action cm-popover-action-icon${state.projectDeleteMode ? ' cm-popover-action-active' : ''}" id="cm-workdir-manage" title="隐藏工作目录" aria-label="隐藏工作目录">${icon('folder-minus')}</button>
+          <button class="cm-popover-action cm-popover-action-icon${state.projectSortMenuOpen ? ' cm-popover-action-active' : ''}" id="cm-workdir-sort" title="排序：${state.projectSort === 'created' ? '添加时间' : '最新使用时间'}" aria-label="排序">${icon('arrow-up-down')}</button>
+          ${renderSortMenu('project')}
         </div>
       `);
     }
@@ -665,11 +693,22 @@
         hideProjectForCanvas(btn.getAttribute('data-dir'));
       });
     });
-    $('#cm-workdir-add')?.addEventListener('click', openWorkdirDialog);
-    $('#cm-workdir-manage')?.addEventListener('click', () => {
+    $('#cm-workdir-add')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openWorkdirDialog();
+    });
+    $('#cm-workdir-manage')?.addEventListener('click', (e) => {
+      e.stopPropagation();
       state.projectDeleteMode = !state.projectDeleteMode;
       renderProjPop();
     });
+    $('#cm-workdir-sort')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.projectSortMenuOpen = !state.projectSortMenuOpen;
+      renderProjPop();
+    });
+    bindSortMenu(pop, 'project');
+    refreshPanelIcons();
   }
 
   async function openWorkdirDialog() {
@@ -860,18 +899,27 @@
     const projectDir = safeStr(dir);
     try {
       let threadId = options.conversationId ? safeStr(options.threadId || '') : '';
+      let restoredConversation = null;
       if (options.conversationId) {
-        const restored = await fetchHistoryConversation(options.conversationId);
-        if (restored) {
-          applyPanelStateSnapshot(restored, { silent: true });
-          state.conversationId = safeStr(restored.conversationId || restored.conversation_id || options.conversationId);
-          threadId = state.threadId || threadId;
+        showConversationRecoveryPlaceholder('恢复对话中');
+        restoredConversation = await fetchHistoryConversation(options.conversationId);
+        if (restoredConversation) {
+          threadId = safeStr(restoredConversation.threadId || restoredConversation.thread_id || threadId);
         }
       } else {
         state.conversationId = '';
         state.threadId = threadId;
       }
-      await openExecutionThread(projectDir, threadId);
+      let restoredApplied = false;
+      await openExecutionThread(projectDir, threadId, () => {
+        if (!restoredConversation) return;
+        applyPanelStateSnapshot(restoredConversation, { silent: true });
+        restoredApplied = true;
+      });
+      if (restoredConversation && !restoredApplied) {
+        applyPanelStateSnapshot(restoredConversation, { silent: true });
+        state.conversationId = safeStr(restoredConversation.conversationId || restoredConversation.conversation_id || options.conversationId);
+      }
       state.workdirReady = true;
       await unhideProjectForCanvas(projectDir);
       updateBusy('正在加载历史');
@@ -969,6 +1017,59 @@
     }
   }
 
+  function timeValue(value) {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+    const raw = safeStr(value).trim();
+    if (!raw) return 0;
+    if (/^\d+$/.test(raw)) return Number(raw);
+    const parsed = Date.parse(raw);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function sortByHistoryPreference(items, preference) {
+    const field = preference === 'created' ? 'created_at' : 'updated_at';
+    return [...(Array.isArray(items) ? items : [])].sort((a, b) => {
+      const aTime = timeValue(a?.[field] || (preference === 'created' ? a?.createdAt : a?.last_active || a?.started_at));
+      const bTime = timeValue(b?.[field] || (preference === 'created' ? b?.createdAt : b?.last_active || b?.started_at));
+      return bTime - aTime;
+    });
+  }
+
+  function sortProjectsInPlace(projects) {
+    const sorted = sortByHistoryPreference(projects, state.projectSort);
+    projects.splice(0, projects.length, ...sorted);
+  }
+
+  function renderSortMenu(target) {
+    const preference = target === 'project' ? state.projectSort : state.historySort;
+    const open = target === 'project' ? state.projectSortMenuOpen : state.histSortMenuOpen;
+    if (!open) return '';
+    return `<div class="cm-sort-menu" role="menu">
+      <button type="button" data-sort-target="${target}" data-sort="created" class="${preference === 'created' ? 'cm-sort-selected' : ''}">按添加时间排序</button>
+      <button type="button" data-sort-target="${target}" data-sort="last_used" class="${preference === 'last_used' ? 'cm-sort-selected' : ''}">按最新使用时间排序</button>
+    </div>`;
+  }
+
+  function bindSortMenu(container, target) {
+    container.querySelectorAll(`[data-sort-target="${target}"]`).forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const preference = btn.getAttribute('data-sort') === 'created' ? 'created' : 'last_used';
+        if (target === 'project') {
+          state.projectSort = preference;
+          state.projectSortMenuOpen = false;
+          sortProjectsInPlace(state.projects);
+          renderProjPop();
+        } else {
+          state.historySort = preference;
+          state.histSortMenuOpen = false;
+          renderHistPop();
+        }
+      });
+    });
+  }
+
   function toggleHistPop() {
     if (!hasWorkdirSelection()) { alert('先选工作目录，或选择“无目录”'); return; }
     if (isLockedStatus()) { showHint(state.busyLabel || '正在加载，请稍等'); return; }
@@ -976,6 +1077,7 @@
     state.projPopOpen = false;
     state.mentionOpen = false;
     state.commandOpen = false;
+    state.histSortMenuOpen = false;
     renderProjPop();
     closeMentionPicker();
     closeCommandPicker();
@@ -990,18 +1092,21 @@
     const currentActive = state.histMode !== 'all';
     const html = [`
       <div class="cm-hist-tabs">
-        <button class="${currentActive ? 'cm-hist-tab-active' : ''}" data-mode="current">当前</button>
-        <button class="${!currentActive ? 'cm-hist-tab-active' : ''}" data-mode="all">全部</button>
+        <button class="cm-hist-tab-icon${currentActive ? ' cm-hist-tab-active' : ''}" data-mode="current" title="当前工作目录" aria-label="当前工作目录">${icon('folder-open')}</button>
+        <button class="cm-hist-tab-icon${!currentActive ? ' cm-hist-tab-active' : ''}" data-mode="all" title="全部工作目录" aria-label="全部工作目录">${icon('folders')}</button>
+        <button class="cm-hist-tab-icon${state.histSortMenuOpen ? ' cm-hist-tab-active' : ''}" id="cm-history-sort" title="排序：${state.historySort === 'created' ? '添加时间' : '最新使用时间'}" aria-label="排序">${icon('arrow-up-down')}</button>
+        ${renderSortMenu('history')}
       </div>
     `];
     if (currentActive) {
-      if (state.sessions.length === 0) {
+      const sessions = sortByHistoryPreference(state.sessions, state.historySort);
+      if (sessions.length === 0) {
         html.push('<div class="cm-popover-empty">当前工作目录暂无历史会话</div>');
       } else {
-        html.push(state.sessions.map(s => renderSessionItem(s)).join(''));
+        html.push(sessions.map(s => renderSessionItem(s)).join(''));
       }
     } else {
-      const grouped = groupSessionsByProject(state.histAllSessions);
+      const grouped = groupSessionsByProject(sortByHistoryPreference(state.histAllSessions, state.historySort));
       if (!grouped.length) {
         html.push('<div class="cm-popover-empty">当前画布暂无历史会话</div>');
       } else {
@@ -1025,10 +1130,20 @@
       btn.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        state.histMode = btn.getAttribute('data-mode') === 'all' ? 'all' : 'current';
+        const mode = btn.getAttribute('data-mode');
+        if (!mode) return;
+        state.histMode = mode === 'all' ? 'all' : 'current';
         renderHistPop();
       });
     });
+    $('#cm-history-sort')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      state.histSortMenuOpen = !state.histSortMenuOpen;
+      renderHistPop();
+    });
+    bindSortMenu(pop, 'history');
+    refreshPanelIcons();
     pop.querySelectorAll('.cm-hist-group-head').forEach(btn => {
       btn.addEventListener('click', (e) => {
         e.preventDefault();
@@ -1094,15 +1209,24 @@
     if (!beginPanelOperation('loading_history', '正在恢复会话', { status: 'loading_history' })) return;
     try {
       let threadId = safeStr(sessionId || '');
+      let restored = null;
       if (options.conversationId) {
-        const restored = await fetchHistoryConversation(options.conversationId);
+        showConversationRecoveryPlaceholder('恢复对话中');
+        restored = await fetchHistoryConversation(options.conversationId);
         if (restored) {
-          applyPanelStateSnapshot(restored, { silent: true });
-          state.conversationId = safeStr(restored.conversationId || restored.conversation_id || options.conversationId);
-          threadId = state.threadId || threadId;
+          threadId = safeStr(restored.threadId || restored.thread_id || threadId);
         }
       }
-      await openExecutionThread(state.projectDir, threadId);
+      let restoredApplied = false;
+      await openExecutionThread(state.projectDir, threadId, () => {
+        if (!restored) return;
+        applyPanelStateSnapshot(restored, { silent: true });
+        restoredApplied = true;
+      });
+      if (restored && !restoredApplied) {
+        applyPanelStateSnapshot(restored, { silent: true });
+        state.conversationId = safeStr(restored.conversationId || restored.conversation_id || options.conversationId);
+      }
       state.workdirReady = true;
       updateBusy('正在加载历史');
       await loadSessions(state.projectDir);
@@ -1115,6 +1239,14 @@
       alert('恢复会话失败：' + e.message);
       endPanelOperation('error');
     }
+  }
+
+  function showConversationRecoveryPlaceholder(label = '恢复对话中') {
+    state.messages = [];
+    currentBackendTaskId = '';
+    currentBackendTaskOffset = 0;
+    setRecovering('loading_history', label);
+    renderBody({ preserveScroll: false });
   }
 
   // ---------------- 附件管理 ----------------
@@ -1275,10 +1407,12 @@
   function addAttachment(item) {
     try {
       const url = normalizeAttachmentUrl(item.url || item.path || item.src);
-      if (!url) return false;
-      const existed = state.attachments.find(a => normalizeAttachmentUrl(a.url || a.path || a.src) === url);
+      const normalized = { ...item, url, refId: `ref_${state.attachments.length + 1}` };
+      const key = attachmentIdentity(normalized);
+      if (!key) return false;
+      const existed = state.attachments.find(a => attachmentIdentity(a) === key);
       if (existed) return false;
-      state.attachments.push({ ...item, url, refId: `ref_${state.attachments.length + 1}` });
+      state.attachments.push(normalized);
       renderAttach();
       return true;
     } catch {
@@ -1632,6 +1766,24 @@
     });
   }
 
+  function attachmentIdentity(item) {
+    const data = item && typeof item === 'object' ? item : {};
+    const nodeId = safeStr(data.nodeId || data.node_id);
+    const kind = safeStr(data.kind || '');
+    const imageIndex = data.imageIndex ?? data.image_index ?? '';
+    const url = normalizeAttachmentUrl(data.url || data.path || data.src);
+    if (nodeId && kind === 'prompt') return `prompt:${nodeId}`;
+    if (nodeId && url) return `node:${nodeId}:${imageIndex}:${url}`;
+    return url ? `url:${url}` : '';
+  }
+
+  function selectedNodeCount() {
+    const native = window.SmartCanvasAgentApi;
+    if (typeof native?.getSelectedNodeCount === 'function') return Number(native.getSelectedNodeCount() || 0);
+    const context = native?.getContext?.();
+    return Array.isArray(context?.selectedNodeIds) ? context.selectedNodeIds.length : CanvasAgentBridge.getSelectedAssets().length;
+  }
+
   function removeAttach(idx) {
     state.attachments.splice(idx, 1);
     normalizeAttachmentRefs();
@@ -1652,15 +1804,32 @@
     const count = $('#cm-attach-count');
     if (count) count.textContent = String(state.attachments.length);
     if (!list) return;
-    list.innerHTML = state.attachments.map((a, i) => {
+    if (!state.attachments.length) {
+      list.hidden = true;
+      list.innerHTML = '';
+      savePanelSnapshot();
+      return;
+    }
+    list.hidden = false;
+    const itemHtml = state.attachments.map((a, i) => {
       const kind = safeStr(a.kind || mediaKindFromUrl(a.url));
       const preview = attachmentPreviewHtml(a, kind, 'cm-attach-kind');
-      return `<div class="cm-attach-thumb" data-i="${i}" draggable="true" title="图${i + 1} · ${escapeAttr(a.name)} · ${escapeAttr(a.url)}">
+      const promptTip = kind === 'prompt' ? `<span class="cm-ref-prompt-tip"><b>${escapeHtml(safeStr(a.nodeTitle || a.name || '提示词节点'))}</b><span>${escapeHtml(safeStr(a.text || a.prompt || ''))}</span></span>` : '';
+      return `<div class="cm-attach-thumb" data-i="${i}" data-node-id="${escapeAttr(a.nodeId || a.node_id || '')}" draggable="true" title="引用 ${i + 1} · ${escapeAttr(a.name || a.nodeTitle || kind)}">
         ${preview}
         <span class="cm-attach-index">${i + 1}</span>
         <span class="cm-attach-x" data-i="${i}" title="移除">×</span>
+        ${promptTip}
       </div>`;
     }).join('');
+    list.innerHTML = `<div class="cm-ref-scroll">${itemHtml}</div>
+      <div class="cm-ref-actions">
+        <button class="cm-ref-action" type="button" data-ref-action="clear" title="清空引用">${icon('trash-2')}</button>
+      </div>`;
+    list.querySelector('[data-ref-action="clear"]')?.addEventListener('click', () => {
+      state.attachments = [];
+      renderAttach();
+    });
     list.querySelectorAll('.cm-attach-thumb').forEach(thumb => {
       thumb.addEventListener('dragstart', e => {
         const i = thumb.getAttribute('data-i');
@@ -1694,6 +1863,25 @@
         removeAttach(parseInt(x.getAttribute('data-i'), 10));
       });
     });
+    list.querySelectorAll('.cm-attach-thumb').forEach(thumb => {
+      thumb.addEventListener('mouseenter', () => {
+        const tip = thumb.querySelector('.cm-ref-prompt-tip');
+        if (!tip) return;
+        const rect = thumb.getBoundingClientRect();
+        tip.style.left = `${Math.min(window.innerWidth - 205, rect.right + 7)}px`;
+        tip.style.top = `${Math.min(window.innerHeight - 76, rect.top)}px`;
+      });
+    });
+    list.addEventListener('dblclick', event => {
+      const thumb = event.target.closest('.cm-attach-thumb');
+      if (!thumb || !list.contains(thumb)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const nodeId = safeStr(thumb.dataset.nodeId);
+      const focused = nodeId ? window.SmartCanvasAgentApi?.focusNodes?.([nodeId]) : false;
+      showHint(focused ? '已定位引用节点' : '未能定位引用节点');
+    });
+    refreshPanelIcons();
     savePanelSnapshot();
   }
 
@@ -1706,6 +1894,9 @@
     }
     if (mediaKind === 'video') {
       return `<video src="${url}" muted playsinline preload="metadata"></video><span class="cm-video-badge">▶</span>`;
+    }
+    if (mediaKind === 'prompt') {
+      return `<span class="${fallbackClass} cm-attach-prompt-icon">${icon('scroll-text')}</span>`;
     }
     return `<span class="${fallbackClass}">${escapeHtml(mediaKind.toUpperCase().slice(0, 5))}</span>`;
   }
@@ -2387,11 +2578,13 @@
     return d;
   }
 
-  async function openExecutionThread(projectDir, threadId = '') {
+  async function openExecutionThread(projectDir, threadId = '', onRebuild = null) {
     try {
       return await openProjectSession(projectDir, threadId);
     } catch (e) {
       if (!threadId) throw e;
+      if (typeof onRebuild === 'function') onRebuild();
+      setRecovering('opening_project', '正在重建执行线程');
       return await openProjectSession(projectDir, '');
     }
   }
@@ -2842,14 +3035,14 @@
       const approvalId = safeStr(params.approval_id);
       botMsg.blocks.push({
         type: 'choice',
-        title: params.risk === 'high' ? '高风险画布动作需要确认' : '画布动作需要确认',
+        title: params.tool === 'generate_images' || params.tool === 'generate_videos' ? '生成任务确认' : (params.risk === 'high' ? '高风险画布动作需要确认' : '画布动作需要确认'),
         text: safeStr(params.reason || '确认后才会修改画布'),
         status: 'pending',
         task_id: safeStr(params.task_id || currentBackendTaskId),
         approval_id: approvalId,
         risk: safeStr(params.risk || 'normal'),
         actions: Array.isArray(params.actions) ? params.actions : [],
-        options: [
+        options: Array.isArray(params.options) ? params.options : [
           { label: '执行', value: 'approve', action: 'resolve_canvas_action' },
           { label: '跳过', value: 'skip', action: 'resolve_canvas_action' },
         ],
@@ -3258,13 +3451,17 @@
     send.classList.toggle('cm-send-stop', state.status === 'busy');
 
     const hint = $('#cm-hint');
-    hint.classList.toggle('cm-foot-hint-busy', state.status === 'busy' || recovering);
-    if (state.status === 'busy' || recovering) {
-      const elapsed = state.busyStartedAt ? formatElapsed(Date.now() - state.busyStartedAt) : '00:00';
-      hint.innerHTML = renderBusyHint(elapsed, state.busyLabel || '正在思考');
-    }
-    else if (!state.workdirReady) hint.textContent = '未选工作目录';
-    else hint.textContent = `${workdirLabel(state.projectDir)} · thread: ${(state.threadId || '').slice(0, 8)}… · 自动上下文`;
+    hint.classList.remove('cm-foot-hint-busy');
+    hint.textContent = state.workdirReady ? workdirLabel(state.projectDir) : '未选工作目录';
+    updateSelectionHint();
+  }
+
+  function updateSelectionHint() {
+    const target = $('#cm-selection-hint');
+    if (!target) return;
+    target.textContent = isRecoveringStatus()
+      ? (state.busyLabel || '恢复对话中')
+      : `选中 ${selectedNodeCount()} 节点`;
   }
 
   function renderBusyHint(elapsed, label) {
@@ -3287,6 +3484,7 @@
     }
     const oldScroll = options.preserveScroll ? (state.scrollTop || body.scrollTop || 0) : 0;
     body.innerHTML = state.messages.map(renderMessage).join('');
+    refreshPanelIcons();
     bindCodeCopyButtons(body);
     bindMessageActionButtons(body);
     body.scrollTop = options.preserveScroll ? oldScroll : body.scrollHeight;
@@ -3307,52 +3505,54 @@
       html += `<div class="cm-msg-user">${escapeHtml(normalized.text)}</div>`;
       return `<div class="cm-msg cm-msg-user-wrap">${html}</div>`;
     }
-    const blocks = orderBotBlocksForRender(coalesceBotBlocksForRender(msg.blocks || []));
-    const blocksHtml = blocks.map(renderBlock).filter(Boolean).join('');
-    return `<div class="cm-msg cm-msg-bot-wrap">${blocksHtml}</div>`;
+    const blocks = coalesceBotBlocksForRender(msg.blocks || []);
+    const thinkingBlocks = blocks.filter(block => block.type === 'thinking');
+    const contentBlocks = blocks.filter(block => block.type !== 'thinking');
+    const mergedThinking = thinkingBlocks.map(block => normalizeThinkingText(block.text)).filter(Boolean).join('\n\n');
+    const thinkingHtml = mergedThinking ? renderBlock({ type: 'thinking', text: mergedThinking }) : '';
+    const summaryHtml = renderTurnSummary(msg, blocks);
+    const blocksHtml = contentBlocks.map(renderBlock).filter(Boolean).join('');
+    return `<div class="cm-msg cm-msg-bot-wrap">${thinkingHtml}${blocksHtml}${summaryHtml}</div>`;
   }
 
-  function orderBotBlocksForRender(blocks) {
-    const processBlocks = blocks.filter(block => block.type === 'process');
-    if (!processBlocks.length) return blocks;
-    const rest = blocks.filter(block => block.type !== 'process');
-    let insertAt = -1;
-    rest.forEach((block, index) => {
-      if (block.type === 'thinking') insertAt = index;
-    });
-    const next = rest.slice();
-    next.splice(insertAt >= 0 ? insertAt + 1 : 0, 0, ...processBlocks);
-    return next;
+  function renderTurnSummary(msg, blocks) {
+    const processBlocks = blocks.filter(block => block.type === 'process' && Array.isArray(block.steps) && block.steps.length);
+    if (!processBlocks.length) return '';
+    const startedCandidates = [Number(msg.startedAt || 0), ...processBlocks.map(block => Number(block.startedAt || 0))].filter(Boolean);
+    const endedCandidates = [Number(msg.completedAt || msg.endedAt || 0), ...processBlocks.map(block => Number(block.endedAt || 0))].filter(Boolean);
+    const started = startedCandidates.length ? Math.min(...startedCandidates) : 0;
+    const ended = endedCandidates.length ? Math.max(...endedCandidates) : 0;
+    const duration = started && ended ? formatDurationHuman(Math.max(0, ended - started)) : '';
+    const completedAt = ended ? new Date(ended).toLocaleString() : '';
+    return `<div class="cm-turn-summary" tabindex="0" title="${escapeAttr(completedAt ? `完成于 ${completedAt}` : '本轮对话正在处理')}">
+      <span class="cm-turn-summary-icon">${icon('clock-3')}</span><span>${ended ? '已处理' : '处理中'}${duration ? ` ${escapeHtml(duration)}` : ''}</span>
+      ${completedAt ? `<small>完成于 ${escapeHtml(completedAt)}</small>` : ''}
+    </div>`;
   }
 
   function coalesceBotBlocksForRender(blocks) {
     const out = [];
-    let process = null;
-    const ensure = () => {
-      if (!process) {
-        process = {
-          type: 'process',
-          title: '工具与命令',
-          status: 'done',
-          startedAt: 0,
-          endedAt: 0,
-          steps: [],
-        };
-      }
-      return process;
-    };
     (Array.isArray(blocks) ? blocks : []).forEach(block => {
       if (!block || typeof block !== 'object') return;
       if (block.type === 'process') {
-        const target = ensure();
-        target.status = block.status || target.status;
-        target.startedAt = target.startedAt || block.startedAt || 0;
-        target.endedAt = block.endedAt || target.endedAt || 0;
-        target.steps.push(...(Array.isArray(block.steps) ? block.steps : []));
+        const previous = out[out.length - 1];
+        if (previous?.type === 'process') {
+          previous.status = block.status || previous.status;
+          previous.startedAt = previous.startedAt || block.startedAt || 0;
+          previous.endedAt = block.endedAt || previous.endedAt || 0;
+          previous.steps.push(...(Array.isArray(block.steps) ? block.steps : []));
+        } else {
+          out.push({ ...block, steps: [...(Array.isArray(block.steps) ? block.steps : [])] });
+        }
         return;
       }
       if (block.type === 'tool_call' || block.type === 'tool_result') {
-        ensure().steps.push({
+        let target = out[out.length - 1];
+        if (target?.type !== 'process') {
+          target = { type: 'process', title: '工具与命令', status: block.status || 'done', steps: [] };
+          out.push(target);
+        }
+        target.steps.push({
           kind: block.type,
           label: block.title || block.tool || '工具调用',
           tool: block.tool || block.command || '',
@@ -3364,7 +3564,6 @@
       }
       out.push(block);
     });
-    if (process && process.steps.length) out.push(process);
     return out;
   }
 
@@ -3528,29 +3727,37 @@
     const steps = Array.isArray(b.steps) ? b.steps.filter(Boolean) : [];
     if (!steps.length) return '';
     const running = b.status === 'running';
-    const started = Number(b.startedAt || 0);
-    const ended = Number(b.endedAt || 0);
-    const duration = started ? formatDurationHuman((running ? Date.now() : (ended || Date.now())) - started) : '';
-    const completedAt = ended ? new Date(ended).toLocaleString() : '';
-    const summary = running ? '工具与命令' : `已处理${duration ? ` ${duration}` : ''}`;
+    const commandCount = steps.filter(step => safeStr(step.kind) === 'command').length;
+    const toolCount = steps.length - commandCount;
+    const summaryParts = [];
+    if (commandCount) summaryParts.push(`${running ? '正在执行' : '已执行'} ${commandCount} 项命令执行`);
+    if (toolCount) summaryParts.push(`${commandCount ? '' : (running ? '正在执行 ' : '已执行 ')}${toolCount} 项工具调用`);
+    const summary = summaryParts.join('，') || (running ? '正在处理' : '已处理');
     const rows = steps.map(step => {
       const status = blockStatusLabel(step.status);
       const tool = safeStr(step.tool);
       const command = safeStr(step.command);
       const summaryText = safeStr(step.summary);
       const label = safeStr(step.label || '处理');
-      const detail = safeStr(step.output || step.detail);
+      const rawDetail = safeStr(step.output || step.detail);
+      const repeatedToolDetail = tool && /^(?:工具\s*[:：]\s*)/.test(rawDetail) && rawDetail.replace(/^(?:工具\s*[:：]\s*)/, '').trim() === tool;
+      const detail = rawDetail === command || rawDetail === tool || repeatedToolDetail ? '' : rawDetail;
+      const stepIcon = safeStr(step.kind) === 'command'
+        ? 'terminal'
+        : (safeStr(step.kind) === 'canvas_query' || safeStr(step.kind) === 'webSearch' ? 'search' : 'wrench');
       return `<div class="cm-process-step">
-        <span>${escapeHtml(label)}</span>
-        ${tool || command ? `<code>${escapeHtml(tool || command)}</code>` : ''}
-        <em>${escapeHtml(summaryText || status)}</em>
+        <div class="cm-process-step-head">
+          ${icon(stepIcon)}
+          <span>${escapeHtml(label)}</span>
+          <em>${escapeHtml(summaryText || status)}</em>
+        </div>
+        ${tool || command ? `<code class="cm-process-step-command">${escapeHtml(tool || command)}</code>` : ''}
         ${detail ? `<small>${escapeHtml(detail)}</small>` : ''}
       </div>`;
     }).join('');
-    return `<details class="cm-process${running ? ' cm-process-running' : ''}" title="${escapeAttr(completedAt ? `完成于 ${completedAt}` : '展开查看工具与命令详情')}">
+    return `<details class="cm-process${running ? ' cm-process-running' : ''}" title="展开查看详情">
       <summary><span>${escapeHtml(summary)}</span></summary>
       <div class="cm-process-detail">
-        <div class="cm-process-title">工具与命令${completedAt ? ` · 完成于 ${escapeHtml(completedAt)}` : ''}</div>
         ${rows}
       </div>
     </details>`;
@@ -3559,21 +3766,54 @@
   function renderCanvasActionResultBlock(b) {
     const changed = Number(b.changed || 0);
     const skipped = Number(b.skipped || 0);
-    const fallbackText = `影响 ${changed} 个节点${skipped ? `，跳过 ${skipped} 项` : ''}`;
-    const rawText = safeStr(b.text || b.summary);
-    const text = /(?:smart|prompt|loop)_[A-Za-z0-9_-]+/.test(rawText) ? fallbackText : (rawText || fallbackText);
-    const nodes = Array.isArray(b.nodes) ? b.nodes.slice(0, 4) : [];
+    const resultRows = Array.isArray(b.results) ? b.results : [];
+    const resultNodes = resultRows.flatMap(row => Array.isArray(row?.items) ? row.items : []).filter(Boolean);
+    const nodes = (resultNodes.length ? resultNodes : (Array.isArray(b.nodes) ? b.nodes : [])).slice(0, 8);
+    const countByKind = new Map();
+    const nodeKind = (type, node) => {
+      const action = safeStr(type).toLowerCase();
+      if (/generate.*video|video_generation/.test(action)) return '视频节点';
+      if (/generate.*image|image_generation/.test(action)) return '生图节点';
+      if (/add_text|create_text/.test(action)) return '文本节点';
+      if (/add_prompt|create_prompt/.test(action)) return '提示词节点';
+      if (/add_loop|create_loop/.test(action)) return '循环节点';
+      if (/add_media|add_image|add_video|create_media/.test(action)) return '媒体节点';
+      if (/group/.test(action)) return '分组节点';
+      const nodeType = safeStr(node?.type).toLowerCase();
+      if (nodeType === 'smart-loop') return '循环节点';
+      if (nodeType === 'smart-prompt') return safeStr(node?.title).toLowerCase() === 'text' ? '文本节点' : '提示词节点';
+      return nodeType === 'smart-image' ? '图片节点' : '节点';
+    };
+    resultRows.forEach(row => {
+      const items = Array.isArray(row?.items) ? row.items : [];
+      items.forEach(node => {
+        const kind = nodeKind(row?.type, node);
+        countByKind.set(kind, (countByKind.get(kind) || 0) + 1);
+      });
+    });
+    if (!countByKind.size) nodes.forEach(node => {
+      const kind = nodeKind('', node);
+      countByKind.set(kind, (countByKind.get(kind) || 0) + 1);
+    });
+    const countText = [...countByKind.entries()].map(([kind, count]) => `${count}个${kind}`).join('，');
+    const generationOnly = [...countByKind.keys()].every(kind => kind === '生图节点' || kind === '视频节点');
+    const summary = countText
+      ? `${generationOnly ? '已生成' : '已创建'} ${countText}`
+      : `已完成画布操作${changed ? `，影响 ${changed} 个节点` : ''}${skipped ? `，跳过 ${skipped} 项` : ''}`;
     const nodeRows = nodes.map(node => {
       const id = safeStr(node.id);
       const label = safeStr(node.title || node.name || node.type || '节点');
       const xy = `${Math.round(Number(node.x || 0))}, ${Math.round(Number(node.y || 0))}`;
       return `<button class="cm-node-chip" data-node-id="${escapeAttr(id)}" title="定位节点">${escapeHtml(label)} <span>@ ${escapeHtml(xy)}</span></button>`;
     }).join('');
-    return `<div class="cm-agent-block cm-canvas-action-block">
-      <div class="cm-block-head"><span>画布动作</span><b>已执行</b><em>影响 ${changed} / 跳过 ${skipped}</em></div>
-      <div class="cm-block-text">${escapeHtml(text)}</div>
+    return `<details class="cm-agent-block cm-canvas-action-block" open>
+      <summary title="展开或折叠画布动作">
+        <span class="cm-canvas-action-icon">${icon('sparkles')}</span>
+        <b>${escapeHtml(summary)}</b>
+        <em>影响 ${changed} / 跳过 ${skipped}</em>
+      </summary>
       ${nodeRows ? `<div class="cm-node-chip-row">${nodeRows}</div>` : ''}
-    </div>`;
+    </details>`;
   }
 
   function renderProgressBlock(b) {
@@ -3689,7 +3929,7 @@
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(safeStr(d.detail) || `HTTP ${r.status}`);
-      markApprovalBlockResolved(approvalId, decision === 'approve' ? 'approved' : 'skipped');
+      markApprovalBlockResolved(approvalId, ['approve', 'run', 'execute', 'run_generation', 'create_nodes'].includes(decision) ? 'approved' : 'skipped');
       const result = d.result || {};
       if (d.decision === 'approved') {
         appendCanvasActionResultBlock(result);

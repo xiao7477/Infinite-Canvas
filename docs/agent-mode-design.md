@@ -50,9 +50,17 @@ The backend starts `codex app-server` with `cwd = project_dir`, prepares selecte
 
 Runtime identity is not just `project_dir`. Active runtime sessions are keyed by the current canvas, Canvas Agent conversation, project directory, and bottom Codex thread pointer when needed. `codex_thread_id` is only an execution pointer; if App Server cannot resume it, the backend creates a fresh Codex thread, keeps the same Canvas Agent conversation visible, and emits a warning block instead of losing history.
 
-`POST /api/codex-agent/tools/canvas` is the first internal Canvas Tools bridge. It supports structured query tools (`get_selected_nodes`, `get_viewport_nodes`, `get_node_detail`, `get_connected_nodes`, `get_canvas_summary`) and low-risk operations (`move_nodes`, `arrange_nodes`, `rename_assets`, `group_nodes`, `ungroup_nodes`). The model-facing transition protocol is `canvas_agent_tool`: when the Agent emits a hidden fenced `canvas_agent_tool` JSON block, the backend executes the tool, persists a typed tool result event, and, for query tools, sends the result back into the same App Server thread so the Agent can answer from real canvas data.
+Canvas Tools use App Server native experimental `dynamicTools` as their primary path. At `thread/start`/`thread/resume`, the backend registers the `infinite_canvas` namespace and handles App Server's server-initiated `item/tool/call` requests with structured results. Registered queries are `get_selected_nodes`, `get_viewport_nodes`, `get_canvas_summary`, `search_canvas_nodes`, `get_node_detail`, and `get_connected_nodes`; mutations cover media/prompt/text/loop/generation-node creation, rename, move, arrange, group, ungroup, and explicit preference storage. `generate_images` and `generate_videos` submit provider tasks from the backend and persist task ids on the smart-canvas nodes; `create_*_generation_nodes` remains the node-only alternative.
 
-Background tasks live in service memory. They survive page refreshes and closed browser tabs while `main.py` keeps running, but they are not yet durable across server restarts.
+The composer’s reference rail accepts selected image, video, and `smart-prompt` nodes. It is hidden until references exist, then provides a single horizontally scrollable row with add/clear controls. Media references are prepared as temporary local files for App Server image input; prompt-node references remain ordered text context and are never downloaded as media. The rail preserves order and `@图N` numbering and focuses the source node on double click.
+
+Tool schemas are intentionally narrow: creation accepts bounded item batches and explicit generation fields, target operations accept only node/ref targets and known move/rename fields, and layout options are enumerated. Unknown fields are rejected by the native Tool schema instead of being interpreted as a broad canvas operation.
+
+The current App Server dynamic-tools interface is experimental, so a runtime retries without `dynamicTools` only when registration itself is unsupported. That fallback alone enables the older hidden `canvas_agent_tool` / `canvas_agent_action` JSON protocol; a native runtime never parses those blocks, preventing duplicate execution. Missing or ambiguous query targets return structured errors rather than empty successful results.
+
+Agent-created generation tasks are recorded in `history.sqlite` with the local task id, provider task id when available, canvas/node linkage, request payload, status, result, and error. They survive refreshes and service restarts. On startup, tasks with a durable provider task id resume polling automatically; a request that was interrupted before its provider exposed a reusable id is marked `interrupted` rather than being silently re-submitted and potentially charged twice, and can be retried through a Tool.
+
+Generation queue Tools are `get_generation_queue`, `get_generation_task`, `cancel_generation_task`, and `retry_generation_task`. Cancellation is only allowed while a job is still locally queued. Once it has entered provider execution or has an upstream task id, cancellation is refused and the node remains running; this avoids displaying a false “cancelled” state for work that will still be billed and completed upstream. `delete_nodes` and `undo_last_agent_action` are registered mutation Tools and always require high-risk confirmation, even when the panel is set to automatic execution. Agent mutations store a private pre-action canvas snapshot outside the canvas schema so the most recent Agent action can be restored without changing original node or connection IDs.
 
 Agent panel chat state is persisted outside user project folders. The Canvas Agent now owns its history list instead of using Codex native sessions as the UI source:
 
@@ -80,9 +88,13 @@ The floating panel top bar keeps the compact layout:
 work directory dropdown / new conversation / history dropdown / close
 ```
 
-The work directory dropdown lists only directories used by the current canvas and always includes `无目录`. The `+` button opens an add-workdir dialog with manual absolute-path entry plus server-side preset roots and their direct child folders. The `-` button enters directory-management mode; deleting a directory only hides it from the current canvas directory list through `project_visibility`, and does not delete conversations or messages.
+The work directory dropdown lists only directories used by the current canvas and always includes `无目录`. Its compact left-aligned icon controls expose add (`+`), directory-management (`−`), and sorting (`↕`) on hover. The sort menu supports `按添加时间排序` and `按最新使用时间排序`. The add control opens an add-workdir dialog with manual absolute-path entry plus server-side preset roots and their direct child folders. Directory-management only hides a directory from the current canvas directory list through `project_visibility`; it never deletes conversations or messages.
 
-The history dropdown has `当前 / 全部`: `当前` shows sessions under the selected work directory, while `全部` groups every current-canvas session by work directory. Selecting a session from another group switches the work directory first, then restores that conversation.
+The history dropdown has compact hover-labelled Lucide icon controls for `当前` (`folder-open`), `全部` (`folders`), and sorting (`arrow-up-down`). They use the same 24px borderless visual language as the top panel actions. `当前` shows sessions under the selected work directory, while `全部` groups every current-canvas session by work directory; both views support `按添加时间排序` and `按最新使用时间排序`. Selecting a session from another group switches the work directory first, then restores that conversation.
+
+Within an Agent reply, adjacent tool and command events are rendered as a single collapsible summary at their original position in the reply stream (for example, after one paragraph and before the next). Its one-line count places commands before tools; expanded entries are border cards with a Lucide type icon, status, command/tool name, and output. The summary contains no time or repeated `工具与命令` title. A separate reply-level `已处理 · 耗时` line stays at the top of the reply and reveals the whole-turn completion timestamp only on hover.
+
+Canvas-action result cards are compact, default-expanded `<details>` blocks: the title uses an icon plus a created-node summary such as `已生成 2个生图节点` or `已创建 1个提示词节点，2个生图节点`; the expanded content contains only node locator chips. Backend-hosted generation writes `runStartedAt`, `runFinishedAt`, and `runElapsedMs` to the node so its completed duration remains correct after refresh.
 
 `无目录` is a first-class Canvas Agent mode for chat and canvas-only operations. Its UI/history project key is the empty string, and the backend runs Codex in:
 
@@ -375,11 +387,11 @@ Current implementation status:
 - `@` opens the attachment/reference picker and inserts `@图N` tokens.
 - `/` opens a command picker for common canvas tasks such as organize, rename, prompt generation, image/video node creation, summarize, locate, and batch processing.
 - Mode/scope/approval buttons currently cycle lightweight state and are included in the turn canvas context as `agentInput`.
-- Approval policy is active for backend canvas actions:
-  - `自动执行`: run `canvas_agent_action` immediately.
-  - `高风险确认`: pause high-risk or broad canvas actions and show a confirmation block.
-  - `执行前确认`: pause every canvas action and show a confirmation block.
-- Confirmation blocks persist as typed `choice` blocks and call `/api/codex-agent/action/resolve` to execute or skip the pending action.
+- Approval policy applies to canvas write Tools; read-only context queries always run automatically:
+  - `自动执行`: run every write Tool immediately, including backend-hosted image/video generation.
+  - `高风险确认`: pause video generation, ungrouping, preference storage, and broad (3+ targets or full-canvas) rename/move/arrange/group/image-generation actions. The confirmation includes node count, planned image/video count, and selected provider/model. It does not invent a credit quote; only larger workloads show a “may consume substantial credits” warning. It offers direct task submission, node-only creation, or cancellation.
+  - `执行前确认`: pause every write Tool.
+- Confirmation blocks persist as typed `choice` blocks and call `/api/codex-agent/action/resolve`. For native Tool calls the pending record also stores the App Server request id; approval or rejection sends the structured Tool result back to the paused turn.
 - The selected mode/scope/approval state is kept in the local panel snapshot and sent to backend panel-state.
 
 ### Context Engineering
@@ -405,7 +417,7 @@ Current implementation status:
 
 - The Agent panel builds a `contextProfile` for each turn from input mode, scope, attachments, slash command, and message text.
 - The visible input no longer asks users to manually choose "operate canvas" or "current viewport"; context is routed automatically from user intent, attachments, slash command, and selection state.
-- The frontend still sends the full send-time canvas snapshot to the backend so deterministic actions and collision checks can run safely, but the backend stores that snapshot under `~/.codex/infinite-canvas-agent/context-snapshots/` and sends only a minimal App Server envelope to Codex.
+- The frontend still sends the send-time canvas snapshot to the backend so deterministic actions and collision checks can run safely. The backend also captures the real smart-canvas nodes and connections into `~/.codex/infinite-canvas-agent/context-snapshots/`, while sending only a minimal App Server envelope to Codex.
 - Context levels are active:
   - Level 0: pure chat, no node list, no provider list, no canvas coordinates.
   - Level 1: lightweight canvas summary and node counts.
@@ -414,8 +426,8 @@ Current implementation status:
 - Image/video provider defaults are only sent for generation/model-related intents.
 - The backend hidden context includes `context_snapshot_id`, `viewport_snapshot_id`, `context_level`, `context_intent`, selected refs, node counts, and approval policy. It does not include the full node list in prompt text.
 - The bottom hint shows automatic context routing instead of manual mode/scope buttons.
-- Query tools form a first closed loop: the Agent requests `canvas_agent_tool`, the backend executes the Canvas Tool, emits a UI tool block, then feeds the tool result back to App Server for a final answer.
-- Low-risk operation tools execute directly through the same Canvas Tool bridge and render as canvas action result blocks.
+- Query tools read that immutable send-time snapshot by default; `search_canvas_nodes` is paginated and bounded. Write tools re-load the live canvas and re-resolve targets before mutation, so changed/deleted targets are skipped safely.
+- Native Tool results return directly through the paused App Server request and render as chronological tool blocks; no follow-up turn is required.
 
 ### History And Archive UX
 
