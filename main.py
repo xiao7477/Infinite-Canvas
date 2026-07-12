@@ -5196,7 +5196,7 @@ async def run_jimeng_cli(args, timeout=120, raw_text=False):
     out_text, clean_err_text = jimeng_decode_cli_output(stdout, stderr)
     if proc.returncode != 0:
         message = clean_err_text or out_text or f"exit={proc.returncode}"
-        raise HTTPException(status_code=502, detail=f"即梦 CLI 调用失败：{message[:1000]}")
+        raise HTTPException(status_code=502, detail=jimeng_humanize_error(message))
     # 帮助等纯文本输出不应被 JSON 提取吞掉（如 [0.5, 8] 会被误判为结果）
     if raw_text:
         return {"_stdout": out_text, "_stderr": clean_err_text}
@@ -5328,7 +5328,9 @@ def jimeng_pending_payload(exc: "JimengPendingError"):
     qi = exc.queue_info or {}
     idx = qi.get("queue_idx")
     length = qi.get("queue_length")
-    if idx is not None and length is not None:
+    if qi.get("queue_status") == "history_syncing":
+        msg = f"即梦已接收任务，正在同步查询记录；将自动重试。submit_id={exc.submit_id}"
+    elif idx is not None and length is not None:
         msg = f"即梦云端排队中（第 {idx}/{length} 位），任务未丢失，可继续等待或手动查询。submit_id={exc.submit_id}"
     else:
         msg = f"即梦任务仍在生成中，任务未丢失。submit_id={exc.submit_id}"
@@ -5345,13 +5347,43 @@ async def jimeng_pending_exception_handler(request: Request, exc: JimengPendingE
     # 轮询超时但任务还在云端排队：返回 202 + submit_id，让前端保持「排队中」卡片并续查
     return JSONResponse(status_code=202, content=jimeng_pending_payload(exc))
 
+def jimeng_humanize_error(reason):
+    """将 dreamina CLI 的内部英文失败提示转换为适合节点卡片展示的中文。"""
+    raw = str(reason or "").strip()
+    if not raw:
+        return "生成失败"
+    normalized = re.sub(r"\s+", " ", raw).strip()
+    lower = normalized.lower()
+    moderation_tokens = (
+        "material review", "asset review", "material audit", "asset audit",
+        "content review", "content moderation", "content audit", "moderation",
+        "safety review", "safety check", "policy violation", "审核", "风控",
+        "违规", "不合规", "素材不通过", "内容不通过",
+    )
+    if any(token in lower for token in moderation_tokens):
+        return "素材或内容审核未通过，请替换引用素材或调整提示词后重试。"
+    if re.search(r"(?:final )?generation failed|generation fail(?:ed)?", lower):
+        # 该错误没有携带可操作的终态详情，不误报为确定的审核失败。
+        return "生成失败"
+    if "invalid param" in lower or "invalid parameter" in lower or "参数" in normalized:
+        return "生成参数不被即梦支持，请检查模型、尺寸、比例或参考素材后重试。"
+    if "credit" in lower or "余额" in normalized or "积分" in normalized:
+        return "即梦余额或积分不足，请到即梦后台确认可用额度后重试。"
+    # 节点中不显示 CLI 英文内部错误；未知原因只保留简洁的失败状态。
+    return "生成失败"
+
 def jimeng_failure_reason(raw):
     found = []
     def visit(value):
         if isinstance(value, dict):
             status = str(value.get("gen_status") or value.get("status") or "").strip().lower()
-            reason = value.get("fail_reason") or value.get("failReason") or value.get("error") or value.get("message") or value.get("msg")
-            if reason and (status in {"fail", "failed", "error"} or "fail" in str(reason).lower() or "invalid param" in str(reason).lower()):
+            reason = (
+                value.get("fail_reason") or value.get("failReason") or value.get("failure_reason")
+                or value.get("failureReason") or value.get("error_message") or value.get("errorMessage")
+                or value.get("error") or value.get("reason") or value.get("detail")
+                or value.get("message") or value.get("msg")
+            )
+            if reason and (status in {"fail", "failed", "error", "rejected"} or "fail" in str(reason).lower() or "invalid param" in str(reason).lower()):
                 found.append(str(reason))
             for item in value.values():
                 if isinstance(item, (dict, list)):
@@ -5579,12 +5611,21 @@ async def jimeng_query_result(submit_id, kind="image"):
         f"--submit_id={submit_id}",
         f"--download_dir={jimeng_cli_path_arg(OUTPUT_OUTPUT_DIR)}",
     ]
-    return await run_jimeng_cli(args, timeout=min(300, jimeng_poll_seconds() + 60))
+    try:
+        return await run_jimeng_cli(args, timeout=min(300, jimeng_poll_seconds() + 60))
+    except HTTPException as exc:
+        detail = str(getattr(exc, "detail", "") or exc)
+        # `get_history_by_ids ... ret=2008` is emitted by the CLI while the
+        # upstream history record has not propagated yet. The submit id remains
+        # valid, so keep polling instead of painting a false failed node.
+        if re.search(r"get_history_by_ids\s+failed.*(?:ret\s*=\s*2008|ret=2008)", detail, re.I | re.S):
+            raise JimengPendingError(submit_id, kind, {"queue_status": "history_syncing", "retryable": True}, {"retryable_history_error": detail}) from exc
+        raise
 
 async def jimeng_store_outputs(raw, kind="image", allow_query=True):
     failure = jimeng_failure_reason(raw)
     if failure:
-        raise HTTPException(status_code=502, detail=f"即梦生成失败：{failure}")
+        raise HTTPException(status_code=502, detail=jimeng_humanize_error(failure))
     values = jimeng_output_values(raw)
     urls = []
     for value in values:
@@ -8399,6 +8440,21 @@ CHAT_RATIO_SIZE_OPTIONS = {
     "4:3": ("1344x1008", "2048x1536", "3264x2448"),
     "9:16": ("720x1280", "1080x1920", "1440x2560"),
     "16:9": ("1280x720", "1920x1080", "2560x1440"),
+}
+
+# Must mirror smart-canvas.js `SIZE_MAP`: Agent-created nodes are subsequently
+# opened and rerun by that UI, so their concrete size cannot use the older chat
+# table above (notably 9:16 at 2K differs).
+CANVAS_AGENT_IMAGE_SIZE_OPTIONS = {
+    "1:1": ("1024x1024", "2048x2048", "4096x4096"),
+    "2:3": ("1024x1536", "1360x2048", "2352x3520"),
+    "3:2": ("1536x1024", "2048x1360", "3520x2352"),
+    "3:4": ("1008x1344", "1536x2048", "2448x3264"),
+    "4:3": ("1344x1008", "2048x1536", "3264x2448"),
+    "9:16": ("720x1280", "1152x2048", "2160x3840"),
+    "16:9": ("1280x720", "2048x1152", "3840x2160"),
+    "21:9": ("1280x544", "2048x880", "3840x1648"),
+    "9:21": ("544x1280", "880x2048", "1648x3840"),
 }
 
 def chat_prompt_size_override(message, current_size=""):
@@ -12505,6 +12561,10 @@ async def build_online_image_result(payload: OnlineImageRequest):
             image_items = extract_images(raw_item) if isinstance(raw_item, dict) else [image_data]
         except HTTPException:
             image_items = [image_data]
+        # `n` is implemented as one provider request per requested image. Some
+        # CLI/image tools discover multiple output files for one request; keep
+        # only its primary result so "1 张" never turns into a bonus batch.
+        image_items = [item for item in image_items if item][:1]
         local_urls = []
         local_items = []
         for item in image_items:
@@ -17987,8 +18047,10 @@ def _codex_agent_context_envelope_text(
         "你正在 Infinite-Canvas 的 Agent 面板中。默认围绕当前智能画布工作。",
         "不要向用户展示 internal node id、canvas_agent_tool、canvas_agent_action、context snapshot id 或工具协议细节。",
         "按需使用已注册的 infinite_canvas 原生工具查询或操作画布；不要编造画布内容，也不要输出任何 fenced 工具 JSON。",
+        "图片或视频请求只能调用 infinite_canvas.generate_images / generate_videos（或对应的仅创建节点工具）。绝对不要调用 App Server 自带 imageGeneration、$imagegen 或任何其它内置生图能力；否则会绕过画布 provider 设置并可能重复扣费。",
         "可用查询工具: get_selected_nodes, get_viewport_nodes, get_canvas_summary, search_canvas_nodes, get_node_detail, get_connected_nodes, get_generation_queue, get_generation_task。",
         "可用操作工具: create_media_nodes, create_prompt_nodes, create_text_nodes, create_loop_nodes, generate_images, generate_videos, create_image_generation_nodes, create_video_generation_nodes, cancel_generation_task, retry_generation_task, delete_nodes, undo_last_agent_action, rename_assets, move_nodes, arrange_nodes, group_nodes, ungroup_nodes, remember_preference。delete_nodes 和 undo_last_agent_action 始终需要高风险确认。generate_images/generate_videos 会按当前审批策略直接提交任务或请求选择；create_*_generation_nodes 只创建节点。",
+        "用户确认删除后必须调用 delete_nodes；删除当前选中节点时可传 scope:\"selected\"，不要让用户改用键盘 Delete/Backspace。",
         "get_node_detail/get_connected_nodes 必须传 node_id/ref，或 scope:\"selected\"（仅一个选中节点）；不要在没有目标时调用。",
         "位置信息以发送这一刻的 viewport_snapshot_id 为准；用户后续拖动画布不改变本轮语义。",
         "rename_nodes 默认只修改素材显示名 images[index].name，不改真实文件名、不改节点标题，除非用户明确要求。",
@@ -18039,6 +18101,19 @@ def _codex_agent_context_envelope_text(
                 f"  quality: {image_defaults.get('quality') or ''}",
                 f"  count: {image_defaults.get('count') or ''}",
             ])
+            image_providers = image_defaults.get("providers") if isinstance(image_defaults.get("providers"), list) else []
+            if image_providers:
+                lines.append("available_image_providers:")
+                for provider in image_providers[:20]:
+                    if not isinstance(provider, dict):
+                        continue
+                    models = provider.get("image_models") if isinstance(provider.get("image_models"), list) else []
+                    lines.extend([
+                        f"- provider_id: {provider.get('id') or ''}",
+                        f"  name: {provider.get('name') or ''}",
+                        f"  protocol: {provider.get('protocol') or ''}",
+                        f"  models: {', '.join(str(model) for model in models[:16])}",
+                    ])
         if isinstance(video_defaults, dict) and video_defaults:
             lines.extend([
                 "video_generation_defaults:",
@@ -19867,13 +19942,23 @@ async def _codex_agent_apply_canvas_actions(
                     for node_id in _codex_agent_resolve_node_ids(item if isinstance(item, dict) else {"ref": item}, nodes, refs, selected_ids):
                         if node_id not in target_ids:
                             target_ids.append(node_id)
+                # Native tool callers commonly express "删除选中节点" without
+                # repeating opaque node ids. Treat an omitted target as the
+                # captured selection, instead of silently returning no-op.
+                if not target_ids:
+                    target_ids = [node_id for node_id in selected_ids if node_by_id(node_id)]
                 deleted = [node for node in nodes if str(node.get("id") or "") in set(target_ids)]
                 if not deleted:
-                    result(action_type, "skipped", "no nodes to delete")
+                    result(action_type, "skipped", "no selected nodes to delete")
                     continue
                 deleted_ids = {str(node.get("id") or "") for node in deleted}
                 nodes[:] = [node for node in nodes if str(node.get("id") or "") not in deleted_ids]
                 connections[:] = [conn for conn in connections if _codex_agent_connection_value(conn, ("source", "sourceId", "from", "fromNodeId", "start")) not in deleted_ids and _codex_agent_connection_value(conn, ("target", "targetId", "to", "toNodeId", "end")) not in deleted_ids]
+                for node in nodes:
+                    if isinstance(node.get("inputNodeIds"), list):
+                        node["inputNodeIds"] = [node_id for node_id in node["inputNodeIds"] if str(node_id) not in deleted_ids]
+                    if node.get("type") == "smart-group" and isinstance(node.get("items"), list):
+                        node["items"] = [node_id for node_id in node["items"] if str(node_id) not in deleted_ids]
                 changed += len(deleted)
                 result(action_type, "done", f"deleted {len(deleted)} nodes", [_codex_agent_node_summary(node) for node in deleted])
                 continue
@@ -20128,14 +20213,50 @@ async def _codex_agent_apply_canvas_actions(
                 defaults = native.get("videoGeneration" if is_video else "imageGeneration") if isinstance(native, dict) else {}
                 defaults = defaults if isinstance(defaults, dict) else {}
                 created = []
+                # References are a self-contained run configuration: retain their
+                # media/prompt data on the generated node, but do not draw graph
+                # edges. Without references, selection is an upstream workflow
+                # input and therefore gets an input edge and right-side placement.
+                attached_refs = [ref for ref in refs if isinstance(ref, dict)]
+                attached_media = [
+                    {
+                        "url": str(ref.get("url") or ""),
+                        "name": str(ref.get("name") or ""),
+                        "kind": str(ref.get("kind") or "image"),
+                        "nodeId": str(ref.get("nodeId") or ref.get("node_id") or ""),
+                        "imageIndex": ref.get("imageIndex", ref.get("image_index", "")),
+                    }
+                    for ref in attached_refs if str(ref.get("url") or "").strip()
+                ]
+                attached_prompts = [
+                    {"title": str(ref.get("nodeTitle") or ref.get("name") or "提示词节点"), "text": str(ref.get("text") or "").strip(), "nodeId": str(ref.get("nodeId") or ref.get("node_id") or "")}
+                    for ref in attached_refs if str(ref.get("kind") or "").lower() == "prompt" and str(ref.get("text") or "").strip()
+                ]
+                selected_upstreams = [node_id for node_id in selected_ids if node_by_id(node_id)] if not attached_refs else []
+                placement_options = dict(options)
+                if selected_upstreams:
+                    placement_options.setdefault("scope", "node")
+                    placement_options.setdefault("selected", True)
+                    placement_options.setdefault("side", "right")
                 for index, item in enumerate(items):
                     data = {"prompt": item} if isinstance(item, str) else (item if isinstance(item, dict) else {})
                     prompt = str(data.get("prompt") or data.get("text") or "").strip()
                     if not prompt:
                         continue
-                    point = _codex_agent_new_node_point(canvas, index, len(items), options, 360, 240, canvas_context, refs, selected_ids, context_rects)
-                    provider_id = str(data.get("provider_id") or data.get("providerId") or data.get("provider") or defaults.get("provider_id") or "")
-                    model = str(data.get("model") or defaults.get("model") or "")
+                    prompt_context = [entry["text"] for entry in attached_prompts if entry.get("text")]
+                    if prompt_context and not all(entry in prompt for entry in prompt_context):
+                        prompt = "\n\n".join([*prompt_context, prompt])
+                    point = _codex_agent_new_node_point(canvas, index, len(items), placement_options, 360, 240, canvas_context, refs, selected_ids, context_rects)
+                    requested_provider = str(data.get("provider_id") or data.get("providerId") or data.get("provider") or "").strip()
+                    if requested_provider:
+                        resolved_provider = _codex_agent_resolve_generation_provider(requested_provider, is_video=is_video)
+                        if not resolved_provider:
+                            raise HTTPException(status_code=400, detail=f"未找到可用的生成平台「{requested_provider}」")
+                        provider_id = str(resolved_provider.get("id") or "")
+                        model = _codex_agent_generation_model_from_canvas_default(resolved_provider, data.get("model"), defaults, is_video=is_video)
+                    else:
+                        provider_id = str(defaults.get("provider_id") or "")
+                        model = str(data.get("model") or defaults.get("model") or "")
                     run_settings: Dict[str, Any] = {
                         "engine": "api",
                         "apiKind": "video" if is_video else "image",
@@ -20154,8 +20275,16 @@ async def _codex_agent_apply_canvas_actions(
                             "videoGenerateAudio": bool(data.get("generate_audio", defaults.get("generate_audio", False))),
                         })
                     else:
+                        image_size, image_ratio, image_resolution = _codex_agent_image_size_from_item(data, defaults)
                         run_settings.update({
-                            "customSize": data.get("size") or defaults.get("size") or "",
+                            # Keep the concrete request size and the visual controls
+                            # in sync. Previously a 9:16 request only changed
+                            # customSize while ratio stayed square, so the node UI
+                            # displayed 1:1 and a rerun could regress to square.
+                            "ratio": _codex_agent_image_ratio_key(image_ratio),
+                            "resolution": image_resolution,
+                            "customRatio": image_ratio,
+                            "customSize": image_size,
                             "quality": data.get("quality") or defaults.get("quality") or "auto",
                         })
                     node = {
@@ -20173,12 +20302,19 @@ async def _codex_agent_apply_canvas_actions(
                         "runPrompt": prompt,
                         "runModelPrompt": prompt,
                         "runPromptRefs": [],
-                        "runInputRefs": [],
+                        "runInputRefs": attached_media,
+                        "sourcePromptRefs": attached_prompts,
                         "runSettings": run_settings,
                         "runAt": _codex_agent_now(),
                         "created_at": _codex_agent_now(),
                     }
                     nodes.append(node)
+                    for source_id in selected_upstreams:
+                        if source_id == node["id"]:
+                            continue
+                        node.setdefault("inputNodeIds", []).append(source_id)
+                        if not any(str(conn.get("from") or "") == source_id and str(conn.get("to") or "") == node["id"] and str(conn.get("kind") or "input") == "input" for conn in connections):
+                            connections.append({"from": source_id, "to": node["id"], "kind": "input"})
                     created.append(_codex_agent_node_summary(node))
                 changed += len(created)
                 result(action_type, "done" if created else "skipped", f"created {len(created)} generation nodes", created)
@@ -20424,6 +20560,11 @@ async def _codex_agent_add_generated_image(task_id: str, path: str, prompt: str,
     action = {"type": "add_media", "items": [{"path": path, "name": _codex_agent_name_from_url(path, "codex-image.png"), "kind": "image", "prompt": prompt}], "options": {"cols": 1}}
     with _codex_agent_task_lock:
         task = _codex_agent_tasks.get(task_id) or {}
+        if task.get("native_generation_submitted"):
+            # The turn already submitted a provider task through the Canvas Tool.
+            # Ignore an accidental App Server imageGeneration side effect instead
+            # of adding a second image/node to the same user request.
+            return
         key = f"generated-image:{path}"
         seen = task.setdefault("executed_action_keys", set())
         if key in seen:
@@ -20667,6 +20808,146 @@ def _codex_agent_native_tool_actions(tool: str, args: Dict[str, Any]) -> List[Di
     return [action]
 
 
+def _codex_agent_resolve_generation_provider(value: Any, is_video: bool = False) -> Optional[Dict[str, Any]]:
+    """Resolve user-facing provider names without silently falling back.
+
+    `get_api_provider()` intentionally keeps old UI calls working by falling back
+    to the primary provider. That is unsafe for Agent generation: asking for
+    Gemini must never become a RunningHub request merely because `gemini` is an
+    alias rather than the saved provider id `gemini-cli`.
+    """
+    text = str(value or "").strip().lower()
+    providers = [item for item in load_api_providers() if item.get("enabled", True)]
+    if not text:
+        return None
+    exact = next((item for item in providers if text in {str(item.get("id") or "").lower(), str(item.get("name") or "").lower()}), None)
+    if exact:
+        return exact
+    aliases = {
+        "gemini": ("gemini-cli", "gemini"),
+        "gemini cli": ("gemini-cli",),
+        "antigravity": ("gemini-cli",),
+        "antigravity cli": ("gemini-cli",),
+        "agy": ("gemini-cli",),
+        "gpt": ("codex",),
+        "openai": ("codex",),
+        "codex": ("codex",),
+        "gpt cli": ("codex",),
+        "jimeng": ("jimeng",),
+        "即梦": ("jimeng",),
+        "runninghub": ("runninghub",),
+        "rh": ("runninghub",),
+    }
+    wanted = aliases.get(text, ())
+    for provider_id in wanted:
+        item = next((candidate for candidate in providers if str(candidate.get("id") or "").lower() == provider_id), None)
+        if item:
+            return item
+    # Allow a useful partial match for configured custom providers, but only
+    # when it uniquely identifies one. Ambiguity remains an explicit error.
+    matches = [item for item in providers if text in f"{item.get('id') or ''} {item.get('name') or ''} {item.get('protocol') or ''}".lower()]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _codex_agent_generation_model_for_provider(provider: Dict[str, Any], requested_model: Any, is_video: bool = False) -> str:
+    requested = str(requested_model or "").strip()
+    protocol = provider_protocol(provider)
+    generic_names = {"gemini", "gemini cli", "antigravity", "antigravity cli", "agy", "gpt", "openai", "codex", "gpt cli"}
+    if requested.lower() in generic_names:
+        requested = ""
+    if requested:
+        return requested
+    models = provider.get("video_models" if is_video else "image_models") or []
+    if models:
+        return str(models[0] or "")
+    if protocol == "gemini-cli":
+        return GEMINI_CLI_DEFAULT_IMAGE_MODELS[0] if not is_video else ""
+    if protocol == "codex":
+        return CODEX_DEFAULT_IMAGE_MODELS[0] if not is_video else ""
+    return ""
+
+
+def _codex_agent_generation_model_from_canvas_default(
+    provider: Dict[str, Any], requested_model: Any, defaults: Dict[str, Any], is_video: bool = False,
+) -> str:
+    """优先保留画布中已选择的默认模型，Agent 不替用户改选模型。"""
+    requested = str(requested_model or "").strip()
+    generic_names = {"gemini", "gemini cli", "antigravity", "antigravity cli", "agy", "gpt", "openai", "codex", "gpt cli"}
+    if requested.lower() in generic_names:
+        requested = ""
+    if requested:
+        return requested
+    configured_provider = str(defaults.get("provider_id") or "").strip()
+    configured_model = str(defaults.get("model") or "").strip()
+    if configured_model and configured_provider == str(provider.get("id") or ""):
+        return configured_model
+    return _codex_agent_generation_model_for_provider(provider, "", is_video=is_video)
+
+
+def _codex_agent_image_ratio(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("：", ":").replace(" ", "")
+    aliases = {
+        "square": "1:1", "正方形": "1:1", "wide": "16:9", "横版": "16:9", "横屏": "16:9",
+        "story": "9:16", "竖版": "9:16", "竖屏": "9:16", "portrait": "2:3",
+        "landscape": "3:2", "portrait43": "3:4", "landscape43": "4:3",
+        "ultrawide": "21:9", "ultratall": "9:21",
+    }
+    text = aliases.get(text, text)
+    return text if text in CHAT_RATIO_SIZE_OPTIONS else ""
+
+
+def _codex_agent_image_ratio_key(ratio: str) -> str:
+    return {
+        "1:1": "square", "2:3": "portrait", "3:2": "landscape", "3:4": "portrait43",
+        "4:3": "landscape43", "9:16": "story", "16:9": "wide", "21:9": "ultrawide", "9:21": "ultratall",
+    }.get(str(ratio or ""), "square")
+
+
+def _codex_agent_image_resolution_key(data: Dict[str, Any], defaults: Dict[str, Any], ratio: str) -> str:
+    hint = " ".join(str(value or "") for value in (
+        data.get("resolution"), data.get("quality"), data.get("size"), defaults.get("size"), defaults.get("quality"),
+    )).lower()
+    if "4k" in hint or "3840" in hint or "4096" in hint:
+        return "4k"
+    if "2k" in hint or "2048" in hint:
+        return "2k"
+    # A current default size should keep its approximate quality tier when only
+    # the requested aspect changes (e.g. default 1536 square -> 9:16 2K).
+    width, height = parse_size_pair(defaults.get("size") or "")
+    if max(width, height) >= 1900:
+        return "2k"
+    return "1k"
+
+
+def _codex_agent_image_size_from_item(data: Dict[str, Any], defaults: Dict[str, Any]) -> Tuple[str, str, str]:
+    """Return concrete size plus UI ratio/resolution for an Agent image node."""
+    raw_size = str(data.get("size") or "").strip()
+    width, height = parse_size_pair(raw_size)
+    ratio = _codex_agent_image_ratio(data.get("aspect_ratio") or data.get("aspect") or data.get("ratio"))
+    if not ratio and raw_size:
+        ratio = _codex_agent_image_ratio(raw_size)
+    if width and height:
+        if not ratio:
+            divisor = math.gcd(width, height) or 1
+            ratio = _codex_agent_image_ratio(f"{width // divisor}:{height // divisor}")
+        resolution = _codex_agent_image_resolution_key(data, defaults, ratio)
+        return raw_size, ratio or "1:1", resolution
+    if ratio:
+        resolution = _codex_agent_image_resolution_key(data, defaults, ratio)
+        options = CANVAS_AGENT_IMAGE_SIZE_OPTIONS.get(ratio) or CANVAS_AGENT_IMAGE_SIZE_OPTIONS["1:1"]
+        index = {"1k": 0, "2k": 1, "4k": 2}.get(resolution, 0)
+        return options[min(index, len(options) - 1)], ratio, resolution
+    fallback = str(defaults.get("size") or "1024x1024").strip()
+    width, height = parse_size_pair(fallback)
+    if width and height:
+        divisor = math.gcd(width, height) or 1
+        inferred = _codex_agent_image_ratio(f"{width // divisor}:{height // divisor}") or "1:1"
+        return fallback, inferred, _codex_agent_image_resolution_key(data, defaults, inferred)
+    return "1024x1024", "1:1", "1k"
+
+
 def _codex_agent_generation_request(tool: str, args: Dict[str, Any], canvas_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if tool not in {"generate_images", "generate_videos"}:
         return None
@@ -20689,8 +20970,18 @@ def _codex_agent_generation_request(tool: str, args: Dict[str, Any], canvas_cont
             count = max(1, min(8, int(item.get("count") or item.get("n") or defaults.get("count") or 1)))
             item["count"] = count
             image_count += count
-        item.setdefault("provider_id", defaults.get("provider_id") or "")
-        item.setdefault("model", defaults.get("model") or "")
+        requested_provider = str(item.get("provider_id") or item.get("providerId") or item.get("provider") or "").strip()
+        if requested_provider:
+            provider = _codex_agent_resolve_generation_provider(requested_provider, is_video=is_video)
+            if not provider:
+                raise HTTPException(status_code=400, detail=f"未找到可用的生成平台「{requested_provider}」。请使用当前画布已配置的平台名称或 provider_id。")
+            item["provider_id"] = str(provider.get("id") or "")
+            item["model"] = _codex_agent_generation_model_from_canvas_default(provider, item.get("model"), defaults, is_video=is_video)
+        else:
+            item["provider_id"] = str(defaults.get("provider_id") or "")
+            item["model"] = str(item.get("model") or defaults.get("model") or "")
+        if not is_video:
+            item["size"], _ratio, _resolution = _codex_agent_image_size_from_item(item, defaults)
         items.append(item)
     if not items:
         return None
@@ -21102,6 +21393,11 @@ async def _codex_agent_handle_native_tool_call(
             if not approval.get("required"):
                 result = await _codex_agent_submit_generation(canvas_id, generation, refs, canvas_context)
                 result["tool"] = tool
+                if result.get("ok"):
+                    with _codex_agent_task_lock:
+                        task = _codex_agent_tasks.get(task_id)
+                        if task is not None:
+                            task["native_generation_submitted"] = True
                 _codex_agent_add_task_event(task_id, {"method": "canvas/tool_result", "params": {"tool": tool, "query": False, "result": result, "native": True}})
                 await runtime.respond_dynamic_tool_call(request_id, _codex_agent_dynamic_tool_response(result))
                 return
@@ -21683,6 +21979,11 @@ async def codex_agent_action_resolve(payload: CodexAgentActionResolveRequest):
             pending.get("refs") if isinstance(pending.get("refs"), list) else [],
             pending.get("canvas_context") if isinstance(pending.get("canvas_context"), dict) else {},
         )
+        if result.get("ok"):
+            with _codex_agent_task_lock:
+                current_task = _codex_agent_tasks.get(payload.task_id)
+                if current_task is not None:
+                    current_task["native_generation_submitted"] = True
     else:
         result = await _codex_agent_apply_canvas_actions(
             str(canvas_id or ""),

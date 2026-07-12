@@ -67,6 +67,7 @@
   let currentBackendTaskOffset = 0;
   let currentBackendManaged = false;
   let turnStopRequested = false;
+  let activeTurnStatusBlock = null;
   let busyTimer = null;
   let autoSelectProjectInFlight = false;
   let panelOperation = '';
@@ -230,7 +231,15 @@
   function ensureProcessBlock(botMsg) {
     // 工具组只合并与自己相邻的调用。这样新的文字回复会自然把下一组
     // 工具/命令放在它之后，而不是把整轮调用都堆到消息顶部。
-    let block = botMsg.blocks[botMsg.blocks.length - 1];
+    let block = null;
+    for (let index = botMsg.blocks.length - 1; index >= 0; index -= 1) {
+      const candidate = botMsg.blocks[index];
+      // 思考会被统一渲染到消息顶部，临时状态与被清洗为空的协议文本也
+      // 不属于可见时间线；它们不能把相邻工具调用拆成两个工具组。
+      if (isInvisibleTimelineBlock(candidate)) continue;
+      block = candidate;
+      break;
+    }
     if (block?.type !== 'process') block = null;
     if (!block) {
       block = {
@@ -247,6 +256,13 @@
     }
     if (!Array.isArray(block.steps)) block.steps = [];
     return block;
+  }
+
+  function isInvisibleTimelineBlock(block) {
+    if (!block || typeof block !== 'object') return true;
+    if (block.type === 'thinking' || block.type === 'agent_status') return true;
+    if (block.type === 'text') return !cleanAgentDisplayText(safeStr(block.text)).trim();
+    return false;
   }
 
   function finishProcessBlocks(botMsg, status = 'done') {
@@ -549,13 +565,39 @@
       busyTimer = setInterval(setStatusUI, 1000);
     }
     setStatusUI();
+    updateActiveTurnStatus(label);
   }
 
   function updateBusy(label) {
     if (state.status === 'busy' || isRecoveringStatus()) {
       state.busyLabel = label || state.busyLabel || '正在思考';
       setStatusUI();
+      updateActiveTurnStatus(state.busyLabel);
     }
+  }
+
+  function liveTurnStatusLabel(label = '') {
+    const text = safeStr(label);
+    if (/发送|准备选中素材/.test(text)) return '发送中';
+    if (/执行|运行|生成|提交|画布工具/.test(text)) return '运行中';
+    return '思考中';
+  }
+
+  function updateActiveTurnStatus(label) {
+    if (!activeTurnStatusBlock) return;
+    activeTurnStatusBlock.text = liveTurnStatusLabel(label);
+    // The block is deliberately transient, but it must be visible immediately
+    // after send and update while the task is streaming.
+    renderBody();
+  }
+
+  function clearActiveTurnStatus() {
+    if (!activeTurnStatusBlock) return;
+    state.messages.forEach(message => {
+      if (!Array.isArray(message?.blocks)) return;
+      message.blocks = message.blocks.filter(block => block !== activeTurnStatusBlock);
+    });
+    activeTurnStatusBlock = null;
   }
 
   function finishBusy(status = 'ready') {
@@ -2879,6 +2921,8 @@
     clearInput();
 
     const botMsg = { role: 'bot', startedAt: Date.now(), blocks: [] };
+    activeTurnStatusBlock = { type: 'agent_status', text: '发送中' };
+    botMsg.blocks.push(activeTurnStatusBlock);
     state.messages.push(botMsg);
     renderBody();
     closeMentionPicker();
@@ -2920,6 +2964,8 @@
       }
       renderBody();
     }
+    clearActiveTurnStatus();
+    renderBody();
     currentTurnAttachments = [];
     currentBackendManaged = false;
     currentBackendTaskId = '';
@@ -3535,7 +3581,12 @@
     (Array.isArray(blocks) ? blocks : []).forEach(block => {
       if (!block || typeof block !== 'object') return;
       if (block.type === 'process') {
-        const previous = out[out.length - 1];
+        let previous = null;
+        for (let index = out.length - 1; index >= 0; index -= 1) {
+          if (isInvisibleTimelineBlock(out[index])) continue;
+          previous = out[index];
+          break;
+        }
         if (previous?.type === 'process') {
           previous.status = block.status || previous.status;
           previous.startedAt = previous.startedAt || block.startedAt || 0;
@@ -3547,7 +3598,12 @@
         return;
       }
       if (block.type === 'tool_call' || block.type === 'tool_result') {
-        let target = out[out.length - 1];
+        let target = null;
+        for (let index = out.length - 1; index >= 0; index -= 1) {
+          if (isInvisibleTimelineBlock(out[index])) continue;
+          target = out[index];
+          break;
+        }
         if (target?.type !== 'process') {
           target = { type: 'process', title: '工具与命令', status: block.status || 'done', steps: [] };
           out.push(target);
@@ -3654,6 +3710,11 @@
       const text = safeStr(b.text).trim();
       if (!text) return '';
       return `<div class="cm-transient-notice">${escapeHtml(text)}</div>`;
+    }
+    if (type === 'agent_status') {
+      const text = safeStr(b.text).trim();
+      if (!text) return '';
+      return `<div class="cm-agent-status-line"><span class="cm-agent-status-dot" aria-hidden="true"></span>${escapeHtml(text)}</div>`;
     }
     if (type === 'tool_call' || type === 'tool_result') {
       return renderToolBlock(b);

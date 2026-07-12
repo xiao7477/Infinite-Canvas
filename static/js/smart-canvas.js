@@ -4871,6 +4871,10 @@ let canvasSyncInFlight = false;
 let canvasSyncTimer = null;
 let canvasMetaPollTimer = null;
 let connectionLayerRaf = 0;
+// Local deletion tombstones prevent a just-deleted node from being merged back
+// from an older server snapshot while its save is in flight (especially when a
+// generation worker publishes a final failed status at the same moment).
+const smartDeletedNodeIds = new Set();
 function mergeSmartImageLists(localImgs, remoteImgs){
     const out = [];
     const seen = new Set();
@@ -5080,6 +5084,7 @@ function mergeSmartNodeLists(localNodes, remoteNodes){
     (localNodes || []).forEach(n => { if(!seen.has(n.id)){ seen.add(n.id); order.push(n.id); } });
     (remoteNodes || []).forEach(n => { if(!seen.has(n.id)){ seen.add(n.id); order.push(n.id); } });
     return order.map(id => {
+        if(smartDeletedNodeIds.has(id)) return null;
         const local = localById.get(id);
         const remote = remoteById.get(id);
         if(local && !remote) return local;     // 仅本地存在：保留（我新建的节点；对方删了也宁可复活也不丢结果）
@@ -5724,9 +5729,9 @@ async function loadCanvas(){
         startCanvasMetaPoll();
     } catch(e) { toast(tr('smart.toastCanvasFail')); }
 }
-function scheduleSave(){
+function scheduleSave(delay=450){
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(saveCanvas, 450);
+    saveTimer = setTimeout(saveCanvas, Math.max(0, Number(delay) || 0));
 }
 async function saveCanvas(){
     if(!canvasId || !canvas) return;
@@ -5759,6 +5764,13 @@ async function saveCanvas(){
         if(res.ok){
             const data = await res.json();
             if(data.canvas && data.canvas.updated_at) canvas.updated_at = data.canvas.updated_at;
+            // Only clear tombstones that this acknowledged server snapshot no
+            // longer contains. A second delete may have happened while the
+            // first save was in flight and must remain protected.
+            const savedIds = new Set((data.canvas?.nodes || []).map(node => node?.id).filter(Boolean));
+            [...smartDeletedNodeIds].forEach(nodeId => {
+                if(!savedIds.has(nodeId)) smartDeletedNodeIds.delete(nodeId);
+            });
         } else if(res.status === 409) {
             // 冲突：别人先保存了。合并对方的状态（节点 id 合并、图片取并集，谁都不丢），
             // 然后用对方最新的 updated_at 作为基底重存，把合并结果落盘——而不是直接覆盖对方。
@@ -6673,6 +6685,29 @@ function smartAgentSizeForItem(item={}, options={}, providerId='', model=''){
     if(resolution === 'custom') return item.customSize || options.customSize || settings.customSize || sizeForRun(settings);
     return apiImageSize(ratio, resolution, item.customRatio || options.customRatio || settings.customRatio || '', item.customSize || options.customSize || settings.customSize || '') || sizeForRun(settings);
 }
+function smartAgentImageDisplaySettings(item={}, options={}, size=''){
+    const requested = item.ratio || item.aspect || item.aspect_ratio || options.ratio || options.aspect || options.aspect_ratio || '';
+    let ratio = smartAgentRatioKey(requested);
+    const parsed = parseSizeValue(size);
+    if(!ratio && parsed){
+        const width = Number(parsed.width) || 1;
+        const height = Number(parsed.height) || 1;
+        const target = width / height;
+        const candidates = [['square', 1], ['portrait', 2 / 3], ['landscape', 3 / 2], ['portrait43', 3 / 4], ['landscape43', 4 / 3], ['story', 9 / 16], ['wide', 16 / 9], ['ultrawide', 21 / 9], ['ultratall', 9 / 21]];
+        ratio = candidates.reduce((best, entry) => Math.abs(Math.log(target / entry[1])) < Math.abs(Math.log(target / best[1])) ? entry : best, candidates[0])[0];
+    }
+    ratio = ratio || settings.ratio || 'square';
+    const hintedResolution = smartAgentResolutionKey(item.resolution || item.quality_size || options.resolution || options.quality_size);
+    let resolution = hintedResolution || settings.resolution || (isGptImageAutoSizeModel(settings.model) ? 'auto' : '1k');
+    if(parsed && !hintedResolution){
+        const longEdge = Math.max(Number(parsed.width), Number(parsed.height));
+        resolution = longEdge >= 3000 ? '4k' : (longEdge >= 1800 ? '2k' : '1k');
+    }
+    // A fixed Agent size must never be recomputed from the global square
+    // setting when the node is reopened or run again.
+    if(resolution === 'auto') resolution = parsed ? (Math.max(Number(parsed.width), Number(parsed.height)) >= 1800 ? '2k' : '1k') : '1k';
+    return {ratio, resolution};
+}
 function smartAgentCreatePendingNode(prompt, payload, index, total, options={}){
     const count = Math.max(1, Math.min(8, Number(payload.n || 1)));
     const parsed = parseSizeValue(payload.size);
@@ -6704,6 +6739,7 @@ function smartAgentCreatePendingNode(prompt, payload, index, total, options={}){
         agentGenerated:true,
         created_at:Date.now()
     };
+    const displaySettings = payload._agentDisplaySettings || smartAgentImageDisplaySettings({}, options, payload.size);
     const meta = {
         prompt,
         displayPrompt:prompt,
@@ -6718,6 +6754,9 @@ function smartAgentCreatePendingNode(prompt, payload, index, total, options={}){
             apiKind:options.kind === 'video' ? 'video' : 'image',
             provider_id:payload.provider_id,
             model:payload.model,
+            ratio:displaySettings.ratio,
+            resolution:displaySettings.resolution,
+            customRatio:displaySettings.ratio === 'custom' ? (options.customRatio || '') : '',
             customSize:payload.size,
             quality:payload.quality,
             count,
@@ -6757,6 +6796,7 @@ async function smartAgentGenerateImageItems(items=[], options={}){
             n:count,
             reference_images:refs
         };
+        payload._agentDisplaySettings = smartAgentImageDisplaySettings(item, baseOptions, payload.size);
         const pending = smartAgentCreatePendingNode(prompt, payload, itemIndex, list.length, {...baseOptions, reference_images:refs});
         smartAgentConnectReferenceNodes(pending.node, refs);
         const runSettings = {
@@ -6765,6 +6805,9 @@ async function smartAgentGenerateImageItems(items=[], options={}){
             apiKind:'image',
             provider_id:payload.provider_id,
             model:payload.model,
+            ratio:payload._agentDisplaySettings.ratio,
+            resolution:payload._agentDisplaySettings.resolution,
+            customRatio:payload._agentDisplaySettings.ratio === 'custom' ? (item.customRatio || baseOptions.customRatio || '') : '',
             quality:payload.quality,
             count,
             customSize:payload.size
@@ -9583,6 +9626,7 @@ function deleteNode(id){
     nodes.forEach(node => {
         if(isHistoryGroupNode(node) && node.historyFor === id) deleteIds.add(node.id);
     });
+    deleteIds.forEach(nodeId => smartDeletedNodeIds.add(nodeId));
     nodes = nodes.filter(node => !deleteIds.has(node.id));
     if(canvas) canvas.connections = (canvas.connections || []).filter(c => !deleteIds.has(c.from) && !deleteIds.has(c.to));
     nodes.forEach(node => {
@@ -9593,7 +9637,9 @@ function deleteNode(id){
     selectedIds = selectedIds.filter(selected => !deleteIds.has(selected));
     if(deleteIds.has(selectedImage.nodeId)) selectedImage = {nodeId:'', index:-1};
     render();
-    scheduleSave();
+    // A delete should not wait behind the normal typing/layout debounce. It
+    // must win over a concurrent task-status broadcast before a page refresh.
+    scheduleSave(0);
 }
 function clearNodeMediaBeforeDelete(id){
     const node = nodes.find(n => n.id === id);
@@ -13303,6 +13349,11 @@ function clearDetachedRunInputRefs(node){
     if(!node) return;
     const hasUpstream = Boolean((canvas?.connections || []).some(conn => conn.to === node.id && ['input','flow'].includes(conn.kind || 'flow')));
     if(hasUpstream || (!canvasUsesConnections && Array.isArray(node.inputNodeIds) && node.inputNodeIds.some(id => nodes.some(n => n.id === id)))) return;
+    // Agent “引用模式” deliberately stores the source media on the generated
+    // node without creating graph edges. Those refs are run configuration, not
+    // stale detached inputs, and must survive save/reload so the composer can
+    // still render its 上游输入 thumbnails.
+    if(node.agentGenerated && Array.isArray(node.runInputRefs) && node.runInputRefs.some(ref => ref?.url)) return;
     delete node.runInputRefs;
     delete node.runPromptRefs;
     delete node.sourceNodeId;

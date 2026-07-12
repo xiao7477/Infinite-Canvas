@@ -583,6 +583,29 @@ body.cm-resizing {
     text-align: center;
     opacity: .82;
 }
+.cm-agent-status-line {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted, #64748b);
+    font-size: 11px;
+    line-height: 1.45;
+    padding: 1px 3px;
+    opacity: .88;
+}
+.cm-agent-status-dot {
+    width: 6px;
+    height: 6px;
+    flex: 0 0 6px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: cm-agent-status-pulse 1.1s ease-in-out infinite;
+}
+@keyframes cm-agent-status-pulse {
+    0%, 100% { opacity: .3; transform: scale(.78); }
+    50% { opacity: 1; transform: scale(1); }
+}
 .cm-agent-block {
     align-self: flex-start;
     width: 100%;
