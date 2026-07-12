@@ -16,14 +16,14 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.07.5.1783137856"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.07.5.1783137856"></script>
-    <script src="/static/js/theme.js?v=2026.07.5.1783137856"></script>
-    <script src="/static/js/i18n.js?v=2026.07.5.1783137856"></script>
-    <script src="/static/js/image-preview.js?v=2026.07.5.1783137856"></script>
-    <script src="/static/js/history-bulk-manager.js?v=2026.07.5.1783137856"></script>
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.07.6.1782696751"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.07.6.1782696749"></script>
+    <script src="/static/js/theme.js?v=2026.07.6.1783117645"></script>
+    <script src="/static/js/i18n.js?v=2026.07.6.1783116068"></script>
+    <script src="/static/js/image-preview.js?v=2026.07.6.1782696713"></script>
+    <script src="/static/js/history-bulk-manager.js?v=2026.07.6.1782696703"></script>
     <style>
-        @import url('/static/vendor/css/fonts.css?v=2026.07.5.1783137856');
+        @import url('/static/vendor/css/fonts.css?v=2026.07.6.1782696732');
         :root { --accent:#111827; --bg:#f9fafb; --card:#fff; --easing:cubic-bezier(0.4,0,0.2,1); }
         body { background:var(--bg); font-family:'Inter',-apple-system,sans-serif; color:var(--accent); -webkit-font-smoothing:antialiased; }
         .container-box { max-width:1280px; margin:0 auto; padding:0 40px; margin-top:50px; }
@@ -63,7 +63,7 @@
         .gallery-lightbox { background:rgba(255,255,255,.99); backdrop-filter:blur(22px) saturate(1.05); }
         @keyframes fadeIn { from{opacity:0} to{opacity:1} }
     </style>
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.07.5.1783137856">
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.07.6.1782696682">
     <style>
         html:not(.studio-theme-dark) body:not(.studio-theme-dark) #lightbox.gallery-lightbox {
             background: rgba(255,255,255,.99) !important;
@@ -323,11 +323,13 @@
         function providerModels(id){
             return uniqueModels(providerById(id)?.image_models || [models.gpt]);
         }
-        /* ---- RunningHub：模型下拉来自 API 设置里配置的工作流 / AI 应用，而非通用 image_models ----
-         * 与智能画布一致：value=app:ID / workflow:ID，后端 generate_ai_image 走 RH 工作流运行路径。 */
+        /* ---- RunningHub：同一平台下同步模型 API / 工作流 / AI 应用。
+         * 模型 API 直接提交原始模型名；value=app:ID / workflow:ID 走 RH 应用/工作流路径。 */
         function runningHubEntryId(entry, kind){
             if(!entry || typeof entry !== 'object') return '';
-            const raw = kind === 'workflow' ? (entry.workflowId || entry.id) : (entry.appId || entry.webappId || entry.id);
+            const raw = kind === 'model' ? (entry.model || entry.id || entry.name)
+                : kind === 'workflow' ? (entry.workflowId || entry.id)
+                : (entry.appId || entry.webappId || entry.id);
             return String(raw || '').trim();
         }
         function runningHubEntries(id){
@@ -336,7 +338,8 @@
                 .filter(e => e && e.enabled !== false && e.hidden !== true)
                 .map(e => ({ kind, id: runningHubEntryId(e, kind), title: String(e.title || e.note || '').trim() }))
                 .filter(e => e.id);
-            return [...collect(p.rh_workflows, 'workflow'), ...collect(p.rh_apps, 'app')];
+            const models = uniqueModels(p.image_models || []).map(model => ({kind:'model', id:model, title:model}));
+            return [...models, ...collect(p.rh_workflows, 'workflow'), ...collect(p.rh_apps, 'app')];
         }
         function isRunningHubProvider(id){ return providerProtocol(id) === 'runninghub'; }
         function renderProviderControls(){
@@ -347,12 +350,12 @@
             providerSelect.innerHTML = providers.map(p => `<option value="${escapeHtml(p.id)}" ${p.id === provider ? 'selected' : ''}>${escapeHtml(p.name || p.id)}</option>`).join('');
             if(isRunningHubProvider(provider)){
                 const entries = runningHubEntries(provider);
-                const keys = entries.map(e => `${e.kind}:${e.id}`);
+                const keys = entries.map(e => e.kind === 'model' ? e.id : `${e.kind}:${e.id}`);
                 if(!keys.includes(selectedModel)) selectedModel = keys[0] || '';
                 modelSelect.innerHTML = entries.length
                     ? entries.map(e => {
-                        const key = `${e.kind}:${e.id}`;
-                        const tag = e.kind === 'workflow' ? tr('online.rhWorkflow') : tr('online.rhApp');
+                        const key = e.kind === 'model' ? e.id : `${e.kind}:${e.id}`;
+                        const tag = e.kind === 'model' ? '模型 API' : e.kind === 'workflow' ? tr('online.rhWorkflow') : tr('online.rhApp');
                         const label = e.title || e.id;
                         return `<option value="${escapeHtml(key)}" ${key === selectedModel ? 'selected' : ''}>${escapeHtml(`[${tag}] ${label}`)}</option>`;
                     }).join('')
