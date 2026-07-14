@@ -1,6 +1,6 @@
 # Infinite Canvas Agent Mode
 
-> Last updated: 2026-07-08
+> Last updated: 2026-07-14
 > Branch: `feature/codex-agent`
 > Goal: add a Codex Agent panel for smart canvas workflows while keeping upstream updates easy to merge.
 
@@ -23,7 +23,7 @@
 
 ### Backend
 
-Main integration lives in `main.py`:
+Agent API implementation lives in `agent/backend.py`; `main.py` only binds the explicit upstream canvas/Provider dependencies, includes the Agent router, and registers its startup hook:
 
 - `POST /api/codex-agent/board/open`
 - `POST /api/codex-agent/board/close`
@@ -50,7 +50,7 @@ The backend starts `codex app-server` with `cwd = project_dir`, prepares selecte
 
 Runtime identity is not just `project_dir`. Active runtime sessions are keyed by the current canvas, Canvas Agent conversation, project directory, and bottom Codex thread pointer when needed. `codex_thread_id` is only an execution pointer; if App Server cannot resume it, the backend creates a fresh Codex thread, keeps the same Canvas Agent conversation visible, and emits a warning block instead of losing history.
 
-Canvas Tools use App Server native experimental `dynamicTools` as their primary path. At `thread/start`/`thread/resume`, the backend registers the `infinite_canvas` namespace and handles App Server's server-initiated `item/tool/call` requests with structured results. Registered queries are `get_selected_nodes`, `get_viewport_nodes`, `get_canvas_summary`, `search_canvas_nodes`, `get_node_detail`, and `get_connected_nodes`; mutations cover media/prompt/text/loop/generation-node creation, rename, move, arrange, group, ungroup, and explicit preference storage. `generate_images` and `generate_videos` submit provider tasks from the backend and persist task ids on the smart-canvas nodes; `create_*_generation_nodes` remains the node-only alternative.
+Canvas Tools use App Server native experimental `dynamicTools` as their primary path. At `thread/start`/`thread/resume`, the backend registers the `infinite_canvas` namespace and handles App Server's server-initiated `item/tool/call` requests with structured results. Registered queries include selection, viewport, canvas summary, search, node detail, direct connections, layout context and recursive node trees; mutations cover creation, rename, block movement, resize/reset, horizontal/vertical/grid layout, recursive tree layout, group, ungroup, deletion, undo and preference storage. `generate_images` and `generate_videos` submit provider tasks from the backend and persist task ids on the smart-canvas nodes; `create_*_generation_nodes` remains the node-only alternative.
 
 Generation provider names are resolved strictly before a task is queued: `Gemini`/`Antigravity`/`agy` resolve to the configured `gemini-cli` provider, and `GPT`/`OpenAI`/`Codex` resolve to `codex`. An unknown explicit provider is an error, never a silent fallback to the current primary provider (for example RunningHub). Agent image/video requests must use the registered Canvas generation tools, not App Server's own `imageGeneration`/`$imagegen`; if such a side-effect still arrives after a Canvas task was submitted, it is not added as a duplicate canvas result. The Canvas task count is exact: each requested image keeps at most one primary output.
 
@@ -68,9 +68,17 @@ For 即梦 CLI, a `get_history_by_ids failed: ret=2008` response during task pol
 
 For Agent-created image nodes, an explicit aspect ratio is converted into a concrete image size and also written back to the node's `ratio`/`resolution` display settings. This prevents a requested portrait size such as `9:16` from being submitted as a vertical image while the node still displays or reruns as `1:1`. Provider and model remain the canvas's configured defaults unless the user explicitly selects a different configured model.
 
+GPT CLI image nodes submit the native `$imagegen` instruction through the currently logged-in Codex CLI and collect its local output. They do not require, probe, or silently fall back through a separate `gpt-image-2-skill`; the canvas GPT CLI configuration remains the sole execution path.
+
+GPT CLI image output capture is serialized across concurrent canvas tasks. Codex may write a reused descriptive filename into the shared output directory, so each completed task immediately atomically renames its detected output to a unique `codex_<id>` filename before the next task starts. This keeps batch prompts and their returned node thumbnails one-to-one instead of allowing later results to overwrite earlier URLs, without leaving a duplicate source file in the asset manager.
+
+When one Agent generation request creates multiple sibling nodes, they use compact vertical batch placement: one nearby column with normal node spacing. The placement resolver treats already-created siblings as occupied and selects the next free row, so it does not apply the batch index twice and scatter the same batch across the canvas.
+
 Composer references are intentionally not connected by graph edges. For Agent-generated nodes their saved media references (`runInputRefs`) are treated as persistent run configuration and are not removed by detached-input cleanup, so “上游输入” thumbnails remain visible after a canvas refresh.
 
 Deleting a smart node creates a local deletion tombstone until the updated canvas is acknowledged by the server. This prevents an older canvas snapshot or a simultaneous generation-status broadcast from merging a deleted failed node back into the visible canvas before refresh.
+
+Agent panel snapshots are isolated by `canvas_id`. A newly created smart canvas does not fall back to the most recently used panel snapshot from another canvas: opening Agent starts with “无目录” and an empty conversation until the user chooses a directory (or “无目录”) and begins a conversation. Existing canvases only restore their own persisted panel state/history.
 
 Agent panel chat state is persisted outside user project folders. The Canvas Agent now owns its history list instead of using Codex native sessions as the UI source:
 
@@ -156,6 +164,10 @@ Smart canvas bridge:
 - `addLoopNodes()`
 - `groupNodes()`
 - `ungroupNodes()`
+- `moveNodes()`
+- `resizeNodes()`
+- `arrangeNodes()`
+- `arrangeNodeTree()`
 - `generateImageNodes()`
 - `generateVideoNodes()`
 - `getImageGenerationDefaults()`
@@ -181,6 +193,7 @@ HTML entry:
 - Hidden `canvas_agent_action` execution for generation and compatibility fallback; background Agent turns execute supported actions on the backend to avoid page-refresh interruption.
 - Add image/video/media/prompt/text/loop nodes to smart canvas.
 - Rename, move, arrange, group, and ungroup selected/reference smart canvas nodes from the backend with missing-node skips.
+- `/整理` can analyze actual node rectangles and nearby occupancy, suggest a size/layout/destination when a multi-selection request is vague, normalize single media to the 520-wide landscape / 440-high portrait standard, treat a multi-media node as one container and restore its native internal grid, restore non-media defaults, lay out rows/columns/grids by outer-frame gaps, and recursively compact a connected upstream/downstream tree near the selected root. Tree placement checks each real node rectangle instead of requiring the sparse tree's whole bounding box to fit inside the viewport or following remote global canvas bounds.
 - Generate image nodes through the smart canvas API generation flow.
 - Generate video nodes through the smart canvas API video generation flow.
 - Reference wiring from selected source nodes to generated nodes.
@@ -396,12 +409,19 @@ Current implementation status:
 - The floating panel composer has Codex-style toolbar controls for attachment, `@`, `/`, mode, scope, approval policy, and send/stop.
 - `@` opens the attachment/reference picker and inserts `@图N` tokens.
 - `/` opens a command picker for common canvas tasks such as organize, rename, prompt generation, image/video node creation, summarize, locate, and batch processing.
+- `/` commands now come from the backend Canvas command registry instead of a second hard-coded frontend business list. The canonical batch label is `/批量任务`; `/批量处理` remains an input alias.
+- Each registered command selects one Canvas-only Skill from `agent/skills/`. These Skills are loaded only for the matching Canvas Agent turn and are not installed as global/project Codex Skills.
 - Mode/scope/approval buttons currently cycle lightweight state and are included in the turn canvas context as `agentInput`.
 - Approval policy applies to canvas write Tools; read-only context queries always run automatically:
   - `自动执行`: run every write Tool immediately, including backend-hosted image/video generation.
   - `高风险确认`: pause video generation, ungrouping, preference storage, and broad (3+ targets or full-canvas) rename/move/arrange/group/image-generation actions. The confirmation includes node count, planned image/video count, and selected provider/model. It does not invent a credit quote; only larger workloads show a “may consume substantial credits” warning. It offers direct task submission, node-only creation, or cancellation.
   - `执行前确认`: pause every write Tool.
 - Confirmation blocks persist as typed `choice` blocks and call `/api/codex-agent/action/resolve`. For native Tool calls the pending record also stores the App Server request id; approval or rejection sends the structured Tool result back to the paused turn.
+- Pending confirmation cards are transient UI: after approval, node-only creation, or cancellation, the choice card is removed and only the resulting canvas-action card or concise skip feedback remains.
+- Rename semantics are enforced server-side: “重命名节点/选中节点改名” changes only the media label shown above the image (`images[index].name`). Agent tools cannot modify internal `node.title`; that field remains available to the base canvas as a type/fallback label for compatibility.
+- Server refresh merging matches media by URL but does not discard same-URL metadata updates: local transient generation fields are retained while the server's `images[index].name` wins. This prevents an Agent rename from being hidden by the stale in-memory name and then overwritten by the next autosave.
+- For completed media nodes, a newer server snapshot is authoritative for persisted layout and settings (`x/y/w/h` included), while the merge retains the newest completion timer and the union of local/remote images. This lets Agent move, resize, and arrange actions appear immediately without a page reload.
+- The composer uses a centered top-edge drag handle for vertical resizing; the browser's native bottom-right resize corner is disabled, and the chosen height is retained locally.
 - The selected mode/scope/approval state is kept in the local panel snapshot and sent to backend panel-state.
 
 ### Context Engineering
@@ -427,7 +447,7 @@ Current implementation status:
 
 - The Agent panel builds a `contextProfile` for each turn from input mode, scope, attachments, slash command, and message text.
 - The visible input no longer asks users to manually choose "operate canvas" or "current viewport"; context is routed automatically from user intent, attachments, slash command, and selection state.
-- The frontend still sends the send-time canvas snapshot to the backend so deterministic actions and collision checks can run safely. The backend also captures the real smart-canvas nodes and connections into `~/.codex/infinite-canvas-agent/context-snapshots/`, while sending only a minimal App Server envelope to Codex.
+- The frontend sends only compact send-time metadata and selected-node geometry. The backend captures the authoritative smart-canvas nodes and connections into `~/.codex/infinite-canvas-agent/context-snapshots/`, while sending only a minimal App Server envelope to Codex.
 - Context levels are active:
   - Level 0: pure chat, no node list, no provider list, no canvas coordinates.
   - Level 1: lightweight canvas summary and node counts.
@@ -435,9 +455,27 @@ Current implementation status:
   - Level 3: global intent marker plus snapshot IDs; full indexes are queried through Canvas Tools instead of prompt text.
 - Image/video provider defaults are only sent for generation/model-related intents.
 - The backend hidden context includes `context_snapshot_id`, `viewport_snapshot_id`, `context_level`, `context_intent`, selected refs, node counts, and approval policy. It does not include the full node list in prompt text.
+- The v2 envelope also carries `canvas_revision` and the active Canvas Skill id. Stable tool catalogs and repeated JSON examples were removed; Dynamic Tool schemas describe tools, while the selected Skill supplies only the matching workflow rules.
+- Provider/model catalogs are no longer embedded in generation turns. `get_generation_settings` returns current image/video defaults and available models only when the user names a platform/model or asks what is available.
+- The browser request no longer duplicates full-canvas nodes or connections. It sends viewport/selection metadata and a bounded selected-node geometry sample; the backend persists the authoritative full snapshot for Tool queries and placement.
 - The bottom hint shows automatic context routing instead of manual mode/scope buttons.
 - Query tools read that immutable send-time snapshot by default; `search_canvas_nodes` is paginated and bounded. Write tools re-load the live canvas and re-resolve targets before mutation, so changed/deleted targets are skipped safely.
 - Native Tool results return directly through the paused App Server request and render as chronological tool blocks; no follow-up turn is required.
+
+### Canvas Revision
+
+- Revision metadata is private to Canvas Agent and lives under `~/.codex/infinite-canvas-agent/canvas-revisions/`; the original canvas schema is unchanged.
+- A structural fingerprint observes nodes, connections, title and settings. Viewport, logs and timestamps do not advance Revision.
+- Every send-time context snapshot records `canvas_revision`, and query Tool results return it.
+- Broad writes, deletes and confirmed undo operations compare the send-time/explicit expected Revision with the live canvas. A mismatch returns a structured conflict and performs no write.
+- Targeted low-risk writes may safely re-resolve live targets; missing targets continue to be skipped instead of turning unrelated canvas edits into a full-task failure.
+
+### Agent Backend Isolation
+
+- Canvas-only command/Skill routing, minimal context construction, Revision storage, Codex App Server runtime, state/history, Dynamic Tools, generation orchestration, Turn service, and all `/api/codex-agent/*` route implementations live in `agent/`.
+- `agent/backend.py` owns the cohesive Agent backend. It deliberately remains one substantial module instead of being split into many thin layers without stable boundaries.
+- `main.py` exposes one explicit dependency bridge, `include_router`, and one startup-hook registration. It defines no `_codex_agent_*` functions, Agent request models, or Agent API routes.
+- The dependency bridge avoids circular imports and keeps original canvas storage, Provider implementations, task queues, and WebSocket manager in the upstream-compatible layer.
 
 ### History And Archive UX
 
@@ -587,6 +625,12 @@ Observed on 2026-07-06:
 
 This is a smart canvas video task lifecycle issue, broader than the Agent panel.
 
+Architecture note (2026-07-13):
+
+- Agent task persistence now lives in `agent/backend.py`.
+- The existing `/api/canvas-image-tasks` and `/api/canvas-video-tasks` handlers remain in `main.py` and use two explicit public bridge exports for payload serialization and persistence.
+- When moving Agent persistence code again, keep those bridge bindings intact; dangling private helper calls cause both ordinary generation routes to fail with HTTP 500 before a task is queued.
+
 Recommended improvement:
 
 - Move video generation to a backend task ID flow, matching image generation.
@@ -600,6 +644,7 @@ These look like base/original smart canvas issues. Keep them recorded and check 
 
 - Video task recovery: manual smart canvas video generation can lose result fill-back after refresh/close because it does not persist a backend task ID before the long `/api/canvas-video` request completes.
 - View scale reset: shortcut `Z` shows an overview but does not reset the underlying viewport scale, so canvas interaction can jump back to an extreme zoom level.
+- Group image size restoration is inconsistent: dragging one thumbnail out of a smart group recreates it through the normal standalone-image sizing path, while one-click ungrouping writes the former group thumbnail cell size into each recreated node's explicit `w/h`. The latter therefore stays visually small instead of returning to the normal standalone display size. This is a base smart-canvas behavior; do not change it as part of Agent work.
 - If upstream does not fix these, consider local fixes in separate, clearly scoped commits that avoid changing unrelated Agent code.
 
 ## Backlog

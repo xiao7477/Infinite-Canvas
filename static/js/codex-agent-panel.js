@@ -79,6 +79,7 @@
   const addedImagePaths = new Set();
   const executedCanvasActionKeys = new Set();
   const panelSizeKey = 'codex-agent-panel-size-v1';
+  const composerHeightKey = 'codex-agent-composer-height-v1';
   const panelStatePrefix = 'codex-agent-panel-state-v5:';
   const panelRecentStateKey = 'codex-agent-panel-recent-state-v5';
   const recoveringStatuses = new Set(['booting', 'loading_projects', 'opening_project', 'loading_history', 'reconnecting_task']);
@@ -100,7 +101,7 @@
     { id: 'confirm-risky', label: '高风险确认' },
     { id: 'confirm', label: '执行前确认' },
   ];
-  const slashCommands = [
+  const fallbackSlashCommands = [
     { id: 'organize', label: '/整理', insert: '/整理 ', desc: '整理选中节点或当前视口内容' },
     { id: 'rename', label: '/重命名', insert: '/重命名 ', desc: '按规则重命名节点素材显示名' },
     { id: 'prompt', label: '/生成提示词', insert: '/生成提示词 ', desc: '把参考图或主题写成提示词节点' },
@@ -108,8 +109,9 @@
     { id: 'video', label: '/创建视频节点', insert: '/创建视频节点 ', desc: '创建视频生成节点' },
     { id: 'summarize', label: '/总结画布', insert: '/总结画布 ', desc: '总结当前视口或全画布内容' },
     { id: 'locate', label: '/定位', insert: '/定位 ', desc: '定位、选中或高亮节点' },
-    { id: 'batch', label: '/批量处理', insert: '/批量处理 ', desc: '批量执行多步骤任务' },
+    { id: 'batch', label: '/批量任务', insert: '/批量任务 ', aliases: ['/批量处理'], desc: '使用现有画布工具规划并执行多步任务', intent: 'global_canvas', contextLevel: 3, generationContext: true },
   ];
+  let slashCommands = fallbackSlashCommands.map(item => ({ ...item }));
   const contextLevelLabels = {
     0: '纯聊天',
     1: '轻量画布',
@@ -398,6 +400,7 @@
       <div class="cm-foot">
         <div class="cm-composer">
           <div class="cm-ref-rail cm-attach-list" id="cm-attach-list"></div>
+          <div class="cm-input-resize-handle" id="cm-input-resize" role="separator" aria-orientation="horizontal" title="上下拖动调整输入框高度"><span></span></div>
           <div class="cm-input cm-input-disabled" id="cm-input" contenteditable="false" data-placeholder="输入消息，回车发送（Shift+Enter 换行）"></div>
           <div class="cm-composer-bar">
             <div class="cm-toolbar-left">
@@ -445,6 +448,7 @@
       savePanelSnapshot();
     }, { passive: true });
     initPanelResize();
+    initComposerResize();
     document.addEventListener('click', onDocClick);
     restorePanelSnapshot();
     setStatusUI();
@@ -503,6 +507,40 @@
       };
       document.addEventListener('pointermove', onMove);
       document.addEventListener('pointerup', onUp, { once: true });
+    });
+  }
+
+  function initComposerResize() {
+    const input = $('#cm-input');
+    const handle = $('#cm-input-resize');
+    if (!input || !handle) return;
+    try {
+      const savedHeight = Number(localStorage.getItem(composerHeightKey) || 0);
+      if (savedHeight > 0) input.style.height = `${savedHeight}px`;
+    } catch {}
+    handle.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      const startY = e.clientY;
+      const startHeight = input.getBoundingClientRect().height;
+      handle.setPointerCapture?.(e.pointerId);
+      document.body.classList.add('cm-resizing-input');
+      const onMove = (ev) => {
+        const maxHeight = Math.max(120, Math.min(420, window.innerHeight * 0.45));
+        const height = Math.max(50, Math.min(maxHeight, startHeight + (startY - ev.clientY)));
+        input.style.height = `${Math.round(height)}px`;
+      };
+      const onUp = () => {
+        document.removeEventListener('pointermove', onMove);
+        document.removeEventListener('pointerup', onUp);
+        document.body.classList.remove('cm-resizing-input');
+        try { localStorage.setItem(composerHeightKey, String(Math.round(input.getBoundingClientRect().height))); } catch {}
+      };
+      document.addEventListener('pointermove', onMove);
+      document.addEventListener('pointerup', onUp, { once: true });
+    });
+    handle.addEventListener('dblclick', () => {
+      input.style.height = '';
+      try { localStorage.removeItem(composerHeightKey); } catch {}
     });
   }
 
@@ -1419,6 +1457,12 @@
     arrangeNodes(items, options = {}) {
       return arrangeNodesOnCanvas(items, options);
     },
+    resizeNodes(items, options = {}) {
+      return resizeNodesOnCanvas(items, options);
+    },
+    arrangeNodeTree(items, options = {}) {
+      return arrangeNodeTreeOnCanvas(items, options);
+    },
     generateImageNodes(items, options = {}) {
       return generateImageNodesToCanvas(items, options);
     },
@@ -1623,6 +1667,14 @@
     return data;
   }
 
+  function normalizeCanvasLayoutOptions(options = {}) {
+    const data = options && typeof options === 'object' ? { ...options } : {};
+    const anchorRef = data.anchor_ref || data.anchorRef;
+    const anchorNodeId = nodeIdFromReferenceValue(anchorRef);
+    if (anchorNodeId && !data.anchor_node_id) data.anchor_node_id = anchorNodeId;
+    return data;
+  }
+
   function renameNodesOnCanvas(items, options = {}) {
     const list = (Array.isArray(items) ? items : [items]).map(normalizeCanvasNodeTargetItem).filter(Boolean);
     if (!list.length) return [];
@@ -1636,7 +1688,7 @@
     const list = (Array.isArray(items) ? items : [items]).map(normalizeCanvasNodeTargetItem).filter(Boolean);
     if (!list.length) return [];
     if (window.SmartCanvasAgentApi?.moveNodes) {
-      return window.SmartCanvasAgentApi.moveNodes(list, options) || [];
+      return window.SmartCanvasAgentApi.moveNodes(list, normalizeCanvasLayoutOptions(options)) || [];
     }
     throw new Error('当前画布还不支持 Agent 移动节点');
   }
@@ -1644,9 +1696,25 @@
   function arrangeNodesOnCanvas(items, options = {}) {
     const list = (Array.isArray(items) ? items : [items]).map(normalizeCanvasNodeTargetItem).filter(Boolean);
     if (window.SmartCanvasAgentApi?.arrangeNodes) {
-      return window.SmartCanvasAgentApi.arrangeNodes(list, options) || [];
+      return window.SmartCanvasAgentApi.arrangeNodes(list, normalizeCanvasLayoutOptions(options)) || [];
     }
     throw new Error('当前画布还不支持 Agent 整理节点');
+  }
+
+  function resizeNodesOnCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items]).map(normalizeCanvasNodeTargetItem).filter(Boolean);
+    if (window.SmartCanvasAgentApi?.resizeNodes) {
+      return window.SmartCanvasAgentApi.resizeNodes(list, normalizeCanvasLayoutOptions(options)) || [];
+    }
+    throw new Error('当前画布还不支持 Agent 调整节点大小');
+  }
+
+  function arrangeNodeTreeOnCanvas(items, options = {}) {
+    const list = (Array.isArray(items) ? items : [items]).map(normalizeCanvasNodeTargetItem).filter(Boolean);
+    if (window.SmartCanvasAgentApi?.arrangeNodeTree) {
+      return window.SmartCanvasAgentApi.arrangeNodeTree(list, normalizeCanvasLayoutOptions(options)) || [];
+    }
+    throw new Error('当前画布还不支持 Agent 整理节点树');
   }
 
   function groupNodesOnCanvas(items, options = {}) {
@@ -2182,7 +2250,7 @@
   function openCommandPickerFromMatch(match) {
     state.commandQuery = safeStr(match[1]).toLowerCase();
     state.commandItems = slashCommands
-      .filter(item => !state.commandQuery || `${item.label} ${item.desc}`.toLowerCase().includes(state.commandQuery))
+      .filter(item => !state.commandQuery || `${item.label} ${(item.aliases || []).join(' ')} ${item.desc}`.toLowerCase().includes(state.commandQuery))
       .slice(0, 10);
     renderCommandPicker();
   }
@@ -2403,10 +2471,10 @@
     let snap = null;
     try {
       snap = JSON.parse(localStorage.getItem(panelSnapshotKey()) || 'null');
-      if (!snap || typeof snap !== 'object' || (!snap.projectDir && !snap.threadId && !snap.messages?.length)) {
-        snap = JSON.parse(localStorage.getItem(panelRecentStateKey) || 'null');
-      }
     } catch {}
+    // 不允许跨画布回退到“最近一次”的全局快照。新建智能画布尚未
+    // 拥有自己的快照时必须保持无目录、空对话；其历史只可从同一
+    // canvas_id 的后端记录恢复。
     if (!snap || typeof snap !== 'object') return;
     state.projectDir = safeStr(snap.projectDir);
     state.workdirReady = Boolean(snap.workdirReady || snap.workdir_ready || snap.projectDir || snap.threadId || snap.messages?.length);
@@ -2547,12 +2615,43 @@
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  async function loadSlashCommands() {
+    try {
+      const r = await fetch('/api/codex-agent/commands');
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(safeStr(d.detail) || `HTTP ${r.status}`);
+      const commands = (Array.isArray(d.commands) ? d.commands : [])
+        .map(item => {
+          const label = safeStr(item.command || item.label);
+          if (!label.startsWith('/')) return null;
+          return {
+            id: safeStr(item.id || label.slice(1)),
+            label,
+            insert: `${label} `,
+            aliases: Array.isArray(item.aliases) ? item.aliases.map(safeStr).filter(Boolean) : [],
+            desc: safeStr(item.description || item.desc),
+            intent: safeStr(item.intent),
+            contextLevel: Number(item.context_level),
+            defaultScope: safeStr(item.default_scope),
+            generationContext: Boolean(item.generation_context),
+            skill: safeStr(item.skill),
+          };
+        })
+        .filter(Boolean);
+      if (commands.length) slashCommands = commands;
+    } catch (e) {
+      console.warn('load slash commands failed; using local fallback', e);
+      slashCommands = fallbackSlashCommands.map(item => ({ ...item }));
+    }
+  }
+
   async function bootstrapPanelRestore() {
     if (restoreInFlight) return;
     restoreInFlight = true;
     const hadSnapshot = Boolean(state.projectDir || state.threadId || state.messages.length);
     try {
       setRecovering('booting', hadSnapshot ? '正在恢复上次对话' : '正在检查上次对话');
+      await loadSlashCommands();
       let latest = null;
       try {
         latest = await fetchLatestPanelState(state.projectDir);
@@ -2638,16 +2737,30 @@
     const scope = state.inputScope || 'auto';
     let intent = 'chat';
     let level = hasAttachments ? 2 : 0;
-    const command = (raw.match(/(?:^|\s)(\/[^\s]+)/) || [])[1] || '';
+    const rawCommand = (raw.match(/(?:^|\s)(\/[^\s]+)/) || [])[1] || '';
+    const commandItem = slashCommands.find(item => item.label === rawCommand || (item.aliases || []).includes(rawCommand));
+    const command = commandItem?.label || rawCommand;
+    let generationContext = Boolean(commandItem?.generationContext);
 
-    if (mode === 'chat') level = hasAttachments ? 2 : 0;
-    if (mode === 'analyze') level = hasAttachments ? 2 : 1;
-    if (mode === 'generate') level = 2;
-    if (mode === 'organize') level = 2;
-    if (scope === 'canvas') level = 3;
-    if (scope === 'selected' || scope === 'node') level = Math.max(level, 2);
+    if (commandItem) {
+      level = Number.isFinite(commandItem.contextLevel)
+        ? Math.max(0, Math.min(3, commandItem.contextLevel))
+        : level;
+      intent = commandItem.intent || intent;
+    }
 
-    if (/全画布|整个画布|所有节点|全部节点|总览|版图|整理全部|\/总结画布|\/批量处理/.test(raw)) {
+    if (!commandItem) {
+      if (mode === 'chat') level = hasAttachments ? 2 : 0;
+      if (mode === 'analyze') level = hasAttachments ? 2 : 1;
+      if (mode === 'generate') level = 2;
+      if (mode === 'organize') level = 2;
+      if (scope === 'canvas') level = 3;
+      if (scope === 'selected' || scope === 'node') level = Math.max(level, 2);
+    }
+
+    if (commandItem) {
+      // 斜杠命令的意图与上下文级别来自后端注册表。
+    } else if (/全画布|整个画布|所有节点|全部节点|总览|版图|整理全部|\/总结画布|\/批量处理|\/批量任务/.test(raw)) {
       level = 3;
       intent = 'global_canvas';
     } else if (/当前|视口|眼前|这块|这片|左边|右边|上方|下方|附近|放到|移动|整理|重命名|分组|节点|画布|\/整理|\/重命名|\/定位/.test(raw)) {
@@ -2656,6 +2769,7 @@
     } else if (/生成|生图|视频|提示词|prompt|\/创建生图节点|\/创建视频节点|\/生成提示词/.test(raw)) {
       level = Math.max(level, 2);
       intent = 'generation';
+      generationContext = true;
     } else if (/这张图|图片|素材|分析|描述|读取|看一下/.test(raw) || hasAttachments) {
       level = Math.max(level, 2);
       intent = 'asset_analysis';
@@ -2673,6 +2787,7 @@
       approvalPolicy: state.approvalPolicy,
       hasAttachments,
       attachmentCount: attachments.length,
+      generationContext,
     };
   }
 
@@ -2718,27 +2833,12 @@
     const allNodes = Array.isArray(native.allNodes) ? native.allNodes : [];
     const selectedNodes = Array.isArray(native.selectedNodes) ? native.selectedNodes : [];
     const visible = native.visibleWorld || native.visible_world || null;
-    const wantsGenerationContext = profile.intent === 'generation' || profile.mode === 'generate' || /生图|生成|视频|模型|provider|model/i.test(text);
-    const attachmentNodeIds = new Set(
-      (attachments || [])
-        .map(item => safeStr(item.nodeId || item.node_id))
-        .filter(Boolean)
+    const wantsGenerationContext = Boolean(
+      profile.generationContext ||
+      profile.intent === 'generation' ||
+      profile.mode === 'generate' ||
+      /生图|生成|视频|模型|provider|model/i.test(text)
     );
-    let contextNodes = [];
-
-    if (profile.level >= 3) {
-      contextNodes = allNodes;
-    } else if (profile.level === 2) {
-      const byId = new Map();
-      selectedNodes.forEach(node => { if (node?.id) byId.set(node.id, node); });
-      allNodes.forEach(node => {
-        if (attachmentNodeIds.has(safeStr(node?.id)) || nodeIntersectsVisible(node, visible, 160)) {
-          if (node?.id) byId.set(node.id, node);
-        }
-      });
-      contextNodes = Array.from(byId.values()).slice(0, 80);
-    }
-
     const routedNative = {
       canvasId: native.canvasId || native.canvas_id || '',
       title: native.title || '',
@@ -2746,15 +2846,17 @@
       visibleWorld: visible || null,
       selectedNodeIds: Array.isArray(native.selectedNodeIds) ? native.selectedNodeIds : [],
       selectedImage: native.selectedImage || null,
-      selectedNodes: profile.level >= 2 ? selectedNodes.map(compactNodeForContext).filter(Boolean) : [],
-      allNodes: profile.level >= 2 ? contextNodes.map(compactNodeForContext).filter(Boolean) : [],
-      connections: profile.level >= 3 && Array.isArray(native.connections) ? native.connections.slice(0, 240) : [],
+      // 完整节点和连线由后端持久化到 context snapshot；
+      // 请求只保留少量选中节点几何信息，用于精确的发送时定位。
+      selectedNodes: profile.level >= 2 ? selectedNodes.slice(0, 24).map(compactNodeForContext).filter(Boolean) : [],
+      allNodes: [],
+      connections: [],
       imageGeneration: wantsGenerationContext ? native.imageGeneration || native.image_generation || null : null,
       videoGeneration: wantsGenerationContext ? native.videoGeneration || native.video_generation || null : null,
       nodeCounts: {
         total: allNodes.length,
         selected: selectedNodes.length,
-        sent: contextNodes.length,
+        sent: 0,
       },
     };
 
@@ -3096,6 +3198,7 @@
       renderBody();
     } else if (method === 'canvas/action_result') {
       const approvalId = safeStr(params.approval_id);
+      if (approvalId) removeApprovalBlock(approvalId);
       if (approvalId && hasCanvasActionResultForApproval(approvalId)) return;
       const changed = Number(params.changed || 0);
       const skipped = Number(params.skipped || 0);
@@ -3424,6 +3527,14 @@
     if (type === 'arrange_node' || type === 'arrange_nodes' || type === 'layout_nodes' || type === 'organize_nodes') {
       const items = action.items || action.nodes || action.targets || [];
       return arrangeNodesOnCanvas(items, options);
+    }
+    if (type === 'resize_node' || type === 'resize_nodes') {
+      const items = action.items || action.nodes || action.targets || [];
+      return resizeNodesOnCanvas(items, options);
+    }
+    if (type === 'arrange_node_tree' || type === 'arrange_tree' || type === 'layout_node_tree') {
+      const items = action.items || action.nodes || action.targets || [action];
+      return arrangeNodeTreeOnCanvas(items, options);
     }
     if (type === 'add_nodes') {
       const nodes = Array.isArray(action.nodes) ? action.nodes : (Array.isArray(action.items) ? action.items : []);
@@ -3857,13 +3968,21 @@
       countByKind.set(kind, (countByKind.get(kind) || 0) + 1);
     });
     const countText = [...countByKind.entries()].map(([kind, count]) => `${count}个${kind}`).join('，');
+    const actionTypes = resultRows.map(row => safeStr(row?.type).toLowerCase()).filter(Boolean);
+    const renameOnly = actionTypes.length > 0 && actionTypes.every(type => /rename|set_node_title/.test(type));
+    const moveOnly = actionTypes.length > 0 && actionTypes.every(type => /move|position|arrange|layout|organize/.test(type));
     const generationOnly = [...countByKind.keys()].every(kind => kind === '生图节点' || kind === '视频节点');
-    const summary = countText
+    const summary = renameOnly
+      ? `已重命名 ${changed || nodes.length}个素材`
+      : moveOnly
+      ? `已调整 ${changed || nodes.length}个节点`
+      : countText
       ? `${generationOnly ? '已生成' : '已创建'} ${countText}`
       : `已完成画布操作${changed ? `，影响 ${changed} 个节点` : ''}${skipped ? `，跳过 ${skipped} 项` : ''}`;
     const nodeRows = nodes.map(node => {
       const id = safeStr(node.id);
-      const label = safeStr(node.title || node.name || node.type || '节点');
+      const mediaName = Array.isArray(node.images) ? safeStr(node.images[0]?.name) : '';
+      const label = safeStr((renameOnly ? mediaName : '') || node.title || node.name || mediaName || node.type || '节点');
       const xy = `${Math.round(Number(node.x || 0))}, ${Math.round(Number(node.y || 0))}`;
       return `<button class="cm-node-chip" data-node-id="${escapeAttr(id)}" title="定位节点">${escapeHtml(label)} <span>@ ${escapeHtml(xy)}</span></button>`;
     }).join('');
@@ -3990,7 +4109,7 @@
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(safeStr(d.detail) || `HTTP ${r.status}`);
-      markApprovalBlockResolved(approvalId, ['approve', 'run', 'execute', 'run_generation', 'create_nodes'].includes(decision) ? 'approved' : 'skipped');
+      removeApprovalBlock(approvalId);
       const result = d.result || {};
       if (d.decision === 'approved') {
         appendCanvasActionResultBlock(result);
@@ -4008,14 +4127,9 @@
     }
   }
 
-  function markApprovalBlockResolved(approvalId, status) {
+  function removeApprovalBlock(approvalId) {
     state.messages.forEach(msg => {
-      (msg.blocks || []).forEach(block => {
-        if (block.type === 'choice' && safeStr(block.approval_id) === approvalId) {
-          block.status = status;
-          block.decision = status;
-        }
-      });
+      msg.blocks = (msg.blocks || []).filter(block => !(block.type === 'choice' && safeStr(block.approval_id) === approvalId));
     });
   }
 

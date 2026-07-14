@@ -1038,6 +1038,7 @@ body.cm-resizing {
     flex-shrink: 0;
 }
 .cm-composer {
+    position: relative;
     border: 1px solid var(--line, #e8edf3);
     border-radius: 10px;
     background: var(--card, #fff);
@@ -1412,7 +1413,7 @@ body.cm-resizing {
 .cm-input {
     width: 100%;
     min-height: 50px;
-    max-height: 160px;
+    max-height: min(45vh, 420px);
     padding: 9px 10px 6px;
     border: 0;
     border-radius: 0;
@@ -1423,8 +1424,36 @@ body.cm-resizing {
     font-family: inherit;
     box-sizing: border-box;
     overflow-y: auto;
+    resize: none;
     white-space: pre-wrap;
     word-break: break-word;
+}
+.cm-input-resize-handle {
+    position: absolute;
+    z-index: 4;
+    top: 0;
+    left: 50%;
+    width: 72px;
+    height: 12px;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    cursor: ns-resize;
+    touch-action: none;
+    user-select: none;
+}
+.cm-input-resize-handle span {
+    width: 36px;
+    height: 2px;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, .48);
+    transition: width .15s ease, background .15s ease;
+}
+.cm-input-resize-handle:hover span,
+body.cm-resizing-input .cm-input-resize-handle span {
+    width: 48px;
+    background: rgba(148, 163, 184, .82);
 }
 .cm-input:focus { outline: none; }
 .cm-input.cm-input-disabled { opacity: 0.5; }
