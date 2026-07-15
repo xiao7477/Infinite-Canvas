@@ -70,7 +70,11 @@ For Agent-created image nodes, an explicit aspect ratio is converted into a conc
 
 GPT CLI image nodes submit the native `$imagegen` instruction through the currently logged-in Codex CLI and collect its local output. They do not require, probe, or silently fall back through a separate `gpt-image-2-skill`; the canvas GPT CLI configuration remains the sole execution path.
 
-GPT CLI image output capture is serialized across concurrent canvas tasks. Codex may write a reused descriptive filename into the shared output directory, so each completed task immediately atomically renames its detected output to a unique `codex_<id>` filename before the next task starts. This keeps batch prompts and their returned node thumbnails one-to-one instead of allowing later results to overwrite earlier URLs, without leaving a duplicate source file in the asset manager.
+GPT CLI and Gemini CLI image outputs use task-owned flat filenames in the shared output directory: `codex_<canvas_task_id>.png` and `gemini_cli_<canvas_task_id>.png` (with an item suffix when one request asks for multiple images). The adapters require the CLI to write that exact path and never scan the output directory for recently modified images. If a CLI ignores the requested name but explicitly reports its own output path, the compatibility path copies that file into the task-owned target; it never renames or removes the source asset. This prevents concurrent providers from claiming each other's files while avoiding one folder per provider task.
+
+Antigravity CLI discovery is independent of how the web server was launched. Besides explicit `ANTIGRAVITY_BIN` / `AGY_BIN` configuration and the process `PATH`, the backend checks common user-local and system locations such as `~/.local/bin/agy`, Homebrew, `/usr/local/bin`, and Windows WinGet. This avoids a false “not installed” state when a desktop-launched or restarted server inherits a reduced `PATH`.
+
+Manual smart-canvas generation still uses the original node lifecycle: create one backend task per pending node, poll that exact task ID, then fill the returned result into that node. The task-owned filename rule is limited to the custom GPT/Gemini CLI provider adapters and does not alter original selection, dragging, node creation, polling, or result fill-back behavior.
 
 When one Agent generation request creates multiple sibling nodes, they use compact vertical batch placement: one nearby column with normal node spacing. The placement resolver treats already-created siblings as occupied and selects the next free row, so it does not apply the batch index twice and scatter the same batch across the canvas.
 
@@ -110,7 +114,7 @@ The work directory dropdown lists only directories used by the current canvas an
 
 The history dropdown has compact hover-labelled Lucide icon controls for `当前` (`folder-open`), `全部` (`folders`), and sorting (`arrow-up-down`). They use the same 24px borderless visual language as the top panel actions. `当前` shows sessions under the selected work directory, while `全部` groups every current-canvas session by work directory; both views support `按添加时间排序` and `按最新使用时间排序`. Selecting a session from another group switches the work directory first, then restores that conversation.
 
-Within an Agent reply, adjacent tool and command events are rendered as a single collapsible summary at their original position in the reply stream (for example, after one paragraph and before the next). Thinking, temporary send status, and cleaned-empty protocol blocks never split an otherwise adjacent tool group. Its one-line count places commands before tools; expanded entries are border cards with a Lucide type icon, status, command/tool name, and output. The summary contains no time or repeated `工具与命令` title. A separate reply-level `已处理 · 耗时` line stays at the top of the reply and reveals the whole-turn completion timestamp only on hover.
+Reasoning events are retained internally for turn recovery and diagnostics but are never rendered in the chat UI, either while streaming or inside the completed process archive. A hidden reasoning event does not split adjacent tool/command events, so calls immediately before and after it remain one merged process row. Other intermediate text, adjacent tool/command groups, errors, and action cards remain visible in timeline order while a turn is running. When the turn completes, that working timeline is compacted under one top-level `已处理 · 耗时` disclosure: intermediate text, tool groups, and errors move into the collapsed process archive. Legacy history without a message-level completion timestamp is also treated as complete when every process group is terminal and at least one group has an end timestamp, so the compact rendering applies without rewriting stored history. Errors use quiet small text rather than red alert cards. Successful staged Canvas action cards are deduplicated by affected node and merged into one final result card, followed by the final Agent conclusion. Hovering the top summary reveals the whole-turn completion timestamp.
 
 Canvas-action result cards are compact, default-expanded `<details>` blocks: the title uses an icon plus a created-node summary such as `已生成 2个生图节点` or `已创建 1个提示词节点，2个生图节点`; the expanded content contains only node locator chips. Backend-hosted generation writes `runStartedAt`, `runFinishedAt`, and `runElapsedMs` to the node so its completed duration remains correct after refresh.
 
@@ -211,6 +215,7 @@ Backend action support currently covers deterministic canvas edits. Full backend
 - Agent grouping should reuse the existing smart group behavior: images are absorbed into the group thumbnail grid; prompt and loop nodes remain group members.
 - Backend Agent tasks should treat conflicts as partial success: if a target node, thread, or image index no longer exists, skip that item, report it, and continue applying valid edits.
 - Agent placement uses three scopes: `viewport` means the visible smart canvas viewport captured at send time, `global` means the bounds of all canvas content, and `node` means relative to a selected/reference node. `viewport` placement first anchors to the node cluster visible in or near that viewport, then expands outward on the requested side; it should not stick to the viewport corner or fly away from nearby nodes. Backend collision checks should use the real node sizes sent in the front-end context snapshot when available. Later user pan/zoom during Agent thinking must not change that turn's `viewport` placement.
+- After an Agent-owned write, the private same-turn snapshot advances both its persisted canvas data and its in-memory node geometry. A later layout Tool therefore uses sizes and positions produced by an earlier resize/move Tool in that turn instead of stale send-time DOM bounds; this prevents enlarged nodes from overlapping and avoids treating the Agent's own preceding write as an external canvas change.
 - Restoring a saved panel thread must resume that exact Codex thread. If a project app-server process is already running for a different thread, restart it and call `thread/resume` for the requested thread instead of silently reusing the current process.
 - The Agent panel has explicit status states: `booting`, `loading_projects`, `opening_project`, `loading_history`, `reconnecting_task`, `ready`, `busy`, and `error`. During boot/loading/reconnect states, message input, send, project switch, history switch, new session, and attachment controls must stay locked and show a loading hint instead of appearing ready.
 - Refresh recovery order is: show local snapshot as a temporary UI, fetch backend latest panel state, open/resume the exact thread, fetch exact backend panel state, reconnect active background task, and only use Codex session replay when no panel state exists.
@@ -373,8 +378,8 @@ send / stop
 /创建生图节点
 /创建视频节点
 /总结画布
-/定位
-/批量处理
+/搜索节点
+/批量任务
 ```
 
 Mode selector:
@@ -408,8 +413,20 @@ Current implementation status:
 
 - The floating panel composer has Codex-style toolbar controls for attachment, `@`, `/`, mode, scope, approval policy, and send/stop.
 - `@` opens the attachment/reference picker and inserts `@图N` tokens.
-- `/` opens a command picker for common canvas tasks such as organize, rename, prompt generation, image/video node creation, summarize, locate, and batch processing.
-- `/` commands now come from the backend Canvas command registry instead of a second hard-coded frontend business list. The canonical batch label is `/批量任务`; `/批量处理` remains an input alias.
+- `/` opens a command picker for common canvas tasks such as organize, rename, prompt generation, image/video node creation, summarize, node search, and batch tasks.
+- `/搜索节点` asks the Agent to interpret a name, content, type, position, or semantic description and query the send-time canvas snapshot with `search_canvas_nodes`. Matching nodes are emitted as a persistent `node_locator` result block; clicking a result calls the smart-canvas `focusNodes(ids)` bridge to center and select it. The former `/定位` command is not registered as an alias because search itself is read-only and does not move the viewport until the user clicks a result.
+- `/` commands come from the backend Canvas command registry. `/批量任务` is the only public batch command; the former names and aliases are not registered.
+- `/批量任务` makes the main Agent plan a flat list of independent image/video generation nodes and call `create_batch_task` exactly once. It does not accept stages, DAG dependencies, review checkpoints, or child Agents.
+- Slash commands are recognized even when attached directly after Chinese prose (for example `生成两张图/批量任务`). Generation-setting queries use the live server Provider configuration as the availability source, while the frontend snapshot only supplies the user's currently selected defaults; a missing snapshot Provider list therefore cannot cause a false “no Provider configured” refusal.
+- Before any node is created, the panel shows one batch-plan confirmation card grouped by node type and Provider, including output count and concurrency. Clicking “确认执行” creates the Agent-only `smart-agent-task` node and starts the server queue; it does not trigger a second risk confirmation.
+- Task nodes use the same `316×240` default footprint and visual scale as prompt nodes while remaining manually resizable. The title chip is visually prominent, while the stage/progress/count area is inset from the node edge. Their progress is published after every item transition: successful items occupy a blue-cyan segment, terminal failures occupy a proportional orange-red segment, and unfinished items remain on the empty track. A finished partial-success task therefore reaches 100% without hiding the success/failure split.
+- While a batch is queued, running, waiting for a Provider, reviewing, or retrying, its outer border shows a subtle slow-moving blue-cyan highlight. The effect stops for paused, waiting-user, completed, failed, partially completed, and cancelled states, and becomes static when the operating system requests reduced motion.
+- Task detail opens as an independent canvas modal instead of replacing the Agent chat. It has explicit light/dark surfaces at every level and lists every planned generation node with live status, attempts, update time, locate action, prompt, references, parameters, and item error.
+- Batch-owned image/video nodes persist the same `runPrompt`, reference, and `runSettings` metadata used by ordinary generated nodes, so selecting them restores the original prompt, reference thumbnails, Provider, model, size, and video parameters.
+- Every batch-owned generation node writes its terminal result into the canvas's existing `canvas.logs` stream. Success entries include Provider, model, request parameters, prompt, references, output thumbnails, node ID, and elapsed time; exhausted retries produce one failed entry. Internal retry attempts remain in task detail instead of flooding the canvas log, while a later explicit retry may add a new terminal entry.
+- When a batch reaches its terminal state, the queue performs one task-scoped finishing layout: stages become left-to-right columns, items within each stage are stacked top-to-bottom using their actual or planned aspect-aware display size plus a fixed gap. This prevents portrait outputs from overlapping; it moves only nodes owned by that batch and preserves any explicit node size already set while the task was running.
+- Reference metadata keeps the original Provider-facing URL and a separate browser-safe `displayUrl`; local paths therefore render in both the task log and generated-node reference strip without changing the source used for reruns.
+- Provider concurrency, retries and restart recovery are handled by the persistent queue without creating a Codex child Thread. A failed item releases its Provider slot immediately; untouched queued items run before a delayed retry becomes eligible.
 - Each registered command selects one Canvas-only Skill from `agent/skills/`. These Skills are loaded only for the matching Canvas Agent turn and are not installed as global/project Codex Skills.
 - Mode/scope/approval buttons currently cycle lightweight state and are included in the turn canvas context as `agentInput`.
 - Approval policy applies to canvas write Tools; read-only context queries always run automatically:
@@ -459,7 +476,7 @@ Current implementation status:
 - Provider/model catalogs are no longer embedded in generation turns. `get_generation_settings` returns current image/video defaults and available models only when the user names a platform/model or asks what is available.
 - The browser request no longer duplicates full-canvas nodes or connections. It sends viewport/selection metadata and a bounded selected-node geometry sample; the backend persists the authoritative full snapshot for Tool queries and placement.
 - The bottom hint shows automatic context routing instead of manual mode/scope buttons.
-- Query tools read that immutable send-time snapshot by default; `search_canvas_nodes` is paginated and bounded. Write tools re-load the live canvas and re-resolve targets before mutation, so changed/deleted targets are skipped safely.
+- Query tools start from the immutable send-time snapshot; `search_canvas_nodes` is paginated and bounded. After a successful Agent-owned write, the same turn advances a private working copy of that snapshot and its Revision to the newly saved canvas. Later queries/writes in that turn therefore see the Agent's own prior changes, while unrelated user/external changes still produce a Revision conflict. Write tools always re-load the live canvas and re-resolve targets before mutation, so changed/deleted targets are skipped safely.
 - Native Tool results return directly through the paused App Server request and render as chronological tool blocks; no follow-up turn is required.
 
 ### Canvas Revision
@@ -468,6 +485,7 @@ Current implementation status:
 - A structural fingerprint observes nodes, connections, title and settings. Viewport, logs and timestamps do not advance Revision.
 - Every send-time context snapshot records `canvas_revision`, and query Tool results return it.
 - Broad writes, deletes and confirmed undo operations compare the send-time/explicit expected Revision with the live canvas. A mismatch returns a structured conflict and performs no write.
+- A successful Agent write advances only that turn's private working snapshot and expected Revision. It does not relax external-change detection or modify the original canvas schema.
 - Targeted low-risk writes may safely re-resolve live targets; missing targets continue to be skipped instead of turning unrelated canvas edits into a full-task failure.
 
 ### Agent Backend Isolation

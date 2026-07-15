@@ -165,7 +165,7 @@ class CodexAppServerSession:
             )
             await self.respond_dynamic_tool_call(request_id, response)
 
-    async def send_user_message(self, text: str, image_paths=None, timeout: int = 900):
+    async def send_user_message(self, text: str, image_paths=None, timeout: int = 900, sandbox_policy: Optional[Dict[str, Any]] = None):
         user_content = [{"type": "text", "text": text, "text_elements": []}]
         for path in image_paths or []:
             if isinstance(path, dict):
@@ -186,7 +186,7 @@ class CodexAppServerSession:
                     "personality": "friendly",
                     "model": None,
                     "approvalPolicy": "never",
-                    "sandboxPolicy": {"type": "workspaceWrite"},
+                    "sandboxPolicy": sandbox_policy or {"type": "workspaceWrite"},
                 },
                 timeout=180,
             )
@@ -324,8 +324,8 @@ class CodexAppServerRuntime:
     async def stop(self) -> None:
         await self.session.stop()
 
-    async def send_user_message(self, text: str, image_paths=None):
-        async for event in self.session.send_user_message(text, image_paths):
+    async def send_user_message(self, text: str, image_paths=None, sandbox_policy: Optional[Dict[str, Any]] = None):
+        async for event in self.session.send_user_message(text, image_paths, sandbox_policy=sandbox_policy):
             yield event
 
     @property

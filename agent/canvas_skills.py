@@ -94,11 +94,11 @@ _COMMANDS: List[Dict[str, Any]] = [
         "risk": "read",
     },
     {
-        "id": "locate",
-        "command": "/定位",
+        "id": "search-nodes",
+        "command": "/搜索节点",
         "aliases": [],
-        "title": "定位",
-        "description": "定位、选中或高亮相关节点",
+        "title": "搜索节点",
+        "description": "按名称、内容、类型或语义描述查找节点",
         "skill": "infinite-canvas-analysis",
         "intent": "canvas_operation",
         "context_level": 2,
@@ -107,18 +107,18 @@ _COMMANDS: List[Dict[str, Any]] = [
         "risk": "read",
     },
     {
-        "id": "batch",
+        "id": "batch-task",
         "command": "/批量任务",
-        "aliases": ["/批量处理"],
+        "aliases": [],
         "title": "批量任务",
-        "description": "使用现有画布工具规划并执行多步任务",
-        "skill": "infinite-canvas-batch-planning",
+        "description": "规划独立生成节点并按平台并发排队执行",
+        "skill": "infinite-canvas-batch-task",
         "intent": "global_canvas",
         "context_level": 3,
         "default_scope": "canvas",
         "generation_context": True,
         "risk": "expensive",
-        "task_node_available": False,
+        "task_node_available": True,
     },
 ]
 
@@ -128,7 +128,7 @@ _SKILL_KEYWORDS = (
     ("infinite-canvas-asset-naming", re.compile(r"重命名|改名|命名规则|素材名", re.I)),
     ("infinite-canvas-organize", re.compile(r"整理|排列|布局|分组|取消分组|移动节点", re.I)),
     ("infinite-canvas-prompt-workflow", re.compile(r"提示词|prompt|反推|拆镜", re.I)),
-    ("infinite-canvas-analysis", re.compile(r"总结画布|定位|找到|上下游|连接关系", re.I)),
+    ("infinite-canvas-analysis", re.compile(r"总结画布|搜索节点|查找节点|找到|上下游|连接关系", re.I)),
 )
 
 
@@ -150,13 +150,10 @@ def resolve_command(value: str) -> Optional[Dict[str, Any]]:
     for item in _COMMANDS:
         if direct in _command_tokens(item):
             return dict(item)
-    match = re.search(r"(?:^|\s)(/[^\s/]+)", text)
-    if not match:
-        return None
-    token = match.group(1)
     for item in _COMMANDS:
-        if token in _command_tokens(item):
-            return dict(item)
+        for token in _command_tokens(item):
+            if token and re.search(re.escape(token) + r"(?=$|\s|[，。；：！？、,.!?;:])", text, re.I):
+                return dict(item)
     return None
 
 

@@ -445,7 +445,7 @@ function uid(prefix){ return `${prefix}_${Math.random().toString(36).slice(2, 10
 function escapeHtml(str){ return String(str == null ? '' : str).replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s])); }
 const escapeAttr = escapeHtml;
 function smartOriginalMediaUrl(itemOrUrl){
-    const raw = typeof itemOrUrl === 'string' ? itemOrUrl : (itemOrUrl?.url || '');
+    const raw = typeof itemOrUrl === 'string' ? itemOrUrl : (itemOrUrl?.displayUrl || itemOrUrl?.url || '');
     const text = String(raw || '');
     if(!text) return '';
     try {
@@ -988,6 +988,33 @@ function isSmartImageNode(node){
 function isSmartGroupNode(node){
     return Boolean(node && node.type === 'smart-group');
 }
+function isSmartAgentTaskNode(node){
+    return Boolean(node && node.type === 'smart-agent-task');
+}
+
+function smartAgentReferenceDisplayUrl(value){
+    let text = String(value || '').trim();
+    if(!text) return '';
+    if(/^(data:|blob:|https?:\/\/)/i.test(text)) return text;
+    if(text.startsWith('/assets/') || text.startsWith('/output/') || text.startsWith('/api/')) return text;
+    if(/^file:\/\//i.test(text)){
+        text = text.slice('file://'.length);
+        try { text = decodeURIComponent(text); } catch(e) {}
+    }
+    return `/api/codex-agent/file/view?path=${encodeURIComponent(text)}`;
+}
+
+function normalizeSmartAgentReferencePreviews(node){
+    if(!node?.agentGenerated && !node?.complexTaskItemId) return;
+    ['runPromptRefs','runInputRefs'].forEach(key => {
+        if(!Array.isArray(node[key])) return;
+        node[key] = node[key].map(raw => {
+            const ref = typeof raw === 'string' ? {url:raw} : {...(raw || {})};
+            if(ref.url && !ref.displayUrl) ref.displayUrl = smartAgentReferenceDisplayUrl(ref.url);
+            return ref;
+        });
+    });
+}
 function isSmartRunnableNode(node){
     return Boolean(isSmartImageNode(node) || isSmartGroupNode(node));
 }
@@ -1009,6 +1036,16 @@ function smartImageUsesWorkflowInput(node, ctx=smartLoopContext){
 }
 function normalizeLegacySmartNode(node){
     if(!node || typeof node !== 'object') return node;
+    if(node.type === 'smart-agent-task'){
+        const width = Number(node.w);
+        const height = Number(node.h);
+        if(!Number.isFinite(width) || !Number.isFinite(height) || (Math.round(width) === 360 && Math.round(height) === 250)){
+            node.w = 316;
+            node.h = 240;
+        }
+        return node;
+    }
+    normalizeSmartAgentReferencePreviews(node);
     if(node.type === 'smart-container'){
         const fallbackImage = node.inputImage?.url ? stripImageGenerationMeta({
             url:node.inputImage.url,
@@ -1850,6 +1887,7 @@ function smartGroupImageGridLayout(node){
     return {cols, rows, visibleRows, width, height, thumb:baseThumb};
 }
 function imageLayout(images, scale=1, node=null){
+    if(isSmartAgentTaskNode(node)) return {cols:1, rows:1, width:Math.round(Number(node.w) || 316), height:Math.round(Number(node.h) || 240), thumb:96, single:true};
     if(node?.type === 'smart-group'){
         const groupThumbLayout = smartGroupThumbLayout(node);
         if(groupThumbLayout) return groupThumbLayout;
@@ -5999,7 +6037,7 @@ function cloneSmartNode(node, dx=0, dy=0){
 function copySelectedNodes(){
     if(!canvas || isEditableTarget(document.activeElement)) return;
     const ids = selectedNodeIds();
-    const copiedNodes = ids.map(id => nodes.find(n => n.id === id)).filter(Boolean);
+    const copiedNodes = ids.map(id => nodes.find(n => n.id === id)).filter(node => node && !isSmartAgentTaskNode(node));
     if(!copiedNodes.length) return;
     const idSet = new Set(copiedNodes.map(n => n.id));
     const copiedConnections = (canvas.connections || []).filter(c => idSet.has(c.from) && idSet.has(c.to));
@@ -6234,7 +6272,7 @@ function smartAgentGridPoint(index, total, options={}){
 }
 function smartAgentNodeSummary(node){
     const rect = nodeRect(node);
-    return {
+    const summary = {
         id:node.id,
         type:node.type || 'smart-image',
         title:node.title || '',
@@ -6250,6 +6288,10 @@ function smartAgentNodeSummary(node){
             kind:mediaKindForItem(img)
         }))
     };
+    if(isSmartAgentTaskNode(node)){
+        summary.task = {status:node.taskStatus || '', mode:node.taskMode || '', progress:node.taskProgress || {}, question:node.taskQuestion || '', link_visibility:node.linkVisibility || 'visible'};
+    }
+    return summary;
 }
 function smartAgentFocusNodes(ids=[]){
     const list = (Array.isArray(ids) ? ids : [ids]).map(id => String(id || '')).filter(Boolean);
@@ -7566,7 +7608,7 @@ function installSmartCanvasAgentApi(){
 installSmartCanvasAgentApi();
 function duplicateForAltDrag(node, preserveConnections=false){
     const ids = (isNodeSelected(node.id) ? selectedNodeIds() : [node.id]);
-    const sourceNodes = ids.map(id => nodes.find(n => n.id === id)).filter(Boolean);
+    const sourceNodes = ids.map(id => nodes.find(n => n.id === id)).filter(node => node && !isSmartAgentTaskNode(node));
     if(!sourceNodes.length) return node;
     pushUndo();
     const idMap = new Map();
@@ -7615,7 +7657,7 @@ function shellPoint(event){
     return {x:event.clientX - rect.left, y:event.clientY - rect.top};
 }
 function renderConnections(){
-    const conns = (canvas?.connections || []).map((conn, index) => ({...conn, index})).filter(c => nodes.some(n => n.id === c.from) && nodes.some(n => n.id === c.to));
+    const conns = (canvas?.connections || []).map((conn, index) => ({...conn, index})).filter(c => nodes.some(n => n.id === c.from) && nodes.some(n => n.id === c.to) && smartAgentTaskConnectionVisible(c));
     const cascadeKeys = cascadeConnectionKeys();
     const activeCascadeCount = (smartCascadeRunPath?.states && Object.values(smartCascadeRunPath.states).filter(state => state && state !== 'done').length) || 0;
     const reduceMotion = activeCascadeCount > 24;
@@ -7685,6 +7727,20 @@ function renderConnections(){
         return `<path class="${cls}" d="${curve}" stroke="${color}" stroke-width="${width}" fill="none" opacity="${opacity}"></path><path class="conn-hit" data-conn-index="${dataIndex}" d="${curve}" stroke="transparent" stroke-width="14" fill="none"></path><circle cx="${tx}" cy="${ty}" r="3.5" fill="${color}" opacity=".66"></circle><g class="conn-cut" data-conn-index="${dataIndex}" transform="translate(${mx} ${my})"><circle r="8" fill="var(--card)" stroke="${color}" stroke-width="1.4"></circle><path d="M-3 -3 L3 3 M3 -3 L-3 3" stroke="${color}" stroke-width="1.5" stroke-linecap="round"></path></g>`;
     }).join('');
     return `<svg class="connection-layer ${reduceMotion ? 'conn-reduce-motion' : ''}" width="6000" height="4000" viewBox="0 0 6000 4000" xmlns="http://www.w3.org/2000/svg">${paths}</svg>`;
+}
+function smartAgentTaskConnectionVisible(conn){
+    const from = nodes.find(node => node.id === conn?.from);
+    const to = nodes.find(node => node.id === conn?.to);
+    const taskId = from?.complexTaskId || to?.complexTaskId || '';
+    if(!taskId) return true;
+    const root = nodes.find(node => isSmartAgentTaskNode(node) && node.complexTaskId === taskId);
+    const visibility = root?.linkVisibility || 'visible';
+    if(visibility === 'hidden') return false;
+    if(visibility === 'main'){
+        if(isSmartAgentTaskNode(from) || isSmartAgentTaskNode(to)) return true;
+        return Boolean(from?.complexTaskStageId && to?.complexTaskStageId && from.complexTaskStageId !== to.complexTaskStageId);
+    }
+    return true;
 }
 function refreshConnectionLayer(){
     connectionLayerRaf = 0;
@@ -8696,6 +8752,7 @@ function smartGroupBodyHtml(node){
     </div>`;
 }
 function nodeBodyHtml(node, layout){
+    if(isSmartAgentTaskNode(node)) return smartAgentTaskBodyHtml(node);
     if(node.type === 'smart-group') return smartGroupBodyHtml(node);
     if(node.type === 'smart-prompt') return promptNodeBodyHtml(node);
     if(node.type === 'smart-loop') return smartLoopBodyHtml(node);
@@ -8730,6 +8787,37 @@ function nodeBodyHtml(node, layout){
         <span class="upload-node-main"><i data-lucide="upload-cloud"></i></span>
         <span class="upload-node-title">${escapeHtml(tr('smart.createImportNode'))}</span>
         <span class="upload-node-sub">拖拽 / 粘贴 / 点击上传</span>
+    </div>`;
+}
+function smartAgentTaskStatusLabel(status){
+    return ({draft:'草稿',planned:'已规划',queued:'排队中',running:'执行中',reviewing:'子 Agent 验收',waiting_provider:'等待平台',waiting_user:'等待用户',retrying:'重试中',paused:'已暂停',partially_completed:'部分完成',completed:'已完成',failed:'失败',cancelled:'已取消'})[status] || status || '未知';
+}
+function smartAgentTaskBodyHtml(node){
+    const progress = node.taskProgress || {};
+    const total = Math.max(0, Number(progress.total || 0));
+    const completed = Math.max(0, Number(progress.completed || 0));
+    const failed = Math.max(0, Number(progress.failed || 0));
+    const processed = Math.max(0, Number(progress.processed ?? (completed + failed)));
+    const percent = total ? Math.max(0, Math.min(100, Math.round(processed / total * 100))) : 0;
+    const completedPercent = total ? Math.max(0, Math.min(100, completed / total * 100)) : 0;
+    const failedPercent = total ? Math.max(0, Math.min(100 - completedPercent, failed / total * 100)) : 0;
+    const status = String(node.taskStatus || 'queued');
+    const active = !['completed','partially_completed','failed','cancelled'].includes(status);
+    const message = node.taskQuestion || node.taskError || progress.recent_event || '';
+    const messageClass = node.taskQuestion ? 'smart-agent-task-question' : node.taskError ? 'smart-agent-task-error' : 'smart-agent-task-event';
+    return `<div class="smart-agent-task-card ${escapeAttr(status)}">
+        <div class="smart-agent-task-top"><span class="smart-agent-task-mode">批量队列</span><strong>${escapeHtml(smartAgentTaskStatusLabel(status))}</strong></div>
+        <div class="smart-agent-task-stage">${escapeHtml(progress.current_stage || '等待开始')}</div>
+        <div class="smart-agent-task-progress" role="progressbar" aria-label="批量任务进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><i class="smart-agent-task-progress-success" style="width:${completedPercent}%"></i><i class="smart-agent-task-progress-failed" style="width:${failedPercent}%"></i></div>
+        <div class="smart-agent-task-counts"><span>${completed}/${total} 完成</span><span>${failed} 失败</span><span>${Number(progress.retrying || 0)} 重试</span><span>${Number(progress.waiting || 0)} 等待</span></div>
+        ${node.taskQuestion ? `<button type="button" class="smart-agent-task-message ${messageClass}" data-task-detail="${escapeAttr(node.complexTaskId)}"><i data-lucide="message-circle-question"></i><span>${escapeHtml(message)}</span></button>` : `<div class="smart-agent-task-message ${messageClass}">${message ? escapeHtml(message) : '&nbsp;'}</div>`}
+        <div class="smart-agent-task-actions">
+            <button type="button" data-task-detail="${escapeAttr(node.complexTaskId)}"><i data-lucide="list-tree"></i><span>详情</span></button>
+            ${active && status !== 'paused' ? `<button type="button" data-task-control="pause" data-task-id="${escapeAttr(node.complexTaskId)}"><i data-lucide="pause"></i><span>暂停</span></button>` : ''}
+            ${status === 'paused' ? `<button type="button" data-task-control="resume" data-task-id="${escapeAttr(node.complexTaskId)}"><i data-lucide="play"></i><span>继续</span></button>` : ''}
+            ${active ? `<button type="button" data-task-control="cancel" data-task-id="${escapeAttr(node.complexTaskId)}"><i data-lucide="square"></i><span>取消</span></button>` : ''}
+            <button type="button" data-task-links="${escapeAttr(node.complexTaskId)}"><i data-lucide="git-branch"></i><span>${node.linkVisibility === 'hidden' ? '连线隐藏' : node.linkVisibility === 'main' ? '主干连线' : '全部连线'}</span></button>
+        </div>
     </div>`;
 }
 function jimengPendingBodyHtml(node, layout){
@@ -8975,7 +9063,9 @@ function render(){
         .sort((a, b) => (isSmartGroupNode(a) ? 0 : 1) - (isSmartGroupNode(b) ? 0 : 1))
         .map(node => {
         const imgs = node.images || [];
-        const title = node.type === 'smart-group' ? (node.title === '万能分组' ? '智能分组' : (node.title || '智能分组')) : node.type === 'smart-prompt' ? 'Prompt' : node.type === 'smart-loop' ? 'Loop' : (imgs.length > 1 ? 'Group' : imgs.length ? 'Image' : escapeHtml(tr('smart.createImportNode')));
+        const isAgentTask = isSmartAgentTaskNode(node);
+        const isAgentTaskRunning = isAgentTask && ['queued','running','reviewing','waiting_provider','retrying'].includes(String(node.taskStatus || 'queued'));
+        const title = isAgentTask ? (node.title || '批量任务') : node.type === 'smart-group' ? (node.title === '万能分组' ? '智能分组' : (node.title || '智能分组')) : node.type === 'smart-prompt' ? 'Prompt' : node.type === 'smart-loop' ? 'Loop' : (imgs.length > 1 ? 'Group' : imgs.length ? 'Image' : escapeHtml(tr('smart.createImportNode')));
         const scale = nodeScale(node);
         const layout = imageLayout(imgs, scale, node);
         const isPrompt = node.type === 'smart-prompt';
@@ -8991,16 +9081,16 @@ function render(){
         const isPending = ((node.pending || isQueued || isJimengPending) && imgs.length === 0);
         const body = nodeBodyHtml(node, layout);
         const deleteBtn = isGroup ? '' : `<button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button>`;
-        const hint = isSmartGroup ? '双击添加 · 拖入归组 · 选中后生成' : isPending ? escapeHtml(tr('smart.hintPending')) : (imgs.length > 1 ? escapeHtml(tr('smart.hintMulti')) : imgs.length ? escapeHtml(tr('smart.hintSingle')) : escapeHtml(tr('smart.hintEmpty')));
-        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isCompactMember ? 'smart-group-member-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
+        const hint = isAgentTask ? 'Agent 专用任务节点' : isSmartGroup ? '双击添加 · 拖入归组 · 选中后生成' : isPending ? escapeHtml(tr('smart.hintPending')) : (imgs.length > 1 ? escapeHtml(tr('smart.hintMulti')) : imgs.length ? escapeHtml(tr('smart.hintSingle')) : escapeHtml(tr('smart.hintEmpty')));
+        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isAgentTask ? 'smart-agent-task-node' : ''} ${isAgentTaskRunning ? 'smart-agent-task-running' : ''} ${isCompactMember ? 'smart-group-member-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
             <div class="node-head"><div class="node-title">${title}</div><div class="node-actions">${deleteBtn}</div></div>
-            ${!isEmpty && !isGroup ? `<div class="floating-node-actions"><button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button></div>` : ''}
+            ${!isEmpty && !isGroup && !isAgentTask ? `<div class="floating-node-actions"><button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button></div>` : ''}
             ${smartNodeToolbarHtml(node)}${smartGroupToolbarHtml(node)}
             ${runTimePillHtml(node)}
             <div class="node-body">${body}</div>
             ${isCompactMember && (isPrompt || isLoop) ? '<div class="smart-group-member-grab" title="拖动移出分组"></div>' : ''}
             <div class="node-hint">${hint}</div>
-            ${imgs.length || node.pending || isQueued || isJimengPending || isPrompt || isLoop || isSmartGroup ? '<div class="node-resize-handle" data-resize="1"></div>' : ''}
+            ${imgs.length || node.pending || isQueued || isJimengPending || isPrompt || isLoop || isSmartGroup || isAgentTask ? '<div class="node-resize-handle" data-resize="1"></div>' : ''}
             <div class="node-port port-in" data-port="in" title="input"></div>
             <div class="node-port port-out" data-port="out" title="output"></div>
         </div>`;
@@ -9598,12 +9688,57 @@ function pickMediaForSmartNode(nodeId){
     document.body.appendChild(input);
     input.click();
 }
+async function smartAgentControlComplexTask(taskId, action){
+    const response = await fetch(`/api/codex-agent/complex-tasks/${encodeURIComponent(taskId)}/control`, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action})
+    });
+    if(!response.ok) throw new Error(await response.text());
+    const data = await response.json();
+    await mergeReloadCanvasNow();
+    return data.task || null;
+}
+function smartAgentOpenComplexTask(taskId){
+    if(!taskId) return;
+    if(window.InfiniteCanvasAgentPanel?.openComplexTask){
+        window.InfiniteCanvasAgentPanel.openComplexTask(taskId);
+        return;
+    }
+    window.dispatchEvent(new CustomEvent('infinite-canvas:open-complex-task', {detail:{taskId}}));
+}
+function bindSmartAgentTaskControls(el, node){
+    el.querySelectorAll('[data-task-detail]').forEach(btn => {
+        btn.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); }, true);
+        btn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); smartAgentOpenComplexTask(btn.dataset.taskDetail || node.complexTaskId); });
+    });
+    el.querySelectorAll('[data-task-control]').forEach(btn => {
+        btn.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); }, true);
+        btn.addEventListener('click', async e => {
+            e.preventDefault(); e.stopPropagation();
+            const action = btn.dataset.taskControl;
+            if(action === 'cancel' && !window.confirm('确定取消这个批量任务吗？已经提交平台的项目会继续回收结果。')) return;
+            btn.disabled = true;
+            try { await smartAgentControlComplexTask(btn.dataset.taskId || node.complexTaskId, action); }
+            catch(err){ toast((err.message || '批量任务操作失败').slice(0, 160)); }
+            finally { btn.disabled = false; }
+        });
+    });
+    el.querySelectorAll('[data-task-links]').forEach(btn => {
+        btn.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); }, true);
+        btn.addEventListener('click', async e => {
+            e.preventDefault(); e.stopPropagation();
+            const next = node.linkVisibility === 'visible' ? 'main' : node.linkVisibility === 'main' ? 'hidden' : 'visible';
+            try { await smartAgentControlComplexTask(node.complexTaskId, `links_${next}`); }
+            catch(err){ toast((err.message || '修改连线显示失败').slice(0, 160)); }
+        });
+    });
+}
 function bindNodeEvents(){
     world.querySelectorAll('.image-node').forEach(el => {
         const id = el.dataset.id;
         const nodeForControls = nodes.find(n => n.id === id);
         if(nodeForControls?.type === 'smart-prompt') bindPromptNodeControls(el, nodeForControls);
         if(nodeForControls?.type === 'smart-loop') bindLoopNodeControls(el, nodeForControls);
+        if(isSmartAgentTaskNode(nodeForControls)) bindSmartAgentTaskControls(el, nodeForControls);
         if(nodeForControls?.type === 'smart-group') {
             el.ondblclick = e => {
                 e.preventDefault();
@@ -10036,6 +10171,19 @@ function clearNodeMediaBeforeDelete(id){
     return true;
 }
 function deleteNodeFromButton(id){
+    const node = nodes.find(n => n.id === id);
+    if(isSmartAgentTaskNode(node)){
+        const active = !['completed','partially_completed','failed','cancelled'].includes(String(node.taskStatus || ''));
+        if(active && !window.confirm('删除运行中的批量任务节点会取消所有未提交项目；已经提交平台的任务仍会继续回收结果。确定删除吗？')) return;
+        (async () => {
+            if(active && node.complexTaskId){
+                try { await smartAgentControlComplexTask(node.complexTaskId, 'cancel'); }
+                catch(e){ toast((e.message || '取消批量任务失败').slice(0, 160)); return; }
+            }
+            deleteNode(id);
+        })();
+        return;
+    }
     if(clearNodeMediaBeforeDelete(id)) return;
     deleteNode(id);
 }
@@ -17249,8 +17397,8 @@ window.onmousemove = e => {
         if(!node) return;
         const dx = (e.clientX - resizeState.startX) / viewport.scale;
         const dy = (e.clientY - resizeState.startY) / viewport.scale;
-        const minW = node.type === 'smart-prompt' ? 260 : node.type === 'smart-loop' ? 252 : node.type === 'smart-group' ? SMART_GROUP_MIN_WIDTH : 48;
-        const minH = node.type === 'smart-prompt' ? 170 : node.type === 'smart-loop' ? 132 : node.type === 'smart-group' ? SMART_GROUP_MIN_HEIGHT : 48;
+        const minW = node.type === 'smart-agent-task' ? 260 : node.type === 'smart-prompt' ? 260 : node.type === 'smart-loop' ? 252 : node.type === 'smart-group' ? SMART_GROUP_MIN_WIDTH : 48;
+        const minH = node.type === 'smart-agent-task' ? 170 : node.type === 'smart-prompt' ? 170 : node.type === 'smart-loop' ? 132 : node.type === 'smart-group' ? SMART_GROUP_MIN_HEIGHT : 48;
         if(node.type === 'smart-group' && smartGroupImageRefs(node).some(ref => ref.item?.url)){
             // 图片分组：和普通节点一样直接改 w/h，缩略图网格按新尺寸实时重排。不要走下面的“成员缩放”那套，
             // 否则拖动过程里会按成员包围盒/缩放比例收缩，松手才回到拖动宽度（用户反馈的“变宽时先缩小”）。
@@ -17698,6 +17846,10 @@ window.addEventListener('keydown', e => {
     if((e.key === 'Delete' || e.key === 'Backspace') && (selectedId || selectedIds.length) && !isEditableTarget(e.target)){
         e.preventDefault();
         const ids = selectedIds.length ? selectedIds.slice() : [selectedId];
+        if(ids.some(id => isSmartAgentTaskNode(nodes.find(node => node.id === id)))){
+            ids.forEach(id => deleteNodeFromButton(id));
+            return;
+        }
         pushUndo();
         ids.forEach(id => { undoSuppressed = true; deleteNode(id); undoSuppressed = false; });
         render();

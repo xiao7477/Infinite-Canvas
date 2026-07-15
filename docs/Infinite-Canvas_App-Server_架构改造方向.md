@@ -38,7 +38,7 @@ Infinite Canvas Agent UI
 
 ```text
 第一阶段：架构收口 + 上下文 + Revision + Skills
-第二阶段：/批量任务 + 后台任务编排与执行引擎
+第二阶段：/批量任务 + 后台并发队列执行引擎
 ```
 
 ---
@@ -141,7 +141,7 @@ provider defaults（仅生成意图）
 
 本阶段不实现 Ollama、Claude、Gemini 等 Agent Runtime，也不建立泛化的多 Agent 框架。
 
-`/批量任务` 会有独立任务执行器，但这是 Canvas Agent 的专用子系统，不扩展成通用多 Agent 平台。
+`/批量任务` 使用独立后台队列执行器，但这是 Canvas Agent 的专用子系统，不扩展成通用多 Agent 平台。
 
 ---
 
@@ -347,8 +347,8 @@ Revision 优先作为 Agent 私有元数据存储，不改动原画布节点和�
 /创建生图节点
 /创建视频节点
 /总结画布
-/定位
-/批量任务（兼容别名 `/批量处理`）
+/搜索节点
+/批量任务
 ```
 
 每个命令只加载对应 Canvas Skill，并通过严格 Dynamic Tool 契约查询或修改画布。`/整理` 已进一步支持布局分析、尺寸标准化、块级空位移动、横纵宫格和递归节点树布局。
@@ -379,9 +379,9 @@ Provider Adapter
 {
   "id": "batch_task",
   "command": "/批量任务",
-  "aliases": ["/批量处理"],
+  "aliases": [],
   "title": "批量任务",
-  "description": "编排并执行多阶段画布任务",
+  "description": "规划独立生成节点并按平台并发排队执行",
   "skill": "infinite-canvas-batch-task",
   "intent": "batch_task",
   "default_scope": "canvas",
@@ -421,10 +421,10 @@ infinite-canvas-generation
 → 生图/视频节点创建、默认 Provider、参考图和生成校验
 
 infinite-canvas-analysis
-→ 画布总结、节点定位、上下游理解
+→ 画布总结、节点语义搜索、上下游理解
 
 infinite-canvas-batch-task
-→ 批量任务计划、DAG 编排、阶段验收和纠错
+→ 独立生成节点规划、一次确认和 Provider 并发队列
 ```
 
 Skill 只在任务命中时加载，不把全部 Skill 内容注入每轮对话。
@@ -444,13 +444,13 @@ Canvas Skills 默认只在 Infinite Canvas 的画布 Agent 中生效。它们不
 
 ---
 
-## 八、第二阶段重头功能：`/批量任务`
+## 八、第二阶段功能：`/批量任务`
 
-> 当前决策：本章作为后续设计备忘，不在本轮实现。本轮目标到现有架构、上下文、Skills、Revision 和代码隔离优化完成为止，不新增任务节点、DAG 或子 Agent 执行器。
+> 当前范围已简化：只做“主 Agent 规划完整节点清单 → 一次状态卡确认 → 后台按 Provider 并发排队创建并执行”。多阶段 DAG、子 Agent、内容验收和自动纠错不在当前范围。
 
 ### 8.1 产品目标
 
-`/批量任务` 是 Canvas Agent 的核心价值功能：让主 Agent 将一个多节点、多阶段、可能需要数小时的复杂任务编排后，交给独立的后台任务节点继续执行，主 Agent 可以继续处理其他对话和画布工作。
+`/批量任务` 用于把多个相互独立的生图或视频节点一次规划清楚，再交给后台队列按平台安全并发执行。主 Agent 只负责规划，不轮询 Provider，也不逐个调用普通生成工具。
 
 典型任务：
 
@@ -471,7 +471,7 @@ Canvas Skills 默认只在 Infinite Canvas 的画布 Agent 中生效。它们不
 新增一种 Agent 专用画布节点：
 
 ```text
-任务节点（Batch Task Node）
+任务节点（Complex Task Node）
 ```
 
 约束：
@@ -485,9 +485,11 @@ Canvas Skills 默认只在 Infinite Canvas 的画布 Agent 中生效。它们不
 
 节点类型和字段必须是增量扩展，不修改现有节点的字段语义。
 
-### 8.3 不是“一直占用主 Agent 的长对话”
+### 8.3 已取消的历史方案（存档）
 
-任务节点由后台 Batch Task Engine 执行，不要让主 Agent 一直轮询等待。
+本节至 8.10 记录的是此前的多阶段 DAG / Agentic 设计，已被 8.1 的扁平批量队列方案取代，不再作为当前实现或验收目标。保留文字只用于解释方案演变。
+
+任务节点由后台 Complex Task Engine 执行，不要让主 Agent 一直轮询等待。
 
 职责分工：
 
@@ -497,7 +499,7 @@ Canvas Skills 默认只在 Infinite Canvas 的画布 Agent 中生效。它们不
 → 创建任务节点
 → 立即释放，继续为用户处理其他事情
 
-Batch Task Engine
+Complex Task Engine
 → 按依赖、并发配额和重试策略执行任务
 → 更新任务节点和下游节点
 → 记录可恢复状态
@@ -555,7 +557,7 @@ Batch Task Engine
 
 ### 8.5 任务规格与 DAG
 
-主 Agent 不直接输出大段不可执行的自然语言计划，而是产生结构化 `BatchTaskSpec`：
+主 Agent 不直接输出大段不可执行的自然语言计划，而是产生结构化 `ComplexTaskSpec`：
 
 ```json
 {
@@ -733,7 +735,9 @@ cancelled
 
 ### 9.1 Phase 2A：任务节点与持久化骨架
 
-- 定义 `BatchTaskSpec`、Stage、Item 和状态机。
+状态：首版已完成。
+
+- 定义 `ComplexTaskSpec`、Stage、Item 和状态机。
 - 新增 Agent 专用任务节点，不加入手动创建菜单。
 - 建立任务、阶段、item、attempt 和 event 持久化表。
 - 实现查询、暂停、继续、取消和服务重启恢复。
@@ -741,17 +745,24 @@ cancelled
 
 验收：可创建一个不执行的 20 项任务计划，关闭并重启服务后仍可恢复。
 
-### 9.2 Phase 2B：Deterministic DAG 执行器
+### 9.2 Phase 2B：批量队列执行器
+
+状态：首版已完成，真实 Provider 长稳压测待继续。
 
 - 实现依赖解锁和顺序执行。
 - 复用现有生图/视频任务 API。
 - 实现 Provider 并发令牌和排队。
 - 实现错误分类、退避、重试和熔断。
 - 实现任务节点到下游节点的连线和布局。
+- 已补齐逐项目实时进度广播；单项失败不会占用 Provider 并发槽，未尝试项目优先于延迟重试项。
+- 已统一任务节点与提示词节点的默认尺寸，并提供独立节点日志弹窗。
+- 批量生成节点已保留提示词、参考图及 Provider/模型/尺寸等运行参数。
 
 验收：给定 20 组不同提示词/参考图，GPT 生图并发始终不超过安全配置，中途重启后不重复扣费并能继续完成。
 
-### 9.3 Phase 2C：多阶段链路
+### 9.3 Phase 2C：多阶段链路（已取消）
+
+状态：不在当前产品范围；不作为后续实现目标。
 
 - 支持“提示词 → 图片 → 视频”。
 - 上游输出自动成为下游参考输入。
@@ -761,7 +772,9 @@ cancelled
 
 验收：一个 5 镜头小型流程可以从提示词一直运行到视频，画布连线与真实数据依赖一致。
 
-### 9.4 Phase 2D：Agentic 验收和纠错
+### 9.4 Phase 2D：Agentic 验收和纠错（已取消）
+
+状态：不在当前产品范围；批量任务不创建子 Thread。
 
 - 为任务节点建立独立任务 Agent 上下文。
 - 实现阶段 checkpoint 唤醒，不持续占用 Agent。
@@ -784,7 +797,7 @@ cancelled
 4. 已建立 `canvas_revision` 和结构化冲突返回。
 5. 已建立统一 `/` 命令注册表，前端改为动态加载、失败时本地回退。
 6. 已将现有专项流程拆分成不过细的 Canvas Skills。
-7. 已将 `/批量处理` 保留为兼容别名，新入口统一显示为 `/批量任务`。
+7. 已将公开入口收敛为唯一的 `/批量任务`，不保留旧名称或别名。
 8. 已通过快照中的上下文级别、Revision 和结构化工具结果保留基础诊断信息；更完整的统计面板不属于本轮历史问题修复。
 
 第一阶段完成标准：
@@ -806,23 +819,27 @@ cancelled
 - 已将命令注册表改为后端单一真值源，并按任务只加载一个 Canvas Skill。
 - 已将 Provider/模型列表改为 `get_generation_settings` 按需查询。
 - 已建立 Agent 私有 Canvas Revision，不修改原画布 schema。
-- 未开始任务节点体系；`/批量任务` 当前只使用现有画布工具。
+- 已新增 `agent/complex_tasks.py`，`main.py` 仍只负责 Agent Router 和上游依赖装配。
+- 已建立 `complex_tasks`、`complex_task_stages`、`complex_task_items`、`complex_task_attempts`、`complex_task_events` 五张持久化表。
+- 已上线 `smart-agent-task` 批量节点、任务详情面板和进度控制；任务节点不在手动新建菜单中。
+- 已接入扁平批量清单、一次确认卡、Provider 并发、有限重试、抖动退避、熔断和重启恢复；运行期不创建子 Thread。
+- 已实现 `create_batch_task`、`get_batch_task`、`control_batch_task` Dynamic Tools；内部持久化接口继续复用既有任务存储路径。
 
-结论：本轮历史优化目标已经完成。下文任务节点体系仅作为延期设计备忘，不属于当前实施范围。
+结论：历史优化目标已经完成，`/批量任务` 的规划、一次确认、任务节点和后台并发队列已形成闭环。下一步重点是使用真实 Provider 做长时间、大批量、断网和服务重启压测，并根据平台实测调整并发与恢复策略。
 
 ---
 
-## 十一、第二阶段完成标准
+## 十一、第二阶段验收标准
 
 `/批量任务` 完成不以“能一次创建很多节点”为标准，而以下列端到端能力为标准：
 
-1. Agent 可从自然语言产生可验证的 `BatchTaskSpec`。
+1. Agent 可从自然语言产生可验证的 `ComplexTaskSpec`。
 2. 画布会出现只能由 Agent 创建的任务节点。
 3. 主 Agent 提交后立即释放，任务在后台独立运行。
 4. Deterministic 模式能稳定执行 100 项不同参数的节点任务。
 5. 同一 Provider 的并发始终不超过安全配置。
 6. 服务重启、页面关闭和网络短时中断不会造成静默重复提交。
-7. Agentic 模式能在阶段结束时验收输出，重生不合格项并推进后续阶段。
+7. 运行期不创建 Codex 子 Thread，也不会退回普通生成工具逐项提交。
 8. 任务节点、提示词节点、生图节点和视频节点按真实依赖连线。
 9. 连线可隐藏但依赖不丢失。
 10. 用户可暂停、继续、取消、重试失败分支和从指定阶段重跑。

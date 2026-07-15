@@ -8,11 +8,28 @@ from agent.revision import CanvasRevisionConflict, CanvasRevisionStore
 
 
 class CanvasAgentSkillRoutingTests(unittest.TestCase):
-    def test_public_commands_use_canonical_batch_name_with_legacy_alias(self):
-        batch = next(item for item in public_commands() if item["id"] == "batch")
+    def test_public_commands_expose_only_canonical_batch_task_name(self):
+        batch = next(item for item in public_commands() if item["id"] == "batch-task")
         self.assertEqual(batch["command"], "/批量任务")
-        self.assertIn("/批量处理", batch["aliases"])
-        self.assertFalse(batch["task_node_available"])
+        self.assertEqual(batch["aliases"], [])
+        self.assertTrue(batch["task_node_available"])
+
+    def test_search_nodes_replaces_legacy_locate_command(self):
+        commands = public_commands()
+        search = next(item for item in commands if item["id"] == "search-nodes")
+        self.assertEqual(search["command"], "/搜索节点")
+        self.assertEqual(search["aliases"], [])
+        self.assertEqual(search["risk"], "read")
+        self.assertNotIn("/定位", [item["command"] for item in commands])
+
+        profile = normalize_context_profile(
+            "/搜索节点 找到提到海边的节点",
+            {"level": 0, "intent": "chat", "command": "/搜索节点"},
+            0,
+        )
+        self.assertEqual(profile["command_id"], "search-nodes")
+        self.assertEqual(profile["intent"], "canvas_operation")
+        self.assertEqual(active_skill_context("/搜索节点 海边", profile)["id"], "infinite-canvas-analysis")
 
     def test_command_registry_overrides_frontend_guess(self):
         profile = normalize_context_profile(
@@ -23,6 +40,16 @@ class CanvasAgentSkillRoutingTests(unittest.TestCase):
         self.assertEqual(profile["level"], 3)
         self.assertEqual(profile["intent"], "global_canvas")
         self.assertEqual(profile["command_id"], "summarize")
+
+    def test_batch_command_is_detected_when_attached_to_chinese_text(self):
+        profile = normalize_context_profile(
+            "参考选中节点，调用 GPT 和 Gemini 分别再生一张图/批量任务",
+            {"level": 0, "intent": "chat", "command": ""},
+            0,
+        )
+        self.assertEqual(profile["command_id"], "batch-task")
+        self.assertEqual(profile["intent"], "global_canvas")
+        self.assertTrue(profile["generationContext"])
 
     def test_only_matching_canvas_skill_is_loaded(self):
         skill = active_skill_context("把选中素材重命名", {"intent": "canvas_operation"})
@@ -36,6 +63,12 @@ class CanvasAgentSkillRoutingTests(unittest.TestCase):
         self.assertIn("必须先调用 `get_layout_context`", skill["instructions"])
         self.assertIn("只提出建议，不调用写工具", skill["instructions"])
         self.assertIn("用一个简短问题确认", skill["instructions"])
+
+    def test_batch_task_skill_requires_one_queue_submission(self):
+        skill = active_skill_context("/批量任务 批量生成封面", {"intent": "global_canvas", "command": "/批量任务"})
+        self.assertEqual(skill["id"], "infinite-canvas-batch-task")
+        self.assertIn("只调用一次 `create_batch_task`", skill["instructions"])
+        self.assertIn("不得调用普通 `generate_images`", skill["instructions"])
 
 
 class CanvasAgentEnvelopeTests(unittest.TestCase):

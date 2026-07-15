@@ -4305,26 +4305,6 @@ async def run_codex_cli(prompt, model="", image_paths=None, timeout=None, output
         raise HTTPException(status_code=502, detail=f"OpenAI Codex CLI 调用失败：{message[:1200]}")
     return {"text": last_text or out_text, "_stdout": out_text, "_stderr": err_text}
 
-def codex_output_image_files(since_time=0):
-    exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-    root = os.path.abspath(OUTPUT_OUTPUT_DIR)
-    files = []
-    try:
-        for name in os.listdir(root):
-            path = os.path.join(root, name)
-            if not os.path.isfile(path):
-                continue
-            ext = os.path.splitext(name)[1].lower()
-            if ext not in exts:
-                continue
-            mtime = os.path.getmtime(path)
-            if mtime + 1 < float(since_time or 0):
-                continue
-            files.append((mtime, path))
-    except Exception:
-        return []
-    return [path for _mtime, path in sorted(files, reverse=True)]
-
 def codex_output_url_from_path(path):
     path = os.path.abspath(str(path or ""))
     root = os.path.abspath(OUTPUT_OUTPUT_DIR)
@@ -4335,28 +4315,77 @@ def codex_output_url_from_path(path):
         return ""
     return ""
 
-def codex_archive_output_image(path):
-    """Move a Codex output to a request-unique filename before another run can overwrite it."""
-    source = os.path.abspath(str(path or ""))
+def cli_image_output_key(value=""):
+    """Return a filename-safe task key without introducing per-provider folders."""
+    text = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or "").strip()).strip("_-")
+    return text[:120] or uuid.uuid4().hex
+
+def cli_image_output_path(provider_id="", output_key=""):
+    provider_key = cli_image_output_key(provider_id).replace("-", "_")
+    task_key = cli_image_output_key(output_key)
+    return os.path.join(OUTPUT_OUTPUT_DIR, f"{provider_key}_{task_key}.png")
+
+def cli_explicit_image_paths(raw=None):
+    raw = raw if isinstance(raw, dict) else {}
+    text = f"{raw.get('text') or raw.get('_stdout') or ''}\n{raw.get('_stderr') or ''}"
+    pattern = r"([A-Za-z]:\\[^\r\n\"'<>]+\.(?:png|jpe?g|webp|gif)|/[^\r\n\"'<>]+\.(?:png|jpe?g|webp|gif))"
+    return [match.strip() for match in re.findall(pattern, text, flags=re.I)]
+
+def cli_finalize_image_output(raw, target_path, requested_size="", provider_id="", excluded_paths=None):
+    """Resolve only this CLI call's exact/explicit output and never move source assets."""
+    target = os.path.abspath(str(target_path or ""))
     root = os.path.abspath(OUTPUT_OUTPUT_DIR)
+    excluded = {os.path.abspath(str(path)) for path in (excluded_paths or []) if path}
     try:
-        if os.path.commonpath([root, source]) != root or not os.path.isfile(source):
+        if os.path.commonpath([root, target]) != root:
             return ""
     except Exception:
         return ""
-    ext = os.path.splitext(source)[1].lower()
-    if ext not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+
+    source = target if os.path.isfile(target) else ""
+    if not source:
+        for candidate in cli_explicit_image_paths(raw):
+            candidate = os.path.abspath(candidate)
+            try:
+                inside_output = os.path.commonpath([root, candidate]) == root
+            except Exception:
+                inside_output = False
+            if inside_output and candidate not in excluded and os.path.isfile(candidate):
+                source = candidate
+                break
+    if not source:
         return ""
-    target = os.path.join(root, f"codex_{uuid.uuid4().hex}{ext}")
+
     try:
-        # Both paths are in the shared output directory. An atomic rename keeps
-        # the stable URL needed by the canvas without retaining a duplicate
-        # descriptive filename in the asset manager.
-        os.replace(source, target)
+        with Image.open(source) as image:
+            image.verify()
     except Exception as exc:
-        print(f"保存 GPT CLI 生图输出失败：{exc}")
+        print(f"CLI 生图输出不是有效图片：{exc}")
         return ""
-    return target
+
+    if source != target:
+        try:
+            # Copy instead of rename: even a malformed CLI response cannot make
+            # an existing canvas asset disappear from its original URL.
+            with Image.open(source) as image:
+                image.load()
+                oriented = ImageOps.exif_transpose(image)
+                converted = oriented.convert("RGBA") if oriented.mode in ("RGBA", "LA", "P") else oriented.convert("RGB")
+                converted.save(target, format="PNG")
+        except Exception as exc:
+            print(f"复制 CLI 生图输出失败：{exc}")
+            return ""
+
+    processed = codex_postprocess_image_to_requested_size(target, requested_size, provider_id)
+    if processed and os.path.isfile(processed):
+        try:
+            # This only replaces the current task's own target; unrelated assets
+            # and the explicit source file are never renamed or removed.
+            os.replace(processed, target)
+        except Exception as exc:
+            print(f"保存 CLI 尺寸后处理结果失败：{exc}")
+            return ""
+    return target if os.path.isfile(target) else ""
 
 def gpt_image_2_skill_executable():
     configured = str(codex_env_value("GPT_IMAGE_2_SKILL_BIN") or "").strip()
@@ -4746,7 +4775,7 @@ def codex_models_payload(raw=None):
         "raw": raw or {},
     }
 
-async def generate_codex_provider_image(prompt, size, model, reference_images=None, provider=None):
+async def generate_codex_provider_image(prompt, size, model, reference_images=None, provider=None, output_key=""):
     ref_paths, temp_paths = await codex_reference_paths(reference_images)
     try:
         # GPT CLI is a self-contained canvas provider. Requiring a separate
@@ -4754,12 +4783,13 @@ async def generate_codex_provider_image(prompt, size, model, reference_images=No
         # native image-generation instruction could run. Its output directory
         # is shared, so this whole window must remain exclusive.
         async with CODEX_IMAGE_OUTPUT_LOCK:
-            since = time.time()
+            target_path = cli_image_output_path("codex", output_key or f"direct_{uuid.uuid4().hex}")
             image_prompt = (
                 "$imagegen\n\n"
                 f"任务：{prompt}\n\n"
                 f"尺寸/比例参考：{size or 'auto'}。\n"
-                f"请生成或编辑图片，并把最终图片文件保存到这个本地目录：{OUTPUT_OUTPUT_DIR}\n"
+                f"请生成或编辑图片，并把唯一的最终图片严格保存为这个本地文件：{target_path}\n"
+                "必须使用这个完整文件名，不要另取文件名。\n"
                 "只需要输出最终文件路径和一句简短说明；不要修改项目代码，不要创建额外文档。"
             )
             raw = await run_codex_cli(
@@ -4771,23 +4801,12 @@ async def generate_codex_provider_image(prompt, size, model, reference_images=No
                 timeout=codex_timeout(),
                 output_last_message=True,
             )
-            urls = []
-            for path in codex_output_image_files(since):
-                archived = codex_archive_output_image(path)
-                url = codex_output_url_from_path(archived)
-                if url and url not in urls:
-                    urls.append(url)
-        if not urls:
-            text = f"{raw.get('text') or raw.get('_stdout') or ''}\n{raw.get('_stderr') or ''}"
-            pattern = r"([A-Za-z]:\\[^\r\n\"'<>]+\.(?:png|jpe?g|webp|gif)|/[^\r\n\"'<>]+\.(?:png|jpe?g|webp|gif))"
-            for match in re.findall(pattern, text, flags=re.I):
-                archived = codex_archive_output_image(match.strip())
-                url = codex_output_url_from_path(archived)
-                if url and url not in urls:
-                    urls.append(url)
+            final_path = cli_finalize_image_output(raw, target_path, size, "codex", ref_paths)
+            url = codex_output_url_from_path(final_path)
+            urls = [url] if url else []
         if not urls:
             status_text = (raw.get("text") or raw.get("_stdout") or raw.get("_stderr") or "")[:1200]
-            raise HTTPException(status_code=502, detail=f"GPT CLI 已返回，但没有在输出目录发现图片：{status_text}")
+            raise HTTPException(status_code=502, detail=f"GPT CLI 已返回，但没有生成当前任务的指定文件：{status_text}")
         return {"type": "url", "value": urls[0]}, {"images": urls, "text": raw.get("text"), "provider": "codex"}
     finally:
         for path in temp_paths:
@@ -4853,15 +4872,35 @@ def antigravity_cli_winget_candidates():
         candidates.extend(glob.glob(pattern))
     return sorted(dict.fromkeys(path for path in candidates if os.path.exists(path)), reverse=True)
 
+def antigravity_cli_local_candidates():
+    """Return common install locations that GUI-launched servers may miss in PATH."""
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, ".local", "bin", "agy"),
+        os.path.join(home, ".local", "bin", "agy.exe"),
+        os.path.join(home, "bin", "agy"),
+        os.path.join(home, "bin", "agy.exe"),
+        "/opt/homebrew/bin/agy",
+        "/usr/local/bin/agy",
+        "/usr/bin/agy",
+    ]
+    return [
+        path for path in dict.fromkeys(candidates)
+        if os.path.isfile(path) and os.access(path, os.X_OK)
+    ]
+
 def gemini_cli_executable():
     for key in ("ANTIGRAVITY_BIN", "AGY_BIN", "GEMINI_BIN"):
         configured = str(gemini_cli_env_value(key) or "").strip().strip('"')
-        if configured:
+        configured = os.path.expanduser(configured)
+        if configured and os.path.isfile(configured):
             return configured
     for name in ("agy", "agy.exe"):
         found = shutil.which(name)
         if found:
             return found
+    for candidate in antigravity_cli_local_candidates():
+        return candidate
     for candidate in antigravity_cli_winget_candidates():
         return candidate
     return shutil.which("gemini") or shutil.which("gemini.exe") or shutil.which("gemini.cmd") or ""
@@ -5032,10 +5071,10 @@ def gemini_cli_image_size_instruction(size="", model=""):
         return "目标输出为 2K 高分辨率图片；最终保存文件需要达到当前画幅对应的 2K 像素尺寸，不要默认输出 1024px 小图。"
     return f"尺寸/比例参考：{size_text or 'auto'}。如果可以指定分辨率，请优先输出高分辨率图片。"
 
-async def generate_gemini_cli_provider_image(prompt, size, model, reference_images=None, provider=None):
+async def generate_gemini_cli_provider_image(prompt, size, model, reference_images=None, provider=None, output_key=""):
     ref_paths, temp_paths = await gemini_cli_reference_paths(reference_images)
-    since = time.time()
     try:
+        target_path = cli_image_output_path("gemini-cli", output_key or f"direct_{uuid.uuid4().hex}")
         ref_text = ""
         if ref_paths:
             ref_text = "\n参考图片本地路径：\n" + "\n".join(ref_paths)
@@ -5045,7 +5084,8 @@ async def generate_gemini_cli_provider_image(prompt, size, model, reference_imag
             f"任务：{prompt}\n\n"
             f"{gemini_cli_image_size_instruction(size, size_context)}\n"
             f"{ref_text}\n\n"
-            f"如果当前 Antigravity CLI/模型支持图片生成或图片编辑，请把最终图片保存到这个本地目录：{OUTPUT_OUTPUT_DIR}\n"
+            f"如果当前 Antigravity CLI/模型支持图片生成或图片编辑，请把唯一的最终图片严格保存为这个本地文件：{target_path}\n"
+            "必须使用这个完整文件名，不要另取文件名。\n"
             "文件格式优先 png 或 jpg。只输出最终文件路径和一句简短说明；不要修改项目代码，不要创建额外文档。\n"
             "如果你无法真正创建图片文件，请在 60 秒内直接回复“无法生成图片文件”，不要只写计划，也不要持续尝试。"
         )
@@ -5055,25 +5095,12 @@ async def generate_gemini_cli_provider_image(prompt, size, model, reference_imag
             timeout=gemini_cli_image_timeout() if is_antigravity_cli(gemini_cli_executable()) else gemini_cli_timeout(),
             allow_tools=True,
         )
-        files = codex_output_image_files(since)
-        urls = []
-        for path in files:
-            processed_path = codex_postprocess_image_to_requested_size(path, size, "gemini-cli")
-            url = codex_output_url_from_path(processed_path or path)
-            if url and url not in urls:
-                urls.append(url)
-        if not urls:
-            text = f"{raw.get('text') or raw.get('_stdout') or ''}\n{raw.get('_stderr') or ''}"
-            pattern = r"([A-Za-z]:\\[^\r\n\"'<>]+\.(?:png|jpe?g|webp|gif)|/[^\r\n\"'<>]+\.(?:png|jpe?g|webp|gif))"
-            for match in re.findall(pattern, text, flags=re.I):
-                match_path = match.strip()
-                processed_path = codex_postprocess_image_to_requested_size(match_path, size, "gemini-cli")
-                url = codex_output_url_from_path(processed_path or match_path)
-                if url and url not in urls:
-                    urls.append(url)
+        final_path = cli_finalize_image_output(raw, target_path, size, "gemini-cli", ref_paths)
+        url = codex_output_url_from_path(final_path)
+        urls = [url] if url else []
         if not urls:
             status_text = (raw.get("text") or raw.get("_stdout") or raw.get("_stderr") or "")[:1200]
-            raise HTTPException(status_code=502, detail=f"{gemini_cli_display_name()} 已返回，但没有在输出目录发现图片：{status_text}")
+            raise HTTPException(status_code=502, detail=f"{gemini_cli_display_name()} 已返回，但没有生成当前任务的指定文件：{status_text}")
         return {"type": "url", "value": urls[0]}, {"images": urls, "text": raw.get("text"), "provider": "gemini-cli", "raw": raw.get("raw")}
     finally:
         for path in temp_paths:
@@ -10153,14 +10180,14 @@ async def generate_runninghub_video(payload, provider):
         local_urls = [await save_remote_video_to_output(url, prefix="rh_video_") for url in urls]
         return {"videos": local_urls, "task_id": task_id, "raw": result}
 
-async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly"):
+async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", output_key=""):
     provider = get_api_provider(provider_id)
     if provider["id"] == "modelscope":
         return await generate_modelscope_provider_image(prompt, size, model, reference_images, provider)
     if is_codex_provider(provider):
-        return await generate_codex_provider_image(prompt, size, model, reference_images, provider)
+        return await generate_codex_provider_image(prompt, size, model, reference_images, provider, output_key)
     if is_gemini_cli_provider(provider):
-        return await generate_gemini_cli_provider_image(prompt, size, model, reference_images, provider)
+        return await generate_gemini_cli_provider_image(prompt, size, model, reference_images, provider, output_key)
     if is_jimeng_provider(provider):
         return await generate_jimeng_provider_image(prompt, size, model, reference_images, provider)
     if is_runninghub_provider(provider):
@@ -12791,15 +12818,25 @@ async def fetch_upstream_models(provider_id: str):
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider_id} 未配置 API Key")
     return await fetch_models_from_upstream(provider.get("base_url") or "", api_key, provider_protocol(provider), provider.get("image_request_mode") or "openai")
 
-async def build_online_image_result(payload: OnlineImageRequest):
+async def build_online_image_result(payload: OnlineImageRequest, task_id=""):
     provider = get_api_provider(payload.provider_id)
     default_model = (provider.get("image_models") or [IMAGE_MODEL])[0]
     model = selected_model(payload.model, default_model)
     refs = [ref.dict() for ref in payload.reference_images if ref.url]
     image_refs = image_references(refs)
     count = max(1, min(8, int(payload.n or 1)))
-    async def generate_one():
-        image_data, raw_item = await generate_ai_image(payload.prompt, payload.size, payload.quality, model, image_refs, provider["id"])
+    task_key = task_id or f"online_{uuid.uuid4().hex}"
+    async def generate_one(index):
+        output_key = task_key if count == 1 else f"{task_key}_{index + 1}"
+        image_data, raw_item = await generate_ai_image(
+            payload.prompt,
+            payload.size,
+            payload.quality,
+            model,
+            image_refs,
+            provider["id"],
+            output_key,
+        )
         try:
             image_items = extract_images(raw_item) if isinstance(raw_item, dict) else [image_data]
         except HTTPException:
@@ -12817,7 +12854,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
                 local_items.append(image_output_meta(local_url, item))
         return local_urls, local_items, raw_item
     try:
-        generated = await asyncio.gather(*(generate_one() for _ in range(count)))
+        generated = await asyncio.gather(*(generate_one(index) for index in range(count)))
     except httpx.HTTPStatusError as exc:
         log_net_error(f"生图 HTTP状态错误 provider={provider.get('id')} model={model} size={payload.size}", exc)
         text = exc.response.text or ''
@@ -12993,7 +13030,7 @@ async def run_canvas_image_task(task_id: str, payload: OnlineImageRequest):
             CANVAS_TASKS[task_id]["updated_at"] = time.time()
             _canvas_generation_task_persist(CANVAS_TASKS[task_id], _canvas_task_payload_dict(payload))
     try:
-        result = await build_online_image_result(payload)
+        result = await build_online_image_result(payload, task_id)
         with CANVAS_TASK_LOCK:
             CANVAS_TASKS[task_id].update({
                 "status": "succeeded",

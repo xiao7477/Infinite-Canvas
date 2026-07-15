@@ -1,11 +1,13 @@
 import json
 from pathlib import Path
 import subprocess
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
 import agent.backend as backend
+from agent.revision import CanvasRevisionStore
 
 
 class _RevisionStore:
@@ -30,11 +32,46 @@ def image_node(node_id, x, y, width, height, natural_w, natural_h):
 
 
 class CanvasAgentOrganizeGeometryTests(unittest.TestCase):
-    def test_registry_exposes_v3_organize_tools(self):
+    def test_agent_write_advances_same_turn_working_snapshot(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot_root = root / "snapshots"
+            snapshot_root.mkdir()
+            snapshot_path = snapshot_root / "turn.json"
+            canvas = {"id": "canvas-1", "kind": "smart", "name": "测试", "nodes": [], "connections": []}
+            snapshot_path.write_text(json.dumps({
+                "canvas_id": "canvas-1",
+                "canvas_revision": 0,
+                "canvas_snapshot": {"title": "测试", "nodes": [], "connections": []},
+            }), encoding="utf-8")
+            context = {"_contextSnapshot": {"snapshot_path": str(snapshot_path), "canvas_revision": 0}}
+            old_root = backend.CODEX_AGENT_CONTEXT_SNAPSHOT_DIR
+            old_store = backend.CODEX_AGENT_REVISION_STORE
+            try:
+                backend.CODEX_AGENT_CONTEXT_SNAPSHOT_DIR = snapshot_root
+                backend.CODEX_AGENT_REVISION_STORE = CanvasRevisionStore(root / "revisions")
+                backend.CODEX_AGENT_REVISION_STORE.observe("canvas-1", canvas)
+                canvas["nodes"].append({"id": "node-1", "type": "smart-image", "x": 10, "y": 20})
+                revision = backend.CODEX_AGENT_REVISION_STORE.observe("canvas-1", canvas)["revision"]
+                backend._codex_agent_advance_context_snapshot(context, "canvas-1", canvas, revision)
+                stored = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                self.assertEqual(context["_contextSnapshot"]["canvas_revision"], 1)
+                self.assertTrue(context["_contextSnapshot"]["working_revision_advanced"])
+                self.assertEqual(stored["canvas_revision"], 1)
+                self.assertEqual(stored["canvas_snapshot"]["nodes"][0]["id"], "node-1")
+                backend.CODEX_AGENT_REVISION_STORE.assert_expected("canvas-1", canvas, 1)
+            finally:
+                backend.CODEX_AGENT_CONTEXT_SNAPSHOT_DIR = old_root
+                backend.CODEX_AGENT_REVISION_STORE = old_store
+
+    def test_registry_exposes_v5_organize_and_batch_task_tools(self):
         registry = backend._codex_agent_canvas_tool_registry()
-        self.assertEqual(backend.CODEX_AGENT_DYNAMIC_TOOL_REGISTRY_VERSION, 3)
+        self.assertEqual(backend.CODEX_AGENT_DYNAMIC_TOOL_REGISTRY_VERSION, 5)
         for tool in ("get_layout_context", "get_node_tree", "resize_nodes", "arrange_node_tree"):
             self.assertIn(tool, registry)
+        for tool in ("create_batch_task", "get_batch_task", "control_batch_task"):
+            self.assertIn(tool, registry)
+        self.assertNotIn("create_complex_task", registry)
 
     def test_standard_size_rules_and_non_media_reset(self):
         landscape = image_node("landscape", 0, 0, 100, 100, 1600, 900)
@@ -184,6 +221,48 @@ process.stdout.write(JSON.stringify(mergeSmartNode(local, remote)));
         self.assertEqual(merged["runElapsedMs"], 100)
         self.assertTrue(merged["runTimerHidden"])
 
+    def test_batch_task_frontend_uses_prompt_size_and_independent_detail_modal(self):
+        root = Path(__file__).parents[1]
+        canvas_source = (root / "static/js/smart-canvas.js").read_text(encoding="utf-8")
+        panel_source = (root / "static/js/codex-agent-panel.js").read_text(encoding="utf-8")
+        css_source = (root / "static/css/codex-agent-panel.css").read_text(encoding="utf-8")
+
+        normalize_start = canvas_source.index("function normalizeLegacySmartNode")
+        normalize_end = canvas_source.index("\nfunction validOutpaintSize", normalize_start)
+        normalize_fn = canvas_source[normalize_start:normalize_end]
+        completed = subprocess.run([
+            "node", "-e",
+            f"{normalize_fn}\nprocess.stdout.write(JSON.stringify(normalizeLegacySmartNode({{type:'smart-agent-task',w:360,h:250}})));",
+        ], check=True, capture_output=True, text=True)
+        normalized = json.loads(completed.stdout)
+        self.assertEqual((normalized["w"], normalized["h"]), (316, 240))
+
+        preview_start = canvas_source.index("function smartAgentReferenceDisplayUrl")
+        preview_end = canvas_source.index("\nfunction isSmartRunnableNode", preview_start)
+        preview_helpers = canvas_source[preview_start:preview_end]
+        completed = subprocess.run([
+            "node", "-e",
+            f"{preview_helpers}\nconst node={{agentGenerated:true,runInputRefs:[{{url:'/Users/demo/ref.png'}}]}}; normalizeSmartAgentReferencePreviews(node); process.stdout.write(JSON.stringify(node));",
+        ], check=True, capture_output=True, text=True)
+        reference_node = json.loads(completed.stdout)
+        self.assertEqual(reference_node["runInputRefs"][0]["url"], "/Users/demo/ref.png")
+        self.assertEqual(reference_node["runInputRefs"][0]["displayUrl"], "/api/codex-agent/file/view?path=%2FUsers%2Fdemo%2Fref.png")
+
+        open_start = panel_source.index("async function openComplexTask")
+        open_end = panel_source.index("\n  function closeComplexTask", open_start)
+        open_fn = panel_source[open_start:open_end]
+        self.assertNotIn("state.open = true", open_fn)
+        self.assertNotIn("cm-panel", open_fn)
+        self.assertIn("ensureComplexTaskModal", open_fn)
+        self.assertIn(".cm-task-modal{position:fixed", css_source)
+        self.assertIn("grid-template-rows:28px 20px 6px 18px", css_source)
+        self.assertIn(".smart-agent-task-card{width:100%;height:100%", css_source)
+        self.assertIn("smart-agent-task-progress-success", canvas_source)
+        self.assertIn("smart-agent-task-progress-failed", canvas_source)
+        self.assertIn("linear-gradient(90deg,#f59e0b,#ef4444)", css_source)
+        self.assertIn("--cm-task-surface:#151c28", css_source)
+        self.assertIn("normalizeAttachmentUrl(ref.displayUrl || source)", panel_source)
+
     def test_layout_context_reports_variation_and_available_sides(self):
         nodes = [
             image_node("a", 0, 0, 520, 292, 1600, 900),
@@ -208,6 +287,25 @@ process.stdout.write(JSON.stringify(mergeSmartNode(local, remote)));
         self.assertEqual(len(result["nodes"]), 2)
         self.assertTrue(result["suggest_uniform_media_size"])
         self.assertIn("right", result["open_sides"])
+
+    def test_generation_settings_fall_back_to_server_provider_config(self):
+        payload = backend.CodexAgentCanvasToolRequest(
+            canvas_id="canvas",
+            tool="get_generation_settings",
+            args={"kind": "image"},
+            canvas_context={"native": {"imageGeneration": None}},
+        )
+        configured = [
+            {"id": "codex", "name": "GPT CLI", "protocol": "codex", "enabled": True, "image_models": ["gpt-image-2"]},
+            {"id": "gemini-cli", "name": "Gemini CLI", "protocol": "gemini-cli", "enabled": True, "image_models": ["auto"]},
+        ]
+        with (
+            patch.object(backend, "_codex_agent_query_snapshot_canvas", return_value=({"nodes": [], "connections": []}, [], [], "snapshot")),
+            patch.object(backend, "load_api_providers", return_value=configured, create=True),
+        ):
+            result = backend._codex_agent_tool_query_canvas(payload)
+        providers = result["image_generation"]["providers"]
+        self.assertEqual([provider["provider_id"] for provider in providers], ["codex", "gemini-cli"])
 
 
 class CanvasAgentOrganizeActionTests(unittest.IsolatedAsyncioTestCase):
@@ -289,6 +387,55 @@ class CanvasAgentOrganizeActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(by_id["up"]["x"], by_id["root"]["x"])
         self.assertGreater(by_id["down1"]["x"], by_id["root"]["x"])
         self.assertGreater(by_id["down2"]["x"], by_id["root"]["x"])
+
+    async def test_tree_layout_uses_size_changed_earlier_in_same_turn(self):
+        self.canvas["nodes"] = [
+            image_node("root", 0, 0, 200, 200, 1024, 1024),
+            image_node("down1", 300, 0, 200, 200, 1024, 1024),
+            image_node("down2", 300, 317, 200, 200, 1024, 1024),
+        ]
+        self.canvas["connections"] = [
+            {"id": "c1", "from": "root", "to": "down1"},
+            {"id": "c2", "from": "root", "to": "down2"},
+        ]
+        context = {
+            "_contextSnapshot": {"canvas_revision": 0},
+            "native": {
+                "selectedNodeIds": ["root"],
+                # This is the stale send-time geometry that previously won over
+                # the 440x440 size written by the first Tool call.
+                "allNodes": [
+                    {"id": node["id"], "x": node["x"], "y": node["y"], "width": 200, "height": 275}
+                    for node in self.canvas["nodes"]
+                ],
+            },
+        }
+        resized = await backend._codex_agent_apply_canvas_actions(
+            self.canvas["id"],
+            [{
+                "type": "resize_nodes",
+                "items": [{"node_id": node_id} for node_id in ("root", "down1", "down2")],
+                "options": {"size_mode": "standard"},
+            }],
+            [],
+            context,
+        )
+        self.assertEqual(resized["changed"], 3)
+        self.assertEqual(
+            [(item["width"], item["height"]) for item in context["native"]["allNodes"]],
+            [(440, 440), (440, 440), (440, 440)],
+        )
+
+        arranged = await backend._codex_agent_apply_canvas_actions(
+            self.canvas["id"],
+            [{"type": "arrange_node_tree", "items": [{"node_id": "root"}], "options": {"tree_scope": "both"}}],
+            [],
+            context,
+        )
+        self.assertEqual(arranged["changed"], 3)
+        by_id = {node["id"]: node for node in self.canvas["nodes"]}
+        upper, lower = sorted((by_id["down1"], by_id["down2"]), key=lambda node: node["y"])
+        self.assertEqual(lower["y"] - (upper["y"] + upper["h"]), 42)
 
     async def test_tree_layout_stays_near_root_when_viewport_is_smaller_than_tree(self):
         self.canvas["nodes"] = [

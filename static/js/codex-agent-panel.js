@@ -53,6 +53,8 @@
     busyStartedAt: 0,
     busyLabel: '',
     scrollTop: 0,
+    complexTaskId: '',
+    complexTask: null,
   };
 
   let currentAgentMsgId = null;
@@ -76,6 +78,8 @@
   let panelStateSaveInFlight = false;
   let suppressPanelSave = false;
   let lastRecoveryAlertAt = 0;
+  let complexTaskRefreshTimer = 0;
+  let complexTaskExpanded = new Set();
   const addedImagePaths = new Set();
   const executedCanvasActionKeys = new Set();
   const panelSizeKey = 'codex-agent-panel-size-v1';
@@ -108,8 +112,8 @@
     { id: 'image', label: '/创建生图节点', insert: '/创建生图节点 ', desc: '创建智能画布生图节点' },
     { id: 'video', label: '/创建视频节点', insert: '/创建视频节点 ', desc: '创建视频生成节点' },
     { id: 'summarize', label: '/总结画布', insert: '/总结画布 ', desc: '总结当前视口或全画布内容' },
-    { id: 'locate', label: '/定位', insert: '/定位 ', desc: '定位、选中或高亮节点' },
-    { id: 'batch', label: '/批量任务', insert: '/批量任务 ', aliases: ['/批量处理'], desc: '使用现有画布工具规划并执行多步任务', intent: 'global_canvas', contextLevel: 3, generationContext: true },
+    { id: 'search-nodes', label: '/搜索节点', insert: '/搜索节点 ', desc: '按名称、内容、类型或语义描述查找节点' },
+    { id: 'batch-task', label: '/批量任务', insert: '/批量任务 ', aliases: [], desc: '规划独立生成节点并按平台并发排队执行', intent: 'global_canvas', contextLevel: 3, generationContext: true },
   ];
   let slashCommands = fallbackSlashCommands.map(item => ({ ...item }));
   const contextLevelLabels = {
@@ -464,6 +468,153 @@
     savePanelSnapshot();
   }
 
+  async function openComplexTask(taskId) {
+    if (!taskId) return;
+    state.complexTaskId = taskId;
+    complexTaskExpanded = new Set();
+    window.clearTimeout(complexTaskRefreshTimer);
+    const modal = ensureComplexTaskModal();
+    modal.classList.add('cm-task-modal-open');
+    modal.setAttribute('aria-hidden', 'false');
+    modal.querySelector('.cm-task-modal-content').innerHTML = '<div class="cm-task-modal-loading">正在读取批量任务…</div>';
+    await refreshComplexTask();
+  }
+
+  function closeComplexTask() {
+    window.clearTimeout(complexTaskRefreshTimer);
+    complexTaskRefreshTimer = 0;
+    state.complexTaskId = '';
+    state.complexTask = null;
+    const modal = document.querySelector('.cm-task-modal');
+    modal?.classList.remove('cm-task-modal-open');
+    modal?.setAttribute('aria-hidden', 'true');
+  }
+
+  function ensureComplexTaskModal() {
+    let modal = document.querySelector('.cm-task-modal');
+    if (modal) return modal;
+    modal = document.createElement('div');
+    modal.className = 'cm-task-modal';
+    modal.setAttribute('aria-hidden', 'true');
+    modal.innerHTML = `<div class="cm-task-modal-backdrop"></div><section class="cm-task-modal-dialog" role="dialog" aria-modal="true" aria-label="批量任务详情"><div class="cm-task-modal-content"></div></section>`;
+    document.body.appendChild(modal);
+    modal.querySelector('.cm-task-modal-backdrop').addEventListener('click', closeComplexTask);
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && modal.classList.contains('cm-task-modal-open')) closeComplexTask();
+    });
+    return modal;
+  }
+
+  async function refreshComplexTask() {
+    const taskId = state.complexTaskId;
+    if (!taskId) return;
+    try {
+      const response = await fetch(`/api/codex-agent/complex-tasks/${encodeURIComponent(taskId)}`);
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      if (state.complexTaskId !== taskId) return;
+      state.complexTask = data.task || null;
+      renderComplexTask();
+      if (state.complexTask && !['completed', 'partially_completed', 'failed', 'cancelled'].includes(state.complexTask.status)) {
+        complexTaskRefreshTimer = window.setTimeout(() => { if (state.complexTaskId === taskId) refreshComplexTask(); }, 1000);
+      }
+    } catch (error) {
+      const content = document.querySelector('.cm-task-modal-content');
+      if (content) content.innerHTML = `<div class="cm-task-modal-loading">${escapeHtml(error.message || '读取批量任务失败')}<br><button type="button" data-task-close>关闭</button></div>`;
+      content?.querySelector('[data-task-close]')?.addEventListener('click', closeComplexTask);
+    }
+  }
+
+  function taskStatusLabel(status) {
+    return ({ draft:'草稿', planned:'已规划', queued:'排队中', submitting:'提交中', running:'执行中', reviewing:'验收中', waiting_provider:'等待平台', waiting_user:'等待用户', retrying:'重试中', paused:'已暂停', interrupted:'已中断', blocked:'已阻塞', partially_completed:'部分完成', completed:'已完成', failed:'失败', cancelled:'已取消' })[status] || status || '未知';
+  }
+
+  function taskItemKind(task, item) {
+    const stage = (task.stages || []).find(row => safeStr(row?.spec?.id || row?.id).split(':').pop() === safeStr(item.stage_id).split(':').pop());
+    return safeStr(stage?.type).includes('video') ? 'video' : 'image';
+  }
+
+  function taskItemParams(item, kind) {
+    const payload = item.payload || {};
+    const fields = kind === 'video'
+      ? [['平台', payload.provider_id], ['模型', payload.model], ['时长', payload.duration ? `${payload.duration}s` : ''], ['比例', payload.aspect_ratio], ['分辨率', payload.resolution], ['固定镜头', payload.camerafixed == null ? '' : (payload.camerafixed ? '是' : '否')], ['生成音频', payload.generate_audio == null ? '' : (payload.generate_audio ? '是' : '否')]]
+      : [['平台', payload.provider_id], ['模型', payload.model], ['尺寸', payload.size], ['比例', payload.aspect_ratio], ['质量', payload.quality], ['数量', payload.count || payload.n || 1]];
+    return fields.filter(([, value]) => value !== '' && value != null);
+  }
+
+  function taskItemUpdatedAt(value) {
+    const timestamp = Number(value || 0);
+    if (!timestamp) return '—';
+    try { return new Date(timestamp).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit', second:'2-digit' }); }
+    catch { return '—'; }
+  }
+
+  function taskReferenceHtml(raw, index) {
+    const ref = typeof raw === 'string' ? { url:raw } : (raw || {});
+    const source = safeStr(ref.url || ref.path || ref.src);
+    const preview = normalizeAttachmentUrl(ref.displayUrl || source);
+    const name = safeStr(ref.name || `图${index + 1}`);
+    return `<figure><div class="cm-task-ref-frame"><img src="${escapeAttr(preview)}" data-task-ref-image data-source-url="${escapeAttr(source)}" alt="参考图 ${index + 1}" loading="lazy"></div><figcaption>${escapeHtml(name)}</figcaption></figure>`;
+  }
+
+  function taskItemRowHtml(task, item, index) {
+    const kind = taskItemKind(task, item);
+    const payload = item.payload || {};
+    const refs = Array.isArray(payload.reference_images) ? payload.reference_images.filter(ref => (typeof ref === 'string' ? ref : ref?.url)) : [];
+    const expanded = complexTaskExpanded.has(item.id);
+    const params = taskItemParams(item, kind);
+    const retryAt = Number(item.retry_after || 0);
+    const retryText = item.status === 'retrying' && retryAt > Date.now() ? ` · ${Math.max(1, Math.ceil((retryAt - Date.now()) / 1000))} 秒后重试` : '';
+    return `<article class="cm-task-item ${expanded ? 'expanded' : ''}" data-task-item="${escapeAttr(item.id)}">
+      <div class="cm-task-item-row">
+        <button type="button" class="cm-task-item-toggle" data-task-item-toggle="${escapeAttr(item.id)}" aria-expanded="${expanded ? 'true' : 'false'}">${icon(expanded ? 'chevron-down' : 'chevron-right')}</button>
+        <span class="cm-task-item-index">${index + 1}</span>
+        <span class="cm-task-item-main"><strong>${escapeHtml(item.title || `${kind === 'video' ? '视频' : '图片'}节点 ${index + 1}`)}</strong><small>${escapeHtml(kind === 'video' ? '视频节点' : '生图节点')} · ${escapeHtml(payload.provider_id || '—')} · ${escapeHtml(payload.model || '—')}</small></span>
+        <span class="cm-task-item-state ${escapeAttr(item.status || 'queued')}">${escapeHtml(taskStatusLabel(item.status))}</span>
+        <span class="cm-task-item-attempt">${Number(item.attempt_count || 0)} 次</span>
+        <span class="cm-task-item-time">${escapeHtml(taskItemUpdatedAt(item.updated_at))}</span>
+        <button type="button" class="cm-task-item-locate" data-task-locate="${escapeAttr(item.node_id || '')}" ${item.node_id ? '' : 'disabled'}>${icon('locate-fixed')}<span>${item.node_id ? '定位' : '待创建'}</span></button>
+      </div>
+      ${item.error ? `<div class="cm-task-item-error">${escapeHtml(item.error)}${escapeHtml(retryText)}</div>` : ''}
+      ${expanded ? `<div class="cm-task-item-detail">
+        <div class="cm-task-item-section"><b>提示词</b><div class="cm-task-item-prompt">${escapeHtml(payload.prompt || payload.text || '—')}</div></div>
+        <div class="cm-task-item-section"><b>参考图</b><div class="cm-task-item-refs">${refs.length ? refs.map(taskReferenceHtml).join('') : '<span>无参考图</span>'}</div></div>
+        <div class="cm-task-item-section"><b>节点参数</b><div class="cm-task-item-params">${params.map(([label, value]) => `<span><small>${escapeHtml(label)}</small>${escapeHtml(value)}</span>`).join('')}</div></div>
+      </div>` : ''}
+    </article>`;
+  }
+
+  function renderComplexTask() {
+    const task = state.complexTask;
+    const modal = ensureComplexTaskModal();
+    const detail = modal.querySelector('.cm-task-modal-content');
+    if (!detail || !task) return;
+    const previousBody = detail.querySelector('.cm-task-modal-body');
+    const scrollTop = previousBody?.scrollTop || 0;
+    const items = Array.isArray(task.items) ? task.items : [];
+    detail.innerHTML = `<header class="cm-task-modal-head"><div><span>批量任务日志</span><strong>${escapeHtml(task.title || '批量任务')}</strong></div><span class="cm-task-modal-status ${escapeAttr(task.status || '')}">${escapeHtml(taskStatusLabel(task.status))}</span><button type="button" class="cm-task-modal-close" data-task-close aria-label="关闭">${icon('x')}</button></header>
+      <div class="cm-task-modal-columns"><span></span><span>#</span><span>节点</span><span>状态</span><span>尝试</span><span>更新时间</span><span>操作</span></div>
+      <div class="cm-task-modal-body">${items.length ? items.map((item, index) => taskItemRowHtml(task, item, index)).join('') : '<div class="cm-task-modal-loading">暂无任务节点</div>'}</div>`;
+    const body = detail.querySelector('.cm-task-modal-body');
+    if (body) body.scrollTop = scrollTop;
+    refreshPanelIcons();
+    detail.querySelector('[data-task-close]')?.addEventListener('click', closeComplexTask);
+    detail.querySelectorAll('[data-task-item-toggle]').forEach(button => button.addEventListener('click', () => {
+      const id = button.dataset.taskItemToggle;
+      if (complexTaskExpanded.has(id)) complexTaskExpanded.delete(id); else complexTaskExpanded.add(id);
+      renderComplexTask();
+    }));
+    detail.querySelectorAll('[data-task-ref-image]').forEach(image => image.addEventListener('error', () => {
+      image.closest('figure')?.classList.add('cm-task-ref-missing');
+    }, { once:true }));
+    detail.querySelectorAll('[data-task-locate]').forEach(button => button.addEventListener('click', () => {
+      const nodeId = button.dataset.taskLocate;
+      if (!nodeId) return;
+      window.SmartCanvasAgentApi?.focusNodes?.([nodeId]);
+      closeComplexTask();
+    }));
+  }
+
   function initPanelResize() {
     const panel = $('#cm-panel');
     const handle = $('#cm-resize');
@@ -492,11 +643,13 @@
         const height = Math.max(minHeight, Math.min(maxHeight, startHeight + (ev.clientY - startY)));
         panel.style.width = `${Math.round(width)}px`;
         panel.style.height = `${Math.round(height)}px`;
+        repositionAssistPickers();
       };
       const onUp = () => {
         document.removeEventListener('pointermove', onMove);
         document.removeEventListener('pointerup', onUp);
         document.body.classList.remove('cm-resizing');
+        repositionAssistPickers();
         const next = panel.getBoundingClientRect();
         try {
           localStorage.setItem(panelSizeKey, JSON.stringify({
@@ -528,11 +681,13 @@
         const maxHeight = Math.max(120, Math.min(420, window.innerHeight * 0.45));
         const height = Math.max(50, Math.min(maxHeight, startHeight + (startY - ev.clientY)));
         input.style.height = `${Math.round(height)}px`;
+        repositionAssistPickers();
       };
       const onUp = () => {
         document.removeEventListener('pointermove', onMove);
         document.removeEventListener('pointerup', onUp);
         document.body.classList.remove('cm-resizing-input');
+        repositionAssistPickers();
         try { localStorage.setItem(composerHeightKey, String(Math.round(input.getBoundingClientRect().height))); } catch {}
       };
       document.addEventListener('pointermove', onMove);
@@ -540,8 +695,10 @@
     });
     handle.addEventListener('dblclick', () => {
       input.style.height = '';
+      repositionAssistPickers();
       try { localStorage.removeItem(composerHeightKey); } catch {}
     });
+    window.addEventListener('resize', repositionAssistPickers, { passive: true });
   }
 
   function formatElapsed(ms) {
@@ -2255,11 +2412,31 @@
     renderCommandPicker();
   }
 
+  function positionAssistPicker(pop, anchor, preferredMaxHeight) {
+    const panel = $('#cm-panel');
+    const head = panel?.querySelector('.cm-head');
+    if (!panel || !pop || !anchor) return;
+    const panelRect = panel.getBoundingClientRect();
+    const anchorRect = anchor.getBoundingClientRect();
+    const headRect = head?.getBoundingClientRect();
+    const gap = 8;
+    const bottom = Math.max(64, panelRect.bottom - anchorRect.top + gap);
+    const available = Math.max(120, anchorRect.top - (headRect?.bottom || panelRect.top + 44) - gap * 2);
+    pop.style.bottom = `${Math.round(bottom)}px`;
+    pop.style.maxHeight = `${Math.round(Math.min(preferredMaxHeight, available))}px`;
+  }
+
+  function repositionAssistPickers() {
+    if (state.mentionOpen) positionAssistPicker($('#cm-mention-pop'), $('#cm-at'), 280);
+    if (state.commandOpen) positionAssistPicker($('#cm-command-pop'), $('#cm-slash'), 380);
+  }
+
   function renderMentionPicker() {
     const pop = $('#cm-mention-pop');
     if (!pop) return;
     state.mentionOpen = true;
     pop.classList.add('cm-mention-open');
+    positionAssistPicker(pop, $('#cm-at'), 280);
     if (!state.mentionItems.length) {
       pop.innerHTML = '<div class="cm-mention-empty">输入框上方还没有附件</div>';
       return;
@@ -2312,6 +2489,7 @@
     if (!pop) return;
     state.commandOpen = true;
     pop.classList.add('cm-command-open');
+    positionAssistPicker(pop, $('#cm-slash'), 380);
     if (!state.commandItems.length) {
       pop.innerHTML = '<div class="cm-command-empty">没有匹配的命令</div>';
       return;
@@ -2737,8 +2915,19 @@
     const scope = state.inputScope || 'auto';
     let intent = 'chat';
     let level = hasAttachments ? 2 : 0;
-    const rawCommand = (raw.match(/(?:^|\s)(\/[^\s]+)/) || [])[1] || '';
-    const commandItem = slashCommands.find(item => item.label === rawCommand || (item.aliases || []).includes(rawCommand));
+    const commandItem = slashCommands.find(item => {
+      const tokens = [item.label, ...(item.aliases || [])].map(token => safeStr(token).toLowerCase()).filter(Boolean);
+      return tokens.some(token => {
+        let offset = raw.indexOf(token);
+        while (offset >= 0) {
+          const after = raw[offset + token.length] || '';
+          if (!after || /\s|[，。；：！？、,.!?;:]/.test(after)) return true;
+          offset = raw.indexOf(token, offset + token.length);
+        }
+        return false;
+      });
+    });
+    const rawCommand = commandItem?.label || (raw.match(/(?:^|\s)(\/[^\s]+)/) || [])[1] || '';
     const command = commandItem?.label || rawCommand;
     let generationContext = Boolean(commandItem?.generationContext);
 
@@ -2760,10 +2949,10 @@
 
     if (commandItem) {
       // 斜杠命令的意图与上下文级别来自后端注册表。
-    } else if (/全画布|整个画布|所有节点|全部节点|总览|版图|整理全部|\/总结画布|\/批量处理|\/批量任务/.test(raw)) {
+    } else if (/全画布|整个画布|所有节点|全部节点|总览|版图|整理全部|\/总结画布|\/批量任务/.test(raw)) {
       level = 3;
       intent = 'global_canvas';
-    } else if (/当前|视口|眼前|这块|这片|左边|右边|上方|下方|附近|放到|移动|整理|重命名|分组|节点|画布|\/整理|\/重命名|\/定位/.test(raw)) {
+    } else if (/当前|视口|眼前|这块|这片|左边|右边|上方|下方|附近|放到|移动|整理|重命名|分组|节点|画布|\/整理|\/重命名|\/搜索节点/.test(raw)) {
       level = Math.max(level, 2);
       intent = 'canvas_operation';
     } else if (/生成|生图|视频|提示词|prompt|\/创建生图节点|\/创建视频节点|\/生成提示词/.test(raw)) {
@@ -3113,6 +3302,26 @@
     return block;
   }
 
+  function upsertNodeLocatorBlock(botMsg, data = {}) {
+    const id = safeStr(data.id || 'node-search-results');
+    let block = botMsg.blocks.find(b => b.type === 'node_locator' && safeStr(b.id) === id);
+    if (!block) {
+      block = { type: 'node_locator', id, title: '搜索结果', nodes: [] };
+      botMsg.blocks.push(block);
+    }
+    const byId = new Map((Array.isArray(block.nodes) ? block.nodes : [])
+      .filter(node => node?.id)
+      .map(node => [safeStr(node.id), node]));
+    (Array.isArray(data.nodes) ? data.nodes : []).forEach(node => {
+      const nodeId = safeStr(node?.id);
+      if (nodeId) byId.set(nodeId, node);
+    });
+    block.title = safeStr(data.title || block.title || '搜索结果');
+    block.nodes = [...byId.values()].slice(0, 80);
+    block.total = Math.max(block.nodes.length, Number(data.total || 0));
+    return block;
+  }
+
   function handleCodexEvent(msg, botMsg) {
     const method = safeStr(msg.method);
     const params = msg.params || {};
@@ -3152,6 +3361,14 @@
         : `${tool || '画布工具'} 失败：${safeStr(result.message || '未知原因')}`;
       if (params.query) {
         updateProcessToolResult(botMsg, params, result, nodes);
+        if (ok && tool === 'search_canvas_nodes' && nodes.length) {
+          const query = safeStr(result.query);
+          upsertNodeLocatorBlock(botMsg, {
+            title: query ? `搜索“${query}”` : '搜索结果',
+            nodes,
+            total: result.total,
+          });
+        }
         renderBody();
         return;
       }
@@ -3183,12 +3400,14 @@
       const approvalId = safeStr(params.approval_id);
       botMsg.blocks.push({
         type: 'choice',
-        title: params.tool === 'generate_images' || params.tool === 'generate_videos' ? '生成任务确认' : (params.risk === 'high' ? '高风险画布动作需要确认' : '画布动作需要确认'),
+        title: safeStr(params.title || (params.confirmation_kind === 'batch_plan' ? '批量执行确认' : (params.tool === 'generate_images' || params.tool === 'generate_videos' ? '生成任务确认' : (params.risk === 'high' ? '高风险画布动作需要确认' : '画布动作需要确认')))),
         text: safeStr(params.reason || '确认后才会修改画布'),
         status: 'pending',
         task_id: safeStr(params.task_id || currentBackendTaskId),
         approval_id: approvalId,
         risk: safeStr(params.risk || 'normal'),
+        confirmation_kind: safeStr(params.confirmation_kind),
+        summary_rows: Array.isArray(params.summary_rows) ? params.summary_rows : [],
         actions: Array.isArray(params.actions) ? params.actions : [],
         options: Array.isArray(params.options) ? params.options : [
           { label: '执行', value: 'approve', action: 'resolve_canvas_action' },
@@ -3211,7 +3430,9 @@
         ? '：' + resultItems.map(item => `${safeStr(item.title || item.name || item.type || '节点')} @ ${Math.round(Number(item.x || 0))},${Math.round(Number(item.y || 0))}`).join('；')
         : '';
       const text = ok
-        ? `后端已执行画布动作，影响 ${changed} 个节点${skipped ? `，跳过 ${skipped} 项` : ''}${itemHint}`
+        ? (params.tool === 'create_batch_task'
+          ? `批量任务已创建并开始执行${itemHint}`
+          : `后端已执行画布动作，影响 ${changed} 个节点${skipped ? `，跳过 ${skipped} 项` : ''}${itemHint}`)
         : `后端画布动作未执行：${safeStr(params.message || '未知原因')}`;
       botMsg.blocks.push(ok ? {
         type: 'canvas_action_result',
@@ -3663,6 +3884,9 @@
       return `<div class="cm-msg cm-msg-user-wrap">${html}</div>`;
     }
     const blocks = coalesceBotBlocksForRender(msg.blocks || []);
+    if (isCompletedBotMessage(msg, blocks)) {
+      return renderCompletedBotMessage(msg, blocks);
+    }
     const thinkingBlocks = blocks.filter(block => block.type === 'thinking');
     const contentBlocks = blocks.filter(block => block.type !== 'thinking');
     const mergedThinking = thinkingBlocks.map(block => normalizeThinkingText(block.text)).filter(Boolean).join('\n\n');
@@ -3672,18 +3896,95 @@
     return `<div class="cm-msg cm-msg-bot-wrap">${thinkingHtml}${blocksHtml}${summaryHtml}</div>`;
   }
 
-  function renderTurnSummary(msg, blocks) {
+  function isCompletedBotMessage(msg, blocks) {
+    if (Number(msg?.completedAt || msg?.endedAt || 0) > 0) return true;
+    // 旧版历史只把结束时间写在 process block 上，没有消息级 completedAt。
+    // 只在所有过程都已退出 running 且确实存在 endedAt 时推断为完成，避免
+    // 正在流式运行的新回合被提前归档。
+    const processBlocks = (Array.isArray(blocks) ? blocks : []).filter(block => (
+      block?.type === 'process'
+      && Array.isArray(block.steps)
+      && block.steps.length
+    ));
+    return processBlocks.length > 0
+      && processBlocks.every(block => safeStr(block.status).toLowerCase() !== 'running')
+      && processBlocks.some(block => Number(block.endedAt || 0) > 0);
+  }
+
+  function aggregateCanvasActionResults(blocks) {
+    const actions = blocks.filter(block => block.type === 'canvas_action_result' && block.status !== 'error');
+    if (!actions.length) return null;
+    const nodesByKey = new Map();
+    let skipped = 0;
+    let changedFallback = 0;
+    actions.forEach(block => {
+      skipped += Math.max(0, Number(block.skipped || 0));
+      changedFallback += Math.max(0, Number(block.changed || 0));
+      const rows = Array.isArray(block.results) ? block.results : [];
+      const nodes = [
+        ...(Array.isArray(block.nodes) ? block.nodes : []),
+        ...rows.flatMap(row => Array.isArray(row?.items) ? row.items : []),
+      ];
+      nodes.forEach((node, index) => {
+        if (!node || typeof node !== 'object') return;
+        const key = safeStr(node.id) || `${safeStr(node.type)}:${Number(node.x || 0)}:${Number(node.y || 0)}:${index}`;
+        nodesByKey.set(key, node);
+      });
+    });
+    const nodes = [...nodesByKey.values()];
+    const changed = nodes.length || changedFallback;
+    return {
+      type: 'canvas_action_result',
+      status: 'done',
+      aggregate: true,
+      changed,
+      skipped,
+      nodes,
+      results: [],
+      summary: `已完成画布操作${changed ? `，影响 ${changed} 个节点` : ''}${skipped ? `，跳过 ${skipped} 项` : ''}`,
+    };
+  }
+
+  function renderCompletedBotMessage(msg, blocks) {
+    let finalTextIndex = -1;
+    blocks.forEach((block, index) => {
+      if (block.type === 'text' && cleanAgentDisplayText(safeStr(block.text)).trim()) finalTextIndex = index;
+    });
+    const finalText = finalTextIndex >= 0 ? blocks[finalTextIndex] : null;
+    const resultBlock = aggregateCanvasActionResults(blocks);
+    const locatorBlocks = blocks.filter(block => block.type === 'node_locator');
+    const archivedBlocks = blocks.filter((block, index) => {
+      if (index === finalTextIndex) return false;
+      if (block.type === 'canvas_action_result' || block.type === 'node_locator' || block.type === 'agent_status' || block.type === 'transient_notice') return false;
+      return true;
+    });
+    const archiveHtml = archivedBlocks.map(renderBlock).filter(Boolean).join('');
+    const summaryHtml = renderTurnSummary(msg, blocks, archiveHtml);
+    const resultHtml = resultBlock ? renderCanvasActionResultBlock(resultBlock) : '';
+    const locatorHtml = locatorBlocks.map(renderNodeLocatorBlock).filter(Boolean).join('');
+    const finalHtml = finalText ? renderBlock(finalText) : '';
+    return `<div class="cm-msg cm-msg-bot-wrap cm-msg-bot-completed">${summaryHtml}${resultHtml}${locatorHtml}${finalHtml}</div>`;
+  }
+
+  function renderTurnSummary(msg, blocks, archiveHtml = '') {
     const processBlocks = blocks.filter(block => block.type === 'process' && Array.isArray(block.steps) && block.steps.length);
-    if (!processBlocks.length) return '';
     const startedCandidates = [Number(msg.startedAt || 0), ...processBlocks.map(block => Number(block.startedAt || 0))].filter(Boolean);
     const endedCandidates = [Number(msg.completedAt || msg.endedAt || 0), ...processBlocks.map(block => Number(block.endedAt || 0))].filter(Boolean);
     const started = startedCandidates.length ? Math.min(...startedCandidates) : 0;
     const ended = endedCandidates.length ? Math.max(...endedCandidates) : 0;
+    if (!started && !processBlocks.length) return '';
     const duration = started && ended ? formatDurationHuman(Math.max(0, ended - started)) : '';
     const completedAt = ended ? new Date(ended).toLocaleString() : '';
+    const content = `<span class="cm-turn-summary-icon">${icon('clock-3')}</span><span>${ended ? '已处理' : '处理中'}${duration ? ` ${escapeHtml(duration)}` : ''}</span>
+      ${completedAt ? `<small>完成于 ${escapeHtml(completedAt)}</small>` : ''}`;
+    if (archiveHtml) {
+      return `<details class="cm-turn-archive" title="展开查看本轮处理过程">
+        <summary class="cm-turn-summary" tabindex="0" title="${escapeAttr(completedAt ? `完成于 ${completedAt}` : '本轮对话正在处理')}">${content}</summary>
+        <div class="cm-turn-archive-body">${archiveHtml}</div>
+      </details>`;
+    }
     return `<div class="cm-turn-summary" tabindex="0" title="${escapeAttr(completedAt ? `完成于 ${completedAt}` : '本轮对话正在处理')}">
-      <span class="cm-turn-summary-icon">${icon('clock-3')}</span><span>${ended ? '已处理' : '处理中'}${duration ? ` ${escapeHtml(duration)}` : ''}</span>
-      ${completedAt ? `<small>完成于 ${escapeHtml(completedAt)}</small>` : ''}
+      ${content}
     </div>`;
   }
 
@@ -3691,6 +3992,9 @@
     const out = [];
     (Array.isArray(blocks) ? blocks : []).forEach(block => {
       if (!block || typeof block !== 'object') return;
+      // 思考事件只用于内部恢复，不进入可见时间线，也不会把前后相邻的
+      // 工具/命令调用拆成多个分组。
+      if (block.type === 'thinking') return;
       if (block.type === 'process') {
         let previous = null;
         for (let index = out.length - 1; index >= 0; index -= 1) {
@@ -3799,11 +4103,9 @@
       return `<div class="cm-msg-bot cm-md">${renderMarkdown(text)}${b.streaming ? '<span class="cm-stream-caret"> ▍</span>' : ''}</div>`;
     }
     if (type === 'thinking') {
-      const t = normalizeThinkingText(b.text);
-      if (!t) return '';
-      const truncated = t.length > 200 ? '…' + t.slice(-200) : t;
-      const status = b.status === 'stale' || b.stale ? '上次刷新前正在思考' : '思考';
-      return `<details class="cm-thinking" title="${escapeAttr(t)}"><summary>${escapeHtml(status)}：${escapeHtml(truncated)}</summary><div>${escapeHtml(t)}</div></details>`;
+      // Reasoning events remain in the panel snapshot for turn recovery and
+      // diagnostics, but are intentionally never exposed in the chat UI.
+      return '';
     }
     if (type === 'tool') {
       const txt = safeStr(b.text);
@@ -3867,7 +4169,7 @@
       return `<div class="cm-msg-tool">📋 <ul>${items}</ul></div>`;
     }
     if (type === 'error') {
-      return `<div class="cm-msg-error">❌ ${escapeHtml(normalizeAgentErrorText(b.text))}</div>`;
+      return `<div class="cm-msg-error">${icon('circle-alert')}<span>${escapeHtml(normalizeAgentErrorText(b.text))}</span></div>`;
     }
     return '';
   }
@@ -3939,7 +4241,7 @@
     const changed = Number(b.changed || 0);
     const skipped = Number(b.skipped || 0);
     const resultRows = Array.isArray(b.results) ? b.results : [];
-    const resultNodes = resultRows.flatMap(row => Array.isArray(row?.items) ? row.items : []).filter(Boolean);
+    const resultNodes = b.aggregate ? [] : resultRows.flatMap(row => Array.isArray(row?.items) ? row.items : []).filter(Boolean);
     const nodes = (resultNodes.length ? resultNodes : (Array.isArray(b.nodes) ? b.nodes : [])).slice(0, 8);
     const countByKind = new Map();
     const nodeKind = (type, node) => {
@@ -3972,13 +4274,13 @@
     const renameOnly = actionTypes.length > 0 && actionTypes.every(type => /rename|set_node_title/.test(type));
     const moveOnly = actionTypes.length > 0 && actionTypes.every(type => /move|position|arrange|layout|organize/.test(type));
     const generationOnly = [...countByKind.keys()].every(kind => kind === '生图节点' || kind === '视频节点');
-    const summary = renameOnly
+    const summary = safeStr(b.summary) || (renameOnly
       ? `已重命名 ${changed || nodes.length}个素材`
       : moveOnly
       ? `已调整 ${changed || nodes.length}个节点`
       : countText
       ? `${generationOnly ? '已生成' : '已创建'} ${countText}`
-      : `已完成画布操作${changed ? `，影响 ${changed} 个节点` : ''}${skipped ? `，跳过 ${skipped} 项` : ''}`;
+      : `已完成画布操作${changed ? `，影响 ${changed} 个节点` : ''}${skipped ? `，跳过 ${skipped} 项` : ''}`);
     const nodeRows = nodes.map(node => {
       const id = safeStr(node.id);
       const mediaName = Array.isArray(node.images) ? safeStr(node.images[0]?.name) : '';
@@ -4011,16 +4313,22 @@
   }
 
   function renderNodeLocatorBlock(b) {
-    const nodes = Array.isArray(b.nodes) ? b.nodes.filter(n => n && n.id).slice(0, 8) : [];
+    const nodes = Array.isArray(b.nodes) ? b.nodes.filter(n => n && n.id).slice(0, 20) : [];
     if (!nodes.length) return '';
-    const title = safeStr(b.title || '节点定位');
+    const title = safeStr(b.title || '搜索结果');
+    const total = Math.max(nodes.length, Number(b.total || 0));
     const chips = nodes.map(node => {
       const id = safeStr(node.id);
-      const label = safeStr(node.title || node.name || node.type || '节点');
-      return `<button class="cm-node-chip" data-node-id="${escapeAttr(id)}">${escapeHtml(label)}</button>`;
+      const firstMedia = Array.isArray(node.images) ? node.images[0] : null;
+      // 与智能画布图片下方的 image-name-badge 保持一致：
+      // 媒体节点优先展示 images[index].name，而不是内部类型标题 Image/Video。
+      const mediaName = safeStr(firstMedia?.name || extractName(firstMedia?.url || ''));
+      const label = safeStr(mediaName || node.title || node.name || node.text || node.type || '节点').slice(0, 80);
+      const xy = `${Math.round(Number(node.x || 0))}, ${Math.round(Number(node.y || 0))}`;
+      return `<button class="cm-node-chip" data-node-id="${escapeAttr(id)}" title="在画布中定位">${escapeHtml(label)} <span>@ ${escapeHtml(xy)}</span></button>`;
     }).join('');
     return `<div class="cm-agent-block cm-node-locator-block">
-      <div class="cm-block-head"><span>定位</span><b>${escapeHtml(title)}</b><em>${nodes.length} 个</em></div>
+      <div class="cm-block-head"><span>节点</span><b>${escapeHtml(title)}</b><em>${total} 个</em></div>
       <div class="cm-node-chip-row">${chips}</div>
     </div>`;
   }
@@ -4042,9 +4350,18 @@
       const scope = safeStr(action.scope);
       return `<li>${escapeHtml(type)}${count > 1 ? ` · ${count} 项` : ''}${scope ? ` · ${escapeHtml(scope)}` : ''}</li>`;
     }).join('') : '';
+    const batchRows = Array.isArray(b.summary_rows) ? b.summary_rows.map(row => {
+      const nodeLabel = safeStr(row.node_label || '生成节点');
+      const provider = safeStr(row.provider || row.provider_id || '默认平台');
+      const outputCount = Math.max(0, Number(row.output_count || row.node_count || 0));
+      const unit = safeStr(row.unit || '个');
+      const concurrency = Math.max(1, Number(row.concurrency || 1));
+      return `<div class="cm-batch-plan-row"><span>${escapeHtml(nodeLabel)}</span><b>${escapeHtml(provider)}</b><strong>${outputCount}${escapeHtml(unit)}</strong><em>并发 ${concurrency}</em></div>`;
+    }).join('') : '';
     return `<div class="cm-agent-block cm-choice-block">
       <div class="cm-block-head"><span>确认</span><b>${escapeHtml(title)}</b><em>${escapeHtml(blockStatusLabel(b.status || 'pending'))}</em></div>
       ${b.text ? `<div class="cm-block-text">${escapeHtml(safeStr(b.text))}</div>` : ''}
+      ${batchRows ? `<div class="cm-batch-plan-rows">${batchRows}</div>` : ''}
       ${actionRows ? `<ul class="cm-choice-actions">${actionRows}</ul>` : ''}
       <div class="cm-choice-row">${buttons || '<span class="cm-block-muted">暂无选项</span>'}</div>
     </div>`;
@@ -4518,6 +4835,9 @@
       }
     }
   }
+
+  window.InfiniteCanvasAgentPanel = { openComplexTask, closeComplexTask };
+  window.addEventListener('infinite-canvas:open-complex-task', event => openComplexTask(event.detail?.taskId || ''));
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', inject);
