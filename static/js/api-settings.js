@@ -88,7 +88,7 @@ const JIMENG_DEFAULT_IMAGE_MODELS = ['5.0', '4.6', '4.5', '4.1', '4.0', '3.1', '
 const JIMENG_DEFAULT_VIDEO_MODELS = ['seedance2.0fast_vip', 'seedance2.0_vip'];
 const JIMENG_LEGACY_IMAGE_MODELS = new Set(['jimeng-image-2k', 'jimeng-image-4k']);
 const JIMENG_LEGACY_VIDEO_MODELS = new Set(['jimeng-video-720p', 'jimeng-video-1080p']);
-const CODEX_DEFAULT_IMAGE_MODELS = ['$imagegen'];
+const CODEX_DEFAULT_IMAGE_MODELS = ['gpt-image-2'];
 const CODEX_DEFAULT_CHAT_MODELS = ['gpt-5.5'];
 const GEMINI_CLI_DEFAULT_IMAGE_MODELS = ['auto'];
 const GEMINI_CLI_DEFAULT_CHAT_MODELS = ['auto'];
@@ -138,7 +138,7 @@ function applyCliProtocolDefaults(item, protocol){
         item.video_models = unique([...(item.video_models || []).filter(model => !JIMENG_LEGACY_VIDEO_MODELS.has(String(model || '').trim())), ...JIMENG_DEFAULT_VIDEO_MODELS]);
         item.chat_models = unique(item.chat_models || []);
     } else if(value === 'codex'){
-        item.image_models = unique([...(item.image_models || []), ...CODEX_DEFAULT_IMAGE_MODELS]);
+        item.image_models = unique([...(item.image_models || []).filter(model => String(model || '').trim().toLowerCase() !== '$imagegen'), ...CODEX_DEFAULT_IMAGE_MODELS]);
         item.chat_models = unique([...(item.chat_models || []), ...CODEX_DEFAULT_CHAT_MODELS]);
         item.video_models = [];
     } else if(value === 'gemini-cli'){
@@ -166,6 +166,7 @@ const RECOMMENDED_APIS = [
         icons:['IMG'],
         summaryKey:'api.recommendExellomeSummary',
         perks:[{key:'api.recommendExellome2k4k'}],
+        keyHint:'使用 VIP 分组',
         advantages:['稳定输出 GPT-Image2 和 Nano Banana 的 2K/4K', '异步协议适合长任务', '预填全系图像模型'],
         image_models:['gpt-image2-2k', 'gpt-image2-4k', 'Nano-Banana-2-2k', 'Nano-Banana-2-4k', 'Nano-Banana-Pro-2k', 'Nano-Banana-Pro-4k'],
         chat_models:[],
@@ -255,8 +256,25 @@ const RECOMMEND_GROUPS = [
 const LOCKED_RECOMMENDED_PROTOCOL_IDS = new Set(['exellome', 'fhl']);
 function lockedRecommendedApi(itemOrId){
     const id = typeof itemOrId === 'string' ? itemOrId : itemOrId?.id;
-    if(!LOCKED_RECOMMENDED_PROTOCOL_IDS.has(id)) return null;
-    return RECOMMENDED_APIS.find(api => api.id === id) || null;
+    const name = typeof itemOrId === 'string' ? '' : itemOrId?.name;
+    const baseUrl = typeof itemOrId === 'string' ? '' : itemOrId?.base_url;
+    const normalizedId = String(id || '').trim().toLowerCase();
+    const normalizedName = String(name || '').trim().toLowerCase();
+    const normalizedBase = String(baseUrl || '').trim().replace(/\/+$/, '').toLowerCase();
+    const normalizedHost = (() => {
+        try { return new URL(normalizedBase).host.toLowerCase(); } catch(e) { return ''; }
+    })();
+    return RECOMMENDED_APIS.find(api => {
+        if(!LOCKED_RECOMMENDED_PROTOCOL_IDS.has(api.id)) return false;
+        const apiBase = String(api.base_url || '').trim().replace(/\/+$/, '').toLowerCase();
+        const apiHost = (() => {
+            try { return new URL(apiBase).host.toLowerCase(); } catch(e) { return ''; }
+        })();
+        return normalizedId === api.id
+            || normalizedName === String(api.name || '').trim().toLowerCase()
+            || (apiBase && normalizedBase === apiBase)
+            || (apiHost && normalizedHost === apiHost);
+    }) || null;
 }
 function hasLockedRecommendedProtocol(itemOrId){
     return Boolean(lockedRecommendedApi(itemOrId));
@@ -812,7 +830,7 @@ function handleRhPasteInput(value){
     const parsed = parseRunningHubRunRef(value);
     if(parsed) setStatus('已识别 RunningHub 路径，点击右侧创建卡片');
 }
-function createRhEntryFromPaste(){
+async function createRhEntryFromPaste(){
     const item = provider();
     if(!item || item.id !== 'runninghub') return;
     const parsed = parseRunningHubRunRef(rhPasteInput?.value || '');
@@ -840,7 +858,11 @@ function createRhEntryFromPaste(){
     }
     if(rhPasteInput) rhPasteInput.value = '';
     renderRunningHubCards();
-    setStatus(exists ? '这个 RunningHub 项目已经存在' : '已创建 RunningHub 卡片');
+    setStatus(exists ? '这个 RunningHub 项目已经存在' : '已创建 RunningHub 卡片，正在保存...');
+    if(!exists){
+        const ok = await saveProviders();
+        setStatus(ok ? '已创建并保存 RunningHub 卡片' : '已创建 RunningHub 卡片，但自动保存失败');
+    }
 }
 function updateRhEntry(kind, index, prop, value){
     const item = provider();
@@ -860,7 +882,7 @@ function isStaticRunningHubEntry(kind, entry){
     // 静态模板会随 /api/providers 合并返回完整字段；手动粘贴的新卡片通常没有这些配置。
     return Array.isArray(entry?.fields) || (entry?.workflowJson && typeof entry.workflowJson === 'object') || (entry?.raw && typeof entry.raw === 'object');
 }
-function removeRhEntry(kind, index){
+async function removeRhEntry(kind, index){
     const item = provider();
     if(!item || item.id !== 'runninghub') return;
     const listKey = kind === 'app' ? 'rh_apps' : 'rh_workflows';
@@ -877,7 +899,9 @@ function removeRhEntry(kind, index){
         item[listKey].splice(index, 1);
     }
     renderRunningHubCards();
-    setStatus('已删除，点击保存后生效');
+    setStatus('已删除，正在保存...');
+    const ok = await saveProviders();
+    setStatus(ok ? '已删除并保存' : '已删除，但自动保存失败');
 }
 function readFileAsDataUrl(file){
     return new Promise((resolve, reject) => {
@@ -2171,6 +2195,7 @@ function renderRecommendApi(){
                         <label class="onboarding-key-field onboarding-rh-row-field">
                             <span>API Key</span>
                             <input type="password" data-recommend-key="${index}" placeholder="${escapeAttr(trf('api.recommendKeyPlaceholder', {name:api.name}))}">
+                            ${api.keyHint ? `<em class="recommend-key-hint">${escapeHtml(api.keyHint)}</em>` : ''}
                         </label>
                         <button class="onboarding-save-btn recommend-guide-save-btn" type="button" onclick="saveRecommendedApi(${index})"><span>${escapeHtml(tr('api.save'))}</span></button>
                     </div>
@@ -2202,13 +2227,6 @@ function renderRecommendApi(){
         </div>
         <div class="recommend-api-body recommend-inline-body">${html}</div>
         <div class="recommend-note">${escapeHtml(tr('api.recommendApiNote'))}</div>
-        <div class="recommend-account-invite">
-            <div>
-                <div class="recommend-account-title">${escapeHtml(tr('api.recommendAccountTitle'))}</div>
-                <div class="recommend-account-desc">${escapeHtml(tr('api.recommendAccountDesc'))}</div>
-            </div>
-            <a class="onboarding-key-btn recommend-account-link" href="https://bewild.ai?code=WULIDX" target="_blank" rel="noopener noreferrer"><i data-lucide="external-link" class="w-3.5 h-3.5"></i><span>${escapeHtml(tr('api.viewPlans'))}</span></a>
-        </div>
     `;
     refreshIcons();
 }
@@ -2219,6 +2237,7 @@ function recommendedProviderForApi(api){
         item.protocol = api.protocol || item.protocol || 'openai';
         item.image_request_mode = normalizeImageRequestMode(api.image_request_mode || item.image_request_mode);
         item.image_edit_route = normalizeImageEditRoute(api.image_edit_route || item.image_edit_route);
+        if(Array.isArray(api.video_models)) item.video_models = [...api.video_models];
         if(api.empty_models_on_save){
             item.image_models = [];
             item.chat_models = [];

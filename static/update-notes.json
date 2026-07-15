@@ -1,26 +1,22 @@
 {
-  "version": "2026.07.04.2",
-  "updated_at": "2026-07-04T07:20:36+08:00",
+  "version": "2026.07.08",
+  "updated_at": "2026-07-08T18:49:36+08:00",
   "items": [
     {
       "type": "feature",
-      "text": "重要更新："
+      "text": "修复即梦CLI只参考第一张图bug"
     },
     {
       "type": "feature",
-      "text": "针对笔记本等小屏幕，将所有页面做了缩放适配，显示不再拥挤"
+      "text": "修复GPT对话生成图片失败bug"
     },
     {
       "type": "feature",
-      "text": "新增了触屏支持（理论上可以用iPad操控画布了）"
+      "text": "修复智能画布匹配图片比例后，1k/2k/4k尺寸没有自动适配bug"
     },
     {
       "type": "feature",
-      "text": "推荐API新增稳定出图平台，支持GPT Image 2稳定输出2K/4K"
-    },
-    {
-      "type": "feature",
-      "text": "支持GPT/Gemini pro个人账号，调用CLI免费生图，需要下载CLI文件夹自行安装"
+      "text": "modelscope更新源暂不可用"
     }
   ]
 }

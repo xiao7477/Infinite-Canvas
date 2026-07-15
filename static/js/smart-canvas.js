@@ -304,7 +304,7 @@ let settings = {
     provider_id:'',
     model:'',
     ratio:'square',
-    resolution:'auto',
+    resolution:'4k',
     customRatio:'',
     customRatioWidth:'',
     customRatioHeight:'',
@@ -445,7 +445,7 @@ function uid(prefix){ return `${prefix}_${Math.random().toString(36).slice(2, 10
 function escapeHtml(str){ return String(str == null ? '' : str).replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s])); }
 const escapeAttr = escapeHtml;
 function smartOriginalMediaUrl(itemOrUrl){
-    const raw = typeof itemOrUrl === 'string' ? itemOrUrl : (itemOrUrl?.url || '');
+    const raw = typeof itemOrUrl === 'string' ? itemOrUrl : (itemOrUrl?.displayUrl || itemOrUrl?.url || '');
     const text = String(raw || '');
     if(!text) return '';
     try {
@@ -556,6 +556,7 @@ function bindSmartPreviewImageFallbacks(root=document){
 const SMART_SELECTED_HIGH_RES_DELAY = 320;
 let smartSelectedHighResTimer = 0;
 let smartSelectedHighResSeq = 0;
+let smartSelectedHighResNodeIds = new Set();
 const smartSelectedHighResLoaded = new Set();
 const smartSelectedHighResLoading = new Map();
 function smartImageEditorIsOpen(){
@@ -578,31 +579,50 @@ function preloadSmartSelectedHighRes(src){
     smartSelectedHighResLoading.set(src, task);
     return task;
 }
-function syncSmartSelectedImageResolution(root=world){
+function smartNodeElementsByIds(ids){
+    const wanted = ids instanceof Set ? ids : new Set(ids || []);
+    const elements = [];
+    if(!wanted.size) return elements;
+    world.querySelectorAll?.('.image-node').forEach(el => {
+        const id = el.dataset?.id || '';
+        if(wanted.has(id)) elements.push(el);
+    });
+    return elements;
+}
+function smartNodeElementsForHighResSync(root){
+    if(root && root !== world) return [root];
+    const ids = new Set([...smartSelectedHighResNodeIds, ...selectedNodeIds()]);
+    return smartNodeElementsByIds(ids);
+}
+function syncSmartSelectedImageResolution(root=null){
     const selectedImages = [];
-    root.querySelectorAll?.('.image-node img[data-preview-src][data-original-src]').forEach(img => {
-        if(img.dataset.previewKind === 'video') return;
-        const nodeEl = img.closest('.image-node');
-        const selectedNode = Boolean(nodeEl?.dataset?.id && isNodeSelected(nodeEl.dataset.id));
-        const preview = img.dataset.previewSrc || '';
-        const original = img.dataset.originalSrc || '';
-        if(!selectedNode){
-            delete img.dataset.selectedHighResTarget;
+    smartNodeElementsForHighResSync(root).forEach(scope => {
+        const nodeEl = scope?.classList?.contains('image-node') ? scope : scope?.closest?.('.image-node');
+        const nodeId = nodeEl?.dataset?.id || '';
+        const selectedNode = Boolean(nodeId && isNodeSelected(nodeId));
+        scope.querySelectorAll?.('img[data-preview-src][data-original-src]').forEach(img => {
+            if(img.dataset.previewKind === 'video') return;
+            const preview = img.dataset.previewSrc || '';
+            const original = img.dataset.originalSrc || '';
+            if(!selectedNode){
+                delete img.dataset.selectedHighResTarget;
+                if(preview && img.getAttribute('src') !== preview) img.src = preview;
+                return;
+            }
+            const target = displayMediaUrl({url:smartOriginalMediaUrl(original)});
+            if(!target) return;
+            img.dataset.selectedHighResTarget = target;
+            if(smartSelectedHighResLoaded.has(target)){
+                if(img.getAttribute('src') !== target) img.src = target;
+                return;
+            }
             if(preview && img.getAttribute('src') !== preview) img.src = preview;
-            return;
-        }
-        const target = displayMediaUrl({url:smartOriginalMediaUrl(original)});
-        if(!target) return;
-        img.dataset.selectedHighResTarget = target;
-        if(smartSelectedHighResLoaded.has(target)){
-            if(img.getAttribute('src') !== target) img.src = target;
-            return;
-        }
-        if(preview && img.getAttribute('src') !== preview) img.src = preview;
-        selectedImages.push({img, target});
+            selectedImages.push({img, target});
+        });
     });
     if(smartSelectedHighResTimer) clearTimeout(smartSelectedHighResTimer);
     const seq = ++smartSelectedHighResSeq;
+    smartSelectedHighResNodeIds = new Set(selectedNodeIds());
     if(!selectedImages.length || smartImageEditorIsOpen()) return;
     smartSelectedHighResTimer = setTimeout(async () => {
         smartSelectedHighResTimer = 0;
@@ -663,7 +683,7 @@ function isGptImageAutoSizeModel(model){
         || compact.endsWith('gptimage2');
 }
 function defaultSmartApiResolution(model){
-    return isGptImageAutoSizeModel(model) ? 'auto' : '1k';
+    return isGptImageAutoSizeModel(model) ? '4k' : '1k';
 }
 function mediaItemForStorage(item){
     if(!item || typeof item !== 'object') return item;
@@ -968,6 +988,33 @@ function isSmartImageNode(node){
 function isSmartGroupNode(node){
     return Boolean(node && node.type === 'smart-group');
 }
+function isSmartAgentTaskNode(node){
+    return Boolean(node && node.type === 'smart-agent-task');
+}
+
+function smartAgentReferenceDisplayUrl(value){
+    let text = String(value || '').trim();
+    if(!text) return '';
+    if(/^(data:|blob:|https?:\/\/)/i.test(text)) return text;
+    if(text.startsWith('/assets/') || text.startsWith('/output/') || text.startsWith('/api/')) return text;
+    if(/^file:\/\//i.test(text)){
+        text = text.slice('file://'.length);
+        try { text = decodeURIComponent(text); } catch(e) {}
+    }
+    return `/api/codex-agent/file/view?path=${encodeURIComponent(text)}`;
+}
+
+function normalizeSmartAgentReferencePreviews(node){
+    if(!node?.agentGenerated && !node?.complexTaskItemId) return;
+    ['runPromptRefs','runInputRefs'].forEach(key => {
+        if(!Array.isArray(node[key])) return;
+        node[key] = node[key].map(raw => {
+            const ref = typeof raw === 'string' ? {url:raw} : {...(raw || {})};
+            if(ref.url && !ref.displayUrl) ref.displayUrl = smartAgentReferenceDisplayUrl(ref.url);
+            return ref;
+        });
+    });
+}
 function isSmartRunnableNode(node){
     return Boolean(isSmartImageNode(node) || isSmartGroupNode(node));
 }
@@ -989,6 +1036,16 @@ function smartImageUsesWorkflowInput(node, ctx=smartLoopContext){
 }
 function normalizeLegacySmartNode(node){
     if(!node || typeof node !== 'object') return node;
+    if(node.type === 'smart-agent-task'){
+        const width = Number(node.w);
+        const height = Number(node.h);
+        if(!Number.isFinite(width) || !Number.isFinite(height) || (Math.round(width) === 360 && Math.round(height) === 250)){
+            node.w = 316;
+            node.h = 240;
+        }
+        return node;
+    }
+    normalizeSmartAgentReferencePreviews(node);
     if(node.type === 'smart-container'){
         const fallbackImage = node.inputImage?.url ? stripImageGenerationMeta({
             url:node.inputImage.url,
@@ -1223,18 +1280,27 @@ function clearImageClickTimer(){
         imageClickTimer = null;
     }
 }
+let smartSelectionUiNodeIds = new Set();
+let smartSelectionUiImage = {nodeId:'', index:-1};
 function syncSelectionUi(){
     const ids = selectedNodeIds();
+    const nextIds = new Set(ids);
+    const touchedIds = new Set([...smartSelectionUiNodeIds, ...nextIds]);
+    if(smartSelectionUiImage.nodeId) touchedIds.add(smartSelectionUiImage.nodeId);
+    if(selectedImage.nodeId) touchedIds.add(selectedImage.nodeId);
     world.classList.toggle('smart-multi-selected', ids.length > 1);
     smartArrangeBtn?.classList.toggle('visible', ids.length > 0);
-    world.querySelectorAll('.image-node').forEach(el => {
+    smartNodeElementsByIds(touchedIds).forEach(el => {
         const id = el.dataset.id || '';
         el.classList.toggle('selected', isNodeSelected(id));
         el.querySelectorAll('.thumb-item,.image-wrap').forEach(item => {
-            const index = Number(item.dataset.imageIndex || 0);
-            item.classList.toggle('image-selected', selectedImage.nodeId === id && selectedImage.index === index);
+            const targetNodeId = item.dataset.refNodeId || id;
+            const index = Number(item.dataset.refImageIndex ?? item.dataset.imageIndex ?? 0);
+            item.classList.toggle('image-selected', selectedImage.nodeId === targetNodeId && selectedImage.index === index);
         });
     });
+    smartSelectionUiNodeIds = nextIds;
+    smartSelectionUiImage = {nodeId:selectedImage.nodeId || '', index:Number(selectedImage.index ?? -1)};
     syncSmartSelectedImageResolution(world);
     syncRunButtonState();
     scheduleConnectionLayerRefresh();
@@ -1821,6 +1887,7 @@ function smartGroupImageGridLayout(node){
     return {cols, rows, visibleRows, width, height, thumb:baseThumb};
 }
 function imageLayout(images, scale=1, node=null){
+    if(isSmartAgentTaskNode(node)) return {cols:1, rows:1, width:Math.round(Number(node.w) || 316), height:Math.round(Number(node.h) || 240), thumb:96, single:true};
     if(node?.type === 'smart-group'){
         const groupThumbLayout = smartGroupThumbLayout(node);
         if(groupThumbLayout) return groupThumbLayout;
@@ -2183,14 +2250,23 @@ function runningHubProvider(){
 }
 function runningHubEntries(kind){
     const provider = runningHubProvider();
+    if(kind === 'model'){
+        return (provider?.image_models || []).map(model => ({
+            id:String(model || '').trim(),
+            title:String(model || '').trim(),
+            enabled:true
+        })).filter(item => item.id);
+    }
     const key = kind === 'workflow' ? 'rh_workflows' : 'rh_apps';
     return Array.isArray(provider?.[key]) ? provider[key].filter(item => item?.enabled !== false && item?.hidden !== true) : [];
 }
 function runningHubEntryId(entry, kind){
+    if(kind === 'model') return String(entry?.id || entry?.model || entry?.title || '').trim();
     return String(kind === 'workflow' ? (entry?.workflowId || entry?.id || '') : (entry?.appId || entry?.webappId || entry?.id || '')).trim();
 }
 function runningHubEntryLabel(entry, kind){
     const id = runningHubEntryId(entry, kind);
+    if(kind === 'model') return entry?.title || entry?.name || id;
     return entry?.title || entry?.name || (kind === 'workflow' ? `Workflow ${id}` : `AI App ${id}`);
 }
 function runningHubEntryKey(kind, id){
@@ -2198,11 +2274,12 @@ function runningHubEntryKey(kind, id){
 }
 function parseRunningHubEntryKey(value){
     const text = String(value || '').trim();
-    const match = text.match(/^(app|workflow):(.+)$/);
+    const match = text.match(/^(app|workflow|model):(.+)$/);
     return match ? {kind:match[1], id:match[2].trim()} : null;
 }
 function runningHubAllEntries(){
     return [
+        ...runningHubEntries('model').map(entry => ({kind:'model', id:runningHubEntryId(entry, 'model'), entry})).filter(x => x.id),
         ...runningHubEntries('app').map(entry => ({kind:'app', id:runningHubEntryId(entry, 'app'), entry})).filter(x => x.id),
         ...runningHubEntries('workflow').map(entry => ({kind:'workflow', id:runningHubEntryId(entry, 'workflow'), entry})).filter(x => x.id)
     ];
@@ -2228,6 +2305,14 @@ function rhWorkflowJsonFromSources(...sources){
 function rhCurrentKind(sourceSettings=settings){
     return selectedRunningHubRef(sourceSettings)?.kind || 'app';
 }
+function runningHubSelectedModel(sourceSettings=settings){
+    const ref = selectedRunningHubRef(sourceSettings);
+    return ref?.kind === 'model' ? ref.id : '';
+}
+function runningHubModelApiSettings(sourceSettings=settings){
+    const model = runningHubSelectedModel(sourceSettings);
+    return {...(sourceSettings || settings), engine:'api', apiKind:'image', provider_id:'runninghub', model};
+}
 function rhUsableFields(fields){
     const list = Array.isArray(fields) ? fields : [];
     if(!list.length) return [];
@@ -2246,6 +2331,7 @@ function rhActiveFields(sourceSettings=settings){
 }
 function runningHubRunNeedsPrompt(sourceSettings=settings){
     if((sourceSettings || settings).engine !== 'runninghub') return true;
+    if(runningHubSelectedModel(sourceSettings)) return true;
     const fields = rhActiveFields(sourceSettings);
     const promptFields = fields.filter(field => rhFieldRole(field) === 'prompt');
     if(!promptFields.length) return false;
@@ -2338,7 +2424,7 @@ function syncJimengModelPillForRefs(){
     if(mode === _jimengLastEditMode) return;
     _jimengLastEditMode = mode;
     _jimengModelRefreshing = true;
-    try { renderDynamicParams(); } finally { _jimengModelRefreshing = false; }
+    try { scheduleDynamicParamsRefresh(80); } finally { _jimengModelRefreshing = false; }
 }
 // 即梦各视频指令支持的模型集合不同，按当前参考素材推断指令并过滤模型下拉。
 const JIMENG_SEEDANCE_VIDEO_MODELS = ['seedance2.0_vip', 'seedance2.0fast_vip', 'seedance2.0', 'seedance2.0fast'];
@@ -2375,7 +2461,7 @@ function syncJimengVideoModelPillForRefs(){
     if(command === _jimengLastVideoCommand) return;
     _jimengLastVideoCommand = command;
     _jimengModelRefreshing = true;
-    try { renderDynamicParams(); } finally { _jimengModelRefreshing = false; }
+    try { scheduleDynamicParamsRefresh(80); } finally { _jimengModelRefreshing = false; }
 }
 function sanitizeSmartApiSelection(target=settings){
     if(!target || typeof target !== 'object') return target;
@@ -2398,7 +2484,7 @@ function sanitizeSmartApiSelection(target=settings){
     }
     if((target.engine || 'api') === 'api' && (target.apiKind || 'image') !== 'video'){
         const allowAuto = isGptImageAutoSizeModel(target.model);
-        if(!target.resolution) target.resolution = allowAuto ? 'auto' : '1k';
+        if(!target.resolution || (allowAuto && target.resolution === 'auto')) target.resolution = allowAuto ? defaultSmartApiResolution(target.model) : '1k';
         if(!allowAuto && target.resolution === 'auto') target.resolution = '1k';
     }
     if(target.videoProvider){
@@ -2565,7 +2651,7 @@ function normalizeApiSizeSettings(prefix=''){
     const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
     const resKey = prefix ? `${prefix}Resolution` : 'resolution';
     const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && isGptImageAutoSizeModel(settings.model);
-    if(!settings[resKey]) settings[resKey] = allowAuto ? 'auto' : '1k';
+    if(!settings[resKey] || (allowAuto && settings[resKey] === 'auto')) settings[resKey] = allowAuto ? defaultSmartApiResolution(settings.model) : '1k';
     if(!allowAuto && settings[resKey] === 'auto') settings[resKey] = '1k';
     if(settings[resKey] === 'auto' && !settings[ratioKey]) settings[ratioKey] = 'square';
 }
@@ -2585,6 +2671,31 @@ function comfyParamValue(field){
     return field.default ?? (field.type === 'boolean' ? false : (field.type === 'number' || field.type === 'slider' ? 0 : ''));
 }
 function updateProviderModels(){ renderDynamicParams(); }
+let dynamicParamsRefreshTimer = 0;
+let dynamicParamsRefreshIdle = 0;
+let dynamicParamsRefreshSeq = 0;
+function scheduleDynamicParamsRefresh(delay=120){
+    if(dynamicParamsRefreshTimer){
+        clearTimeout(dynamicParamsRefreshTimer);
+        dynamicParamsRefreshTimer = 0;
+    }
+    if(dynamicParamsRefreshIdle && window.cancelIdleCallback){
+        window.cancelIdleCallback(dynamicParamsRefreshIdle);
+        dynamicParamsRefreshIdle = 0;
+    }
+    const seq = ++dynamicParamsRefreshSeq;
+    const run = () => {
+        dynamicParamsRefreshTimer = 0;
+        dynamicParamsRefreshIdle = 0;
+        if(seq !== dynamicParamsRefreshSeq) return;
+        renderDynamicParams();
+    };
+    if(window.requestIdleCallback){
+        dynamicParamsRefreshIdle = window.requestIdleCallback(run, {timeout:Math.max(180, Number(delay) + 260)});
+    } else {
+        dynamicParamsRefreshTimer = setTimeout(run, Math.max(0, Number(delay) || 0));
+    }
+}
 function controlTypeKey(el){
     return el ? Array.from(el.classList).find(c => c !== 'smart-control' && c.endsWith('-control')) || '' : '';
 }
@@ -2749,6 +2860,18 @@ function renderRunningHubParams(){
         dynamicParams.innerHTML = `<div class="muted-note">${escapeHtml(tr('smart.rhNeedConfig'))}</div>`;
         return;
     }
+    if(ref.kind === 'model'){
+        settings.provider_id = 'runninghub';
+        settings.model = ref.id;
+        normalizeApiSizeSettings('');
+        dynamicParams.innerHTML = `
+            ${renderRhConfigControl(ref)}
+            ${renderSizePickerControl('', true)}
+            ${renderQualityControl()}
+            ${renderCountVisualControl()}
+        `;
+        return;
+    }
     const mediaFields = fields.filter(f => ['image','video','audio'].includes(rhFieldRole(f))).length;
     const promptFields = fields.filter(f => rhFieldRole(f) === 'prompt').length;
     dynamicParams.innerHTML = `
@@ -2760,6 +2883,7 @@ function renderRunningHubParams(){
     `;
 }
 function renderRhConfigControl(ref){
+    const models = runningHubEntries('model');
     const apps = runningHubEntries('app');
     const workflows = runningHubEntries('workflow');
     const selected = ref ? runningHubEntryKey(ref.kind, ref.id) : '';
@@ -2768,7 +2892,8 @@ function renderRhConfigControl(ref){
         ${entries.map(entry => {
             const id = runningHubEntryId(entry, kind);
             const key = runningHubEntryKey(kind, id);
-            return `<button type="button" class="direct-option rh-entry-option ${key === selected ? 'active' : ''}" data-smart-param="rhConfigKey" data-smart-value="${escapeHtml(key)}"><i data-lucide="${kind === 'workflow' ? 'workflow' : 'sparkles'}"></i><span>${escapeHtml(runningHubEntryLabel(entry, kind))}</span></button>`;
+            const icon = kind === 'workflow' ? 'workflow' : kind === 'model' ? 'box' : 'sparkles';
+            return `<button type="button" class="direct-option rh-entry-option ${key === selected ? 'active' : ''}" data-smart-param="rhConfigKey" data-smart-value="${escapeHtml(key)}"><i data-lucide="${icon}"></i><span>${escapeHtml(runningHubEntryLabel(entry, kind))}</span></button>`;
         }).join('')}
     ` : '';
     return `<div class="smart-control rh-config-control">
@@ -2776,7 +2901,7 @@ function renderRhConfigControl(ref){
         <div class="smart-popover compact-popover rh-picker-popover">
             <div class="smart-popover-title">${escapeHtml(tr('smart.rhConfig'))}</div>
             <div class="model-list rh-config-list">
-                ${groupHtml('app', apps, 'AI 应用')}${groupHtml('workflow', workflows, '工作流') || ''}
+                ${groupHtml('model', models, '模型 API')}${groupHtml('app', apps, 'AI 应用')}${groupHtml('workflow', workflows, '工作流') || ''}
             </div>
         </div>
     </div>`;
@@ -3096,10 +3221,13 @@ function sizePickerLabel(prefix=''){
 function renderSizePickerControl(prefix='', includeSource=false){
     const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
     const resKey = prefix ? `${prefix}Resolution` : 'resolution';
+    const customRatioKey = prefix ? `${prefix}CustomRatio` : 'customRatio';
+    if(settings[ratioKey] === 'source') applySourceRatioToSettings(prefix);
     const scope = sizePickerScope(prefix);
     const options = (!prefix && settings.engine === 'api') ? ['auto','1k','2k','4k'] : ['1k','2k','4k'];
     const currentRes = settings[resKey] || ((!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model) : '1k');
     const currentRatio = settings[ratioKey] || 'square';
+    const currentCustomRatio = settings[customRatioKey] || (currentRatio === 'source' ? sourceImageRatioLabel(prefix) : '');
     const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && isGptImageAutoSizeModel(settings.model);
     const ratios = [
         ['square','1:1','正方形'], ['portrait','2:3','竖图'], ['landscape','3:2','横图'], ['portrait43','3:4','竖图'], ['landscape43','4:3','横图'],
@@ -3125,7 +3253,7 @@ function renderSizePickerControl(prefix='', includeSource=false){
                     ${ratios.map(([value, label, sub]) => `<button type="button" class="size-picker-option ${value === currentRatio ? 'active' : ''}" data-smart-param="${ratioKey}" data-smart-value="${escapeHtml(value)}"><span>${escapeHtml(label)}</span><small>${escapeHtml(sub)}</small></button>`).join('')}
                 </div>
                 <div class="size-picker-list">
-                    ${options.filter(v => v !== 'auto').map(value => `<button type="button" class="size-picker-option ${value === currentRes ? 'active' : ''}" data-smart-param="${resKey}" data-smart-value="${value}"><span>${value.toUpperCase()}</span><small>${escapeHtml(apiImageSize(currentRatio === 'source' ? 'square' : currentRatio, value, settings[prefix ? `${prefix}CustomRatio` : 'customRatio'] || '', '') || '')}</small></button>`).join('')}
+                    ${options.filter(v => v !== 'auto').map(value => `<button type="button" class="size-picker-option ${value === currentRes ? 'active' : ''}" data-smart-param="${resKey}" data-smart-value="${value}"><span>${value.toUpperCase()}</span><small>${escapeHtml(apiImageSize(currentRatio, value, currentCustomRatio, '') || '')}</small></button>`).join('')}
                 </div>
             </div>` : ''}
             ${scope === 'custom' ? `<div class="size-picker-pane size-picker-custom">
@@ -4871,19 +4999,37 @@ let canvasSyncInFlight = false;
 let canvasSyncTimer = null;
 let canvasMetaPollTimer = null;
 let connectionLayerRaf = 0;
+// Local deletion tombstones prevent a just-deleted node from being merged back
+// from an older server snapshot while its save is in flight (especially when a
+// generation worker publishes a final failed status at the same moment).
+const smartDeletedNodeIds = new Set();
 function mergeSmartImageLists(localImgs, remoteImgs){
     const out = [];
-    const seen = new Set();
+    const indexByUrl = new Map();
     (localImgs || []).forEach(img => {
         const u = img && img.url;
-        if(u && seen.has(u)) return;
-        if(u) seen.add(u);
+        if(u && indexByUrl.has(u)) return;
+        if(u) indexByUrl.set(u, out.length);
         out.push(img);
     });
     (remoteImgs || []).forEach(img => {
         const u = img && img.url;
-        if(!u || seen.has(u)) return;
-        seen.add(u);
+        if(u && indexByUrl.has(u)){
+            const index = indexByUrl.get(u);
+            const local = out[index] || {};
+            // Keep transient/local-only media metadata, but the server is the
+            // authority for the user-facing asset name. Agent rename saves on
+            // the server first; dropping the same-URL remote object here made
+            // the old local name overwrite it again on the next autosave.
+            out[index] = {
+                ...img,
+                ...local,
+                url:u,
+                name:String(img?.name || local?.name || '')
+            };
+            return;
+        }
+        if(u) indexByUrl.set(u, out.length);
         out.push(img);
     });
     return out;
@@ -4914,10 +5060,30 @@ function clearSmartNodeBusyState(node){
     delete node.pendingTasks;
     return node;
 }
+function setSmartNodeGenerationError(node, message='', kind='image'){
+    if(!node) return node;
+    node.running = false;
+    node.pending = 0;
+    node.queued = false;
+    delete node.jimengPending;
+    delete node.pendingTasks;
+    node.generationError = {
+        message:String(message || tr('smart.errRunFailed')).slice(0, 1000),
+        kind:kind || node.outputKind || 'image',
+        at:Date.now(),
+        logged:Boolean(node.generationError?.logged)
+    };
+    node.runFinishedAt = nowMs();
+    if(!node.runStartedAt) node.runStartedAt = node.runFinishedAt;
+    node.runElapsedMs = Math.max(0, node.runFinishedAt - Number(node.runStartedAt || node.runFinishedAt));
+    node.runTimerHidden = false;
+    return node;
+}
 function markSmartNodeComplete(node, meta=null){
     if(!node) return node;
     const keepHidden = node.runTimerHidden === true;
     clearSmartNodeBusyState(node);
+    delete node.generationError;
     node.runFinishedAt = Number(node.runFinishedAt || 0) || nowMs();
     if(!node.runStartedAt) node.runStartedAt = meta?.createdAt || node.runFinishedAt;
     node.runElapsedMs = Math.max(0, Number(node.runFinishedAt || nowMs()) - Number(node.runStartedAt || node.runFinishedAt || nowMs()));
@@ -5040,7 +5206,21 @@ function mergeSmartNode(local, remote){
     if(localDone && remoteDone){
         const localFinished = Number(local.runFinishedAt || 0);
         const remoteFinished = Number(remote.runFinishedAt || 0);
-        return completeSmartNodeWithImages(remoteFinished >= localFinished ? remote : local, images);
+        const completion = remoteFinished >= localFinished ? remote : local;
+        // `applyMergedServerCanvas` only runs for a newer server canvas. Keep
+        // that snapshot authoritative for persisted layout/settings (notably
+        // Agent move/resize/arrange x/y/w/h), while retaining the newest local
+        // completion timer and the already-unioned output images. Choosing the
+        // entire local node here made completed media ignore Agent layout until
+        // a full page reload because load-time completion stamps are newer than
+        // the server node's optional runFinishedAt.
+        return completeSmartNodeWithImages({
+            ...remote,
+            runStartedAt:completion.runStartedAt || remote.runStartedAt || local.runStartedAt,
+            runFinishedAt:Math.max(localFinished, remoteFinished),
+            runElapsedMs:Number.isFinite(Number(completion.runElapsedMs)) ? Number(completion.runElapsedMs) : Number(remote.runElapsedMs || local.runElapsedMs || 0),
+            runTimerHidden:completion.runTimerHidden === true || remote.runTimerHidden === true || local.runTimerHidden === true,
+        }, images);
     }
     // 本地正在生成/排队的节点完全以本地为准，只把对方可能多出来的图并进来，绝不被对方旧状态冲掉
     if(smartNodeInFlight(local)){
@@ -5060,6 +5240,7 @@ function mergeSmartNodeLists(localNodes, remoteNodes){
     (localNodes || []).forEach(n => { if(!seen.has(n.id)){ seen.add(n.id); order.push(n.id); } });
     (remoteNodes || []).forEach(n => { if(!seen.has(n.id)){ seen.add(n.id); order.push(n.id); } });
     return order.map(id => {
+        if(smartDeletedNodeIds.has(id)) return null;
         const local = localById.get(id);
         const remote = remoteById.get(id);
         if(local && !remote) return local;     // 仅本地存在：保留（我新建的节点；对方删了也宁可复活也不丢结果）
@@ -5704,9 +5885,9 @@ async function loadCanvas(){
         startCanvasMetaPoll();
     } catch(e) { toast(tr('smart.toastCanvasFail')); }
 }
-function scheduleSave(){
+function scheduleSave(delay=450){
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(saveCanvas, 450);
+    saveTimer = setTimeout(saveCanvas, Math.max(0, Number(delay) || 0));
 }
 async function saveCanvas(){
     if(!canvasId || !canvas) return;
@@ -5739,6 +5920,13 @@ async function saveCanvas(){
         if(res.ok){
             const data = await res.json();
             if(data.canvas && data.canvas.updated_at) canvas.updated_at = data.canvas.updated_at;
+            // Only clear tombstones that this acknowledged server snapshot no
+            // longer contains. A second delete may have happened while the
+            // first save was in flight and must remain protected.
+            const savedIds = new Set((data.canvas?.nodes || []).map(node => node?.id).filter(Boolean));
+            [...smartDeletedNodeIds].forEach(nodeId => {
+                if(!savedIds.has(nodeId)) smartDeletedNodeIds.delete(nodeId);
+            });
         } else if(res.status === 409) {
             // 冲突：别人先保存了。合并对方的状态（节点 id 合并、图片取并集，谁都不丢），
             // 然后用对方最新的 updated_at 作为基底重存，把合并结果落盘——而不是直接覆盖对方。
@@ -5849,7 +6037,7 @@ function cloneSmartNode(node, dx=0, dy=0){
 function copySelectedNodes(){
     if(!canvas || isEditableTarget(document.activeElement)) return;
     const ids = selectedNodeIds();
-    const copiedNodes = ids.map(id => nodes.find(n => n.id === id)).filter(Boolean);
+    const copiedNodes = ids.map(id => nodes.find(n => n.id === id)).filter(node => node && !isSmartAgentTaskNode(node));
     if(!copiedNodes.length) return;
     const idSet = new Set(copiedNodes.map(n => n.id));
     const copiedConnections = (canvas.connections || []).filter(c => idSet.has(c.from) && idSet.has(c.to));
@@ -5935,9 +6123,1492 @@ function pasteAssetsFromInbox(){
     toast(`已粘贴 ${created.length} 个素材到画布`);
     return true;
 }
+function smartAgentSelectionBounds(){
+    const selected = selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean);
+    if(!selected.length) return null;
+    const rects = selected.map(nodeRect);
+    const left = Math.min(...rects.map(r => r.x));
+    const top = Math.min(...rects.map(r => r.y));
+    const right = Math.max(...rects.map(r => r.x + r.width));
+    const bottom = Math.max(...rects.map(r => r.y + r.height));
+    return {x:left, y:top, width:right - left, height:bottom - top, right, bottom};
+}
+function smartAgentAnchorRectFromRefs(refs=[]){
+    const list = Array.isArray(refs) ? refs : [refs];
+    for(const ref of list){
+        const nodeId = String(ref?.nodeId || ref?.node_id || '').trim();
+        if(!nodeId) continue;
+        const node = nodes.find(n => n.id === nodeId);
+        if(node) return nodeRect(node);
+    }
+    return null;
+}
+function smartAgentRectIntersects(a, b, pad=36){
+    if(!a || !b) return false;
+    return !(
+        a.x + a.width + pad <= b.x ||
+        b.x + b.width + pad <= a.x ||
+        a.y + a.height + pad <= b.y ||
+        b.y + b.height + pad <= a.y
+    );
+}
+function smartAgentFindOpenTopLeft(base, size, options={}){
+    const width = Number(size?.width) || Number(options.boxWidth) || 300;
+    const height = Number(size?.height) || Number(options.boxHeight) || 240;
+    const gapX = Number(options.gapX) || 88;
+    const gapY = Number(options.gapY) || 36;
+    const cellX = Math.max(Number(options.cellX) || 0, width + gapX);
+    const cellY = Math.max(Number(options.cellY) || 0, height + gapY);
+    const existing = nodes.map(nodeRect);
+    const rowOffsets = [0, 1, -1, 2, -2, 3, 4, -3, 5, 6, 7, 8];
+    for(let col = 0; col < 8; col++){
+        for(const row of rowOffsets){
+            const rect = {
+                x:Math.round((base.x || 0) + col * cellX),
+                y:Math.round((base.y || 0) + row * cellY),
+                width,
+                height
+            };
+            if(!existing.some(other => smartAgentRectIntersects(rect, other, Number(options.collisionPad) || 36))){
+                return {x:rect.x, y:rect.y};
+            }
+        }
+    }
+    return {
+        x:Math.round((base.x || 0) + 8 * cellX),
+        y:Math.round(base.y || 0)
+    };
+}
+function smartAgentVisibleWorldRect(){
+    const scale = safeScale(viewport.scale);
+    const width = Math.max(1, shell?.clientWidth || window.innerWidth || 1) / scale;
+    const height = Math.max(1, shell?.clientHeight || window.innerHeight || 1) / scale;
+    return {x:-viewport.x / scale, y:-viewport.y / scale, width, height};
+}
+function smartAgentFindOpenInViewport(size, options={}){
+    const width = Number(size?.width) || Number(options.boxWidth) || 300;
+    const height = Number(size?.height) || Number(options.boxHeight) || 240;
+    const visible = smartAgentVisibleWorldRect();
+    const inset = Number(options.viewportInset) || 28;
+    if(width + inset * 2 > visible.width || height + inset * 2 > visible.height) return null;
+    const existing = nodes.map(nodeRect);
+    const cellX = Math.max(width + (Number(options.gapX) || 48), 160);
+    const cellY = Math.max(height + (Number(options.gapY) || 36), 140);
+    const center = {x:visible.x + visible.width / 2, y:visible.y + visible.height / 2};
+    // Start in the centre and expand in rings, so the closest visible blank area wins.
+    for(let ring = 0; ring <= 8; ring++){
+        for(let row = -ring; row <= ring; row++){
+            for(let col = -ring; col <= ring; col++){
+                if(Math.max(Math.abs(row), Math.abs(col)) !== ring) continue;
+                const rect = {
+                    x:Math.round(center.x - width / 2 + col * cellX),
+                    y:Math.round(center.y - height / 2 + row * cellY),
+                    width,
+                    height
+                };
+                if(rect.x < visible.x + inset || rect.y < visible.y + inset
+                    || rect.x + width > visible.x + visible.width - inset
+                    || rect.y + height > visible.y + visible.height - inset) continue;
+                if(!existing.some(other => smartAgentRectIntersects(rect, other, Number(options.collisionPad) || 36))){
+                    return {x:rect.x, y:rect.y};
+                }
+            }
+        }
+    }
+    return null;
+}
+function smartAgentVisibleNodesBounds(){
+    const visible = smartAgentVisibleWorldRect();
+    const visibleNodes = nodes.map(nodeRect).filter(rect => smartAgentRectIntersects(rect, visible, 0));
+    if(!visibleNodes.length) return null;
+    const left = Math.min(...visibleNodes.map(rect => rect.x));
+    const top = Math.min(...visibleNodes.map(rect => rect.y));
+    const right = Math.max(...visibleNodes.map(rect => rect.x + rect.width));
+    const bottom = Math.max(...visibleNodes.map(rect => rect.y + rect.height));
+    return {x:left, y:top, right, bottom, width:right - left, height:bottom - top};
+}
+function smartAgentGridPoint(index, total, options={}){
+    const cellX = Number(options.cellX) || 360;
+    const cellY = Number(options.cellY) || 330;
+    const cols = Math.max(1, Number(options.cols) || Math.ceil(Math.sqrt(Math.max(1, total))));
+    const baseRect = smartAgentSelectionBounds();
+    const anchorRect = smartAgentAnchorRectFromRefs(options.reference_images || options.references || options.refs || []);
+    const center = viewportCenter();
+    const boxWidth = Number(options.boxWidth) || 0;
+    const boxHeight = Number(options.boxHeight) || 0;
+    if(anchorRect && boxWidth > 0 && boxHeight > 0){
+        const base = {
+            x:anchorRect.x + anchorRect.width + (Number(options.anchorGapX) || 88),
+            y:anchorRect.y + Math.floor(index / Math.max(1, cols)) * Math.max(cellY, boxHeight + 36)
+        };
+        const topLeft = smartAgentFindOpenTopLeft(base, {width:boxWidth, height:boxHeight}, options);
+        if(options.returnTopLeft) return {x:topLeft.x, y:topLeft.y};
+        return {x:Math.round(topLeft.x + boxWidth / 2), y:Math.round(topLeft.y + boxHeight / 2)};
+    }
+    const hasExplicitPoint = Number.isFinite(Number(options.x)) || Number.isFinite(Number(options.y));
+    if(!hasExplicitPoint && boxWidth > 0 && boxHeight > 0){
+        const topLeft = smartAgentFindOpenInViewport({width:boxWidth, height:boxHeight}, options);
+        if(topLeft){
+            if(options.returnTopLeft) return topLeft;
+            return {x:Math.round(topLeft.x + boxWidth / 2), y:Math.round(topLeft.y + boxHeight / 2)};
+        }
+        // A full viewport: continue from the nearby visible node group instead of jumping away.
+        const group = baseRect || smartAgentVisibleNodesBounds();
+        if(group){
+            const nearby = smartAgentFindOpenTopLeft({x:group.right + 48, y:group.y}, {width:boxWidth, height:boxHeight}, options);
+            if(options.returnTopLeft) return nearby;
+            return {x:Math.round(nearby.x + boxWidth / 2), y:Math.round(nearby.y + boxHeight / 2)};
+        }
+    }
+    const baseX = Number.isFinite(Number(options.x))
+        ? Number(options.x)
+        : (baseRect ? baseRect.right + 220 : center.x);
+    const baseY = Number.isFinite(Number(options.y))
+        ? Number(options.y)
+        : (baseRect ? baseRect.y : center.y);
+    const row = Math.floor(index / cols);
+    const col = index % cols;
+    return {x:Math.round(baseX + col * cellX), y:Math.round(baseY + row * cellY)};
+}
+function smartAgentNodeSummary(node){
+    const rect = nodeRect(node);
+    const summary = {
+        id:node.id,
+        type:node.type || 'smart-image',
+        title:node.title || '',
+        x:Math.round(Number(node.x) || 0),
+        y:Math.round(Number(node.y) || 0),
+        width:Math.round(rect.width || 0),
+        height:Math.round(rect.height || 0),
+        text:node.text || '',
+        images:(node.images || []).map((img, index) => ({
+            index,
+            url:img.url || '',
+            name:img.name || '',
+            kind:mediaKindForItem(img)
+        }))
+    };
+    if(isSmartAgentTaskNode(node)){
+        summary.task = {status:node.taskStatus || '', mode:node.taskMode || '', progress:node.taskProgress || {}, question:node.taskQuestion || '', link_visibility:node.linkVisibility || 'visible'};
+    }
+    return summary;
+}
+function smartAgentFocusNodes(ids=[]){
+    const list = (Array.isArray(ids) ? ids : [ids]).map(id => String(id || '')).filter(Boolean);
+    const targetNodes = list.map(id => nodes.find(n => n.id === id)).filter(Boolean);
+    if(!targetNodes.length) return false;
+    const rects = targetNodes.map(nodeRect);
+    const minX = Math.min(...rects.map(r => r.x));
+    const minY = Math.min(...rects.map(r => r.y));
+    const maxX = Math.max(...rects.map(r => r.x + r.width));
+    const maxY = Math.max(...rects.map(r => r.y + r.height));
+    // 单节点使用视窗九宫格；多节点则将整体边界铺满约 90% 视口。
+    // 两种定位都不沿用用户当前缩放。
+    const width = Math.max(1, maxX - minX);
+    const height = Math.max(1, maxY - minY);
+    const targetWidth = targetNodes.length > 1 ? shell.clientWidth * .9 : shell.clientWidth / 3;
+    const targetHeight = targetNodes.length > 1 ? shell.clientHeight * .9 : shell.clientHeight / 3;
+    viewport.scale = Math.max(0.04, Math.min(4, targetWidth / width, targetHeight / height));
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    viewport.x = shell.clientWidth / 2 - cx * viewport.scale;
+    viewport.y = shell.clientHeight / 2 - cy * viewport.scale;
+    selectedId = targetNodes.length === 1 ? targetNodes[0].id : '';
+    selectedIds = targetNodes.length > 1 ? targetNodes.map(n => n.id) : [];
+    selectedImage = {nodeId:'', index:-1};
+    applyViewport();
+    render();
+    scheduleSave();
+    return true;
+}
+function smartAgentResolveNodeIdsFromItem(item={}){
+    const ids = [];
+    const add = value => {
+        const id = String(value || '').trim();
+        if(id && nodes.some(node => node.id === id) && !ids.includes(id)) ids.push(id);
+    };
+    add(item.node_id || item.nodeId || item.id);
+    const nodeIds = Array.isArray(item.node_ids) ? item.node_ids : (Array.isArray(item.nodeIds) ? item.nodeIds : []);
+    nodeIds.forEach(add);
+    if(item.selected || item.scope === 'selected') selectedNodeIds().forEach(add);
+    return ids;
+}
+function smartAgentGroupNodes(items=[], options={}){
+    const list = Array.isArray(items) ? items : [items];
+    const idSet = new Set();
+    list.forEach(item => smartAgentResolveNodeIdsFromItem(item || {}).forEach(id => idSet.add(id)));
+    if(!idSet.size && (options.selected || options.scope === 'selected')) selectedNodeIds().forEach(id => idSet.add(id));
+    if(!idSet.size) selectedNodeIds().forEach(id => idSet.add(id));
+    const selected = [...idSet].map(id => nodes.find(n => n.id === id)).filter(n => n && !isSmartGroupNode(n));
+    if(!selected.length) return [];
+    pushUndo();
+    const rects = selected.map(nodeRect);
+    const minX = Math.min(...rects.map(r => r.x));
+    const minY = Math.min(...rects.map(r => r.y));
+    const maxX = Math.max(...rects.map(r => r.x + r.width));
+    const maxY = Math.max(...rects.map(r => r.y + r.height));
+    const group = {
+        id:uid('group'),
+        type:'smart-group',
+        x:Math.round(minX - 18),
+        y:Math.round(minY - 44),
+        w:Math.max(340, Math.round(maxX - minX + 36)),
+        h:Math.max(220, Math.round(maxY - minY + 72)),
+        title:String(options.title || options.name || '').trim() || '智能分组',
+        items:[],
+        images:[],
+        created_at:Date.now()
+    };
+    nodes.push(group);
+    selected.forEach(node => addNodeToSmartGroup(group, node));
+    arrangeSmartGroupMembers(group, {skipUndo:true});
+    selectedIds = [];
+    selectedId = group.id;
+    selectedImage = {nodeId:'', index:-1};
+    render();
+    scheduleSave();
+    toast(`已由 Agent 分组 ${selected.length} 个节点`);
+    return [smartAgentNodeSummary(group)];
+}
+function smartAgentUngroupNodes(items=[], options={}){
+    const list = Array.isArray(items) ? items : [items];
+    const idSet = new Set();
+    list.forEach(item => smartAgentResolveNodeIdsFromItem(item || {}).forEach(id => idSet.add(id)));
+    if(!idSet.size && (options.selected || options.scope === 'selected')) selectedNodeIds().forEach(id => idSet.add(id));
+    if(!idSet.size) selectedNodeIds().forEach(id => idSet.add(id));
+    const beforeIds = new Set(nodes.map(node => node.id));
+    const groups = [...idSet].map(id => nodes.find(n => n.id === id)).filter(isSmartGroupNode);
+    const changed = [];
+    groups.forEach(group => {
+        if(ungroupNode(group.id)){
+            changed.push(group.id);
+        }
+    });
+    if(!changed.length) return [];
+    const affected = nodes.filter(node => !beforeIds.has(node.id) || selectedIds.includes(node.id) || selectedId === node.id);
+    toast(`已由 Agent 取消分组 ${changed.length} 个分组`);
+    return affected.map(smartAgentNodeSummary);
+}
+function smartAgentNameWithExistingExt(name, media={}){
+    const text = String(name || '').trim();
+    if(!text) return '';
+    if(/\.[a-z0-9]{2,8}$/i.test(text)) return text;
+    const source = String(media.name || media.url || '').split('?')[0];
+    const m = source.match(/(\.[a-z0-9]{2,8})$/i);
+    return m ? `${text}${m[1]}` : text;
+}
+function smartAgentRenameNodes(items=[], options={}){
+    const list = Array.isArray(items) ? items : [items];
+    const changes = [];
+    list.forEach(item => {
+        if(!item) return;
+        const name = String(item.name || item.title || item.label || item.text || '').trim();
+        if(!name) return;
+        smartAgentResolveNodeIdsFromItem(item).forEach(id => {
+            const node = nodes.find(n => n.id === id);
+            if(!node) return;
+            const imageIndexRaw = item.image_index ?? item.imageIndex;
+            const imageIndex = Number.isFinite(Number(imageIndexRaw)) ? Number(imageIndexRaw) : (node.images?.length === 1 ? 0 : -1);
+            changes.push({node, name, imageIndex, field:'media_name'});
+        });
+    });
+    if(!changes.length && (options.selected || options.scope === 'selected') && (options.title || options.name)){
+        selectedNodeIds().forEach(id => {
+            const node = nodes.find(n => n.id === id);
+            if(!node) return;
+            changes.push({node, name:String(options.name || options.title || '').trim(), imageIndex:node.images?.length === 1 ? 0 : -1, field:'media_name'});
+        });
+    }
+    const unique = [];
+    const seen = new Set();
+    changes.forEach(change => {
+        const key = `${change.node.id}|${change.field}|${change.imageIndex}`;
+        if(!change.name || seen.has(key)) return;
+        if(change.field !== 'node_title' && !(change.node.images || [])[change.imageIndex]) return;
+        seen.add(key);
+        unique.push(change);
+    });
+    if(!unique.length) return [];
+    pushUndo();
+    unique.forEach(({node, name, imageIndex, field}) => {
+        if(node.images?.[imageIndex]) node.images[imageIndex].name = smartAgentNameWithExistingExt(name, node.images[imageIndex]);
+    });
+    selectedId = unique.length === 1 ? unique[0].node.id : '';
+    selectedIds = unique.length > 1 ? unique.map(change => change.node.id) : [];
+    selectedImage = {nodeId:'', index:-1};
+    render();
+    scheduleSave();
+    toast(`已由 Agent 改名 ${unique.length} 个素材`);
+    return unique.map(change => smartAgentNodeSummary(change.node));
+}
+function smartAgentTargetNodes(items=[], options={}){
+    const ids = new Set();
+    (Array.isArray(items) ? items : [items]).filter(Boolean).forEach(item => smartAgentResolveNodeIdsFromItem(item).forEach(id => ids.add(id)));
+    if(!ids.size && (options.selected || options.scope === 'selected')) selectedNodeIds().forEach(id => ids.add(id));
+    if(!ids.size && (options.all || options.scope === 'all' || options.scope === 'canvas')) nodes.forEach(node => ids.add(node.id));
+    return [...ids].map(id => nodes.find(node => node.id === id)).filter(Boolean);
+}
+function smartAgentApplySizePolicy(node, mediaMode='keep', nonMediaMode='keep'){
+    const images = (node?.images || []).filter(item => item && typeof item === 'object');
+    if(isSmartImageNode(node) && images.length === 1 && mediaMode === 'standard'){
+        const size = mediaLayoutSize(images[0]);
+        const current = nodeRect(node);
+        const ratio = size.width > 0 && size.height > 0 ? size.width / size.height : current.width / Math.max(1, current.height);
+        if(ratio > 1.001){ node.w = 520; node.h = Math.max(72, Math.round(520 / ratio)); }
+        else if(ratio < .999){ node.h = 440; node.w = Math.max(72, Math.round(440 * ratio)); }
+        else { node.w = 440; node.h = 440; }
+        node.scale = 1;
+        return true;
+    }
+    if(isSmartImageNode(node) && (mediaMode === 'standard' || mediaMode === 'reset')){
+        delete node.w; delete node.h;
+        node.scale = images.length > 1 ? MEDIA_GROUP_DEFAULT_SCALE : MEDIA_NODE_DEFAULT_SCALE;
+        return true;
+    }
+    if(!isSmartImageNode(node) && nonMediaMode === 'reset'){
+        delete node.w; delete node.h;
+        if(node.scale !== undefined) node.scale = 1;
+        return true;
+    }
+    return false;
+}
+function smartAgentResizeNodes(items=[], options={}){
+    const targetNodes = smartAgentTargetNodes(items, options);
+    if(!targetNodes.length) return [];
+    const sizeMode = String(options.size_mode || 'standard').toLowerCase();
+    const mediaMode = String(options.media_size || sizeMode).toLowerCase();
+    const nonMediaMode = String(options.non_media_size || ((sizeMode === 'standard' || sizeMode === 'reset') ? 'reset' : 'keep')).toLowerCase();
+    pushUndo();
+    const touched = targetNodes.filter(node => smartAgentApplySizePolicy(node, mediaMode, nonMediaMode));
+    if(!touched.length) return [];
+    render(); scheduleSave();
+    toast(`已由 Agent 调整 ${touched.length} 个节点大小`);
+    return touched.map(smartAgentNodeSummary);
+}
+function smartAgentBounds(targetNodes){
+    const rects = targetNodes.map(nodeRect);
+    if(!rects.length) return null;
+    const x = Math.min(...rects.map(rect => rect.x)), y = Math.min(...rects.map(rect => rect.y));
+    const right = Math.max(...rects.map(rect => rect.x + rect.width)), bottom = Math.max(...rects.map(rect => rect.y + rect.height));
+    return {x, y, width:right - x, height:bottom - y, right, bottom};
+}
+function smartAgentGap(value, fallback){
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.max(0, number) : fallback;
+}
+function smartAgentPlacementOrigin(targetNodes, options={}){
+    const bounds = smartAgentBounds(targetNodes);
+    if(!bounds) return null;
+    if(Number.isFinite(Number(options.x)) || Number.isFinite(Number(options.y))){
+        return {x:Number.isFinite(Number(options.x)) ? Number(options.x) : bounds.x, y:Number.isFinite(Number(options.y)) ? Number(options.y) : bounds.y};
+    }
+    const movingIds = new Set(targetNodes.map(node => node.id));
+    const obstacles = nodes.filter(node => !movingIds.has(node.id)).map(nodeRect);
+    const side = String(options.side || 'center').toLowerCase();
+    const gapX = smartAgentGap(options.gapX, 80), gapY = smartAgentGap(options.gapY, 54);
+    let anchor = null;
+    const anchorId = String(options.anchor_node_id || '');
+    if(anchorId){ const node = nodes.find(item => item.id === anchorId); if(node) anchor = nodeRect(node); }
+    if(!anchor && options.placement_scope === 'global') anchor = smartAgentBounds(nodes.filter(node => !movingIds.has(node.id))) || bounds;
+    if(!anchor && options.placement_scope === 'viewport'){
+        const view = smartAgentVisibleWorldRect();
+        const candidates = [];
+        for(let y=view.y + 24; y + bounds.height <= view.y + view.height - 24; y += Math.max(80, bounds.height + gapY)){
+            for(let x=view.x + 24; x + bounds.width <= view.x + view.width - 24; x += Math.max(80, bounds.width + gapX)) candidates.push({x,y});
+        }
+        const centerX=view.x+view.width/2-bounds.width/2,centerY=view.y+view.height/2-bounds.height/2;
+        candidates.sort((a,b)=>{
+            if(side==='left')return a.x-b.x||Math.abs(a.y-centerY)-Math.abs(b.y-centerY);
+            if(side==='right')return b.x-a.x||Math.abs(a.y-centerY)-Math.abs(b.y-centerY);
+            if(side==='top')return a.y-b.y||Math.abs(a.x-centerX)-Math.abs(b.x-centerX);
+            if(side==='bottom')return b.y-a.y||Math.abs(a.x-centerX)-Math.abs(b.x-centerX);
+            return Math.abs(a.x-centerX)+Math.abs(a.y-centerY)-(Math.abs(b.x-centerX)+Math.abs(b.y-centerY));
+        });
+        return candidates.find(point => !obstacles.some(rect => smartAgentRectIntersects({x:point.x,y:point.y,width:bounds.width,height:bounds.height}, rect, 24))) || null;
+    }
+    if(!anchor) return null;
+    let base = {x:anchor.x + (anchor.width - bounds.width)/2, y:anchor.y + (anchor.height - bounds.height)/2};
+    if(side === 'left') base = {x:anchor.x - bounds.width - gapX, y:base.y};
+    if(side === 'right') base = {x:anchor.x + anchor.width + gapX, y:base.y};
+    if(side === 'top') base = {x:base.x, y:anchor.y - bounds.height - gapY};
+    if(side === 'bottom') base = {x:base.x, y:anchor.y + anchor.height + gapY};
+    const offsets = [0,1,-1,2,-2,3,-3];
+    for(const offset of offsets){
+        const point = {x:base.x + (side === 'top' || side === 'bottom' ? offset * (bounds.width + gapX) : 0), y:base.y + (side === 'left' || side === 'right' ? offset * (bounds.height + gapY) : 0)};
+        const probe = {x:point.x,y:point.y,width:bounds.width,height:bounds.height};
+        if(!obstacles.some(rect => smartAgentRectIntersects(probe, rect, 24))) return point;
+    }
+    return null;
+}
+function smartAgentNearbyTreeOrigin(treeNodes, root, originalPositions, options={}){
+    const bounds = smartAgentBounds(treeNodes);
+    if(!bounds) return null;
+    if(Number.isFinite(Number(options.x)) || Number.isFinite(Number(options.y)) || options.anchor_node_id){
+        return smartAgentPlacementOrigin(treeNodes, options);
+    }
+    const movingIds = new Set(treeNodes.map(node => node.id));
+    const obstacles = nodes.filter(node => !movingIds.has(node.id)).map(nodeRect);
+    const planned = treeNodes.map(node => ({node, rect:nodeRect(node)}));
+    const plannedRoot = planned.find(item => item.node.id === root.id)?.rect;
+    const originalRoot = originalPositions.get(root.id);
+    if(!plannedRoot || !originalRoot) return null;
+    const centers = [{dx:(Number(originalRoot.x)||0)-plannedRoot.x,dy:(Number(originalRoot.y)||0)-plannedRoot.y}];
+    const view = smartAgentVisibleWorldRect();
+    if(view) centers.push({dx:view.x+view.width/2-(bounds.x+bounds.width/2),dy:view.y+view.height/2-(bounds.y+bounds.height/2)});
+    const stepX=Math.max(64,Math.min(144,smartAgentGap(options.gapX,72))),stepY=Math.max(64,Math.min(120,smartAgentGap(options.gapY,42)));
+    const open = (dx,dy) => planned.every(item => !obstacles.some(obstacle => smartAgentRectIntersects({x:item.rect.x+dx,y:item.rect.y+dy,width:item.rect.width,height:item.rect.height},obstacle,24)));
+    const seen=new Set();
+    for(let ring=0;ring<=36;ring++){
+        const offsets=[];
+        if(!ring) offsets.push([0,0]);
+        else for(let x=-ring;x<=ring;x++) for(let y=-ring;y<=ring;y++) if(Math.abs(x)===ring||Math.abs(y)===ring) offsets.push([x,y]);
+        offsets.sort((a,b)=>Math.abs(a[0])+Math.abs(a[1])-Math.abs(b[0])-Math.abs(b[1]));
+        for(const center of centers) for(const [offsetX,offsetY] of offsets){
+            const dx=center.dx+offsetX*stepX,dy=center.dy+offsetY*stepY,key=`${Math.round(dx)},${Math.round(dy)}`;
+            if(seen.has(key)) continue;
+            seen.add(key);
+            if(open(dx,dy)) return {x:Math.round(bounds.x+dx),y:Math.round(bounds.y+dy)};
+        }
+    }
+    return null;
+}
+function smartAgentMoveNodes(items=[], options={}){
+    const placementTargets = smartAgentTargetNodes(items, options);
+    const wantsPlacement = ['placement_scope','side','anchor_node_id','x','y'].some(key => options[key] !== undefined);
+    if(placementTargets.length && wantsPlacement){
+        const bounds = smartAgentBounds(placementTargets);
+        const origin = smartAgentPlacementOrigin(placementTargets, options);
+        if(!origin){ toast('目标区域没有足够空位'); return []; }
+        pushUndo();
+        const dx = origin.x - bounds.x, dy = origin.y - bounds.y;
+        placementTargets.forEach(node => { node.x = Math.round((Number(node.x)||0)+dx); node.y = Math.round((Number(node.y)||0)+dy); });
+        render(); scheduleSave();
+        toast(`已由 Agent 移动 ${placementTargets.length} 个节点`);
+        return placementTargets.map(smartAgentNodeSummary);
+    }
+    const list = Array.isArray(items) ? items : [items];
+    const changes = [];
+    list.forEach(item => {
+        if(!item) return;
+        smartAgentResolveNodeIdsFromItem(item).forEach(id => {
+            const node = nodes.find(n => n.id === id);
+            if(!node) return;
+            const hasX = Number.isFinite(Number(item.x));
+            const hasY = Number.isFinite(Number(item.y));
+            const dx = Number(item.dx ?? item.offset_x ?? item.offsetX ?? 0);
+            const dy = Number(item.dy ?? item.offset_y ?? item.offsetY ?? 0);
+            const x = hasX ? Number(item.x) : (Number(node.x) || 0) + (Number.isFinite(dx) ? dx : 0);
+            const y = hasY ? Number(item.y) : (Number(node.y) || 0) + (Number.isFinite(dy) ? dy : 0);
+            if(Number.isFinite(x) && Number.isFinite(y)) changes.push({node, x, y});
+        });
+    });
+    if(!changes.length && (options.selected || options.scope === 'selected')){
+        selectedNodeIds().forEach(id => {
+            const node = nodes.find(n => n.id === id);
+            if(!node) return;
+            const x = Number.isFinite(Number(options.x)) ? Number(options.x) : (Number(node.x) || 0) + (Number(options.dx) || 0);
+            const y = Number.isFinite(Number(options.y)) ? Number(options.y) : (Number(node.y) || 0) + (Number(options.dy) || 0);
+            if(Number.isFinite(x) && Number.isFinite(y)) changes.push({node, x, y});
+        });
+    }
+    const unique = [];
+    const seen = new Set();
+    changes.forEach(change => {
+        if(seen.has(change.node.id)) return;
+        seen.add(change.node.id);
+        unique.push(change);
+    });
+    if(!unique.length) return [];
+    pushUndo();
+    unique.forEach(({node, x, y}) => {
+        node.x = Math.round(x);
+        node.y = Math.round(y);
+    });
+    selectedId = unique.length === 1 ? unique[0].node.id : '';
+    selectedIds = unique.length > 1 ? unique.map(change => change.node.id) : [];
+    selectedImage = {nodeId:'', index:-1};
+    render();
+    scheduleSave();
+    toast(`已由 Agent 移动 ${unique.length} 个节点`);
+    return unique.map(change => smartAgentNodeSummary(change.node));
+}
+function smartAgentArrangeNodes(items=[], options={}){
+    const idSet = new Set();
+    const addIdsFromItem = item => smartAgentResolveNodeIdsFromItem(item).forEach(id => idSet.add(id));
+    (Array.isArray(items) ? items : [items]).filter(Boolean).forEach(addIdsFromItem);
+    if(!idSet.size && (options.selected || options.scope === 'selected')) selectedNodeIds().forEach(id => idSet.add(id));
+    if(!idSet.size && (options.all || options.scope === 'all' || options.scope === 'canvas')) nodes.forEach(node => idSet.add(node.id));
+    if(!idSet.size) selectedNodeIds().forEach(id => idSet.add(id));
+    const targetNodes = [...idSet].map(id => nodes.find(node => node.id === id)).filter(Boolean);
+    if(!targetNodes.length) return [];
+    const mode = String(options.mode || options.layout || '').toLowerCase();
+    if(['horizontal','vertical','column','grid'].includes(mode)){
+        const previousStates = new Map(targetNodes.map(node => [node.id, {
+            x:node.x, y:node.y, w:node.w, h:node.h, scale:node.scale,
+            hasW:Object.prototype.hasOwnProperty.call(node,'w'),
+            hasH:Object.prototype.hasOwnProperty.call(node,'h'),
+            hasScale:Object.prototype.hasOwnProperty.call(node,'scale')
+        }]));
+        const restorePreviousStates = () => targetNodes.forEach(node => {
+            const state = previousStates.get(node.id); if(!state) return;
+            node.x=state.x; node.y=state.y;
+            if(state.hasW) node.w=state.w; else delete node.w;
+            if(state.hasH) node.h=state.h; else delete node.h;
+            if(state.hasScale) node.scale=state.scale; else delete node.scale;
+        });
+        pushUndo();
+        const sizeMode = String(options.size_mode || 'keep').toLowerCase();
+        const mediaMode = String(options.media_size || sizeMode).toLowerCase();
+        const nonMediaMode = String(options.non_media_size || ((sizeMode === 'standard' || sizeMode === 'reset') ? 'reset' : 'keep')).toLowerCase();
+        if(mediaMode !== 'keep' || nonMediaMode !== 'keep') targetNodes.forEach(node => smartAgentApplySizePolicy(node, mediaMode, nonMediaMode));
+        let ordered = targetNodes.slice().sort((a,b) => (Number(a.y)||0)-(Number(b.y)||0) || (Number(a.x)||0)-(Number(b.x)||0) || String(a.id).localeCompare(String(b.id)));
+        const byId=new Map(ordered.map(node=>[node.id,node])),incoming=new Map(ordered.map(node=>[node.id,0])),outgoing=new Map(ordered.map(node=>[node.id,[]]));
+        (canvas?.connections||[]).forEach(conn=>{if(byId.has(conn.from)&&byId.has(conn.to)&&conn.from!==conn.to){incoming.set(conn.to,(incoming.get(conn.to)||0)+1);outgoing.get(conn.from).push(conn.to);}});
+        if([...incoming.values()].some(value=>value>0)){
+            const key=id=>{const node=byId.get(id);return [Number(node?.y)||0,Number(node?.x)||0,String(id)];};
+            const compare=(a,b)=>key(a)[0]-key(b)[0]||key(a)[1]-key(b)[1]||key(a)[2].localeCompare(key(b)[2]);
+            const queue=[...incoming].filter(([,count])=>count===0).map(([id])=>id).sort(compare),ids=[];
+            while(queue.length){const id=queue.shift();if(ids.includes(id))continue;ids.push(id);(outgoing.get(id)||[]).sort(compare).forEach(next=>{incoming.set(next,(incoming.get(next)||0)-1);if(incoming.get(next)===0)queue.push(next);});queue.sort(compare);}
+            [...byId.keys()].sort(compare).forEach(id=>{if(!ids.includes(id))ids.push(id);}); ordered=ids.map(id=>byId.get(id));
+        }
+        const start = smartAgentBounds(ordered) || {x:0,y:0};
+        const gapX = smartAgentGap(options.gapX, 80), gapY = smartAgentGap(options.gapY, 54);
+        if(mode === 'horizontal'){
+            const sizes = ordered.map(node => ({node, rect:nodeRect(node)}));
+            const maxH = Math.max(...sizes.map(item => item.rect.height));
+            let x = start.x;
+            sizes.forEach(item => { item.node.x=Math.round(x); item.node.y=Math.round(start.y+(maxH-item.rect.height)/2); x += item.rect.width+gapX; });
+        } else if(mode === 'vertical' || mode === 'column'){
+            const sizes = ordered.map(node => ({node, rect:nodeRect(node)}));
+            const maxW = Math.max(...sizes.map(item => item.rect.width));
+            let y = start.y;
+            sizes.forEach(item => { item.node.x=Math.round(start.x+(maxW-item.rect.width)/2); item.node.y=Math.round(y); y += item.rect.height+gapY; });
+        } else {
+            const cols = Math.max(1, Math.min(12, Number(options.cols) || Math.ceil(Math.sqrt(ordered.length))));
+            const sizes = ordered.map(node => ({node, rect:nodeRect(node)}));
+            const rows = Math.ceil(sizes.length/cols), colW=Array(cols).fill(0), rowH=Array(rows).fill(0);
+            sizes.forEach((item,index) => { colW[index%cols]=Math.max(colW[index%cols],item.rect.width); rowH[Math.floor(index/cols)]=Math.max(rowH[Math.floor(index/cols)],item.rect.height); });
+            const colX=[],rowY=[]; let cursor=0;
+            colW.forEach(width => { colX.push(cursor); cursor+=width+gapX; }); cursor=0;
+            rowH.forEach(height => { rowY.push(cursor); cursor+=height+gapY; });
+            sizes.forEach((item,index) => { const col=index%cols,row=Math.floor(index/cols); item.node.x=Math.round(start.x+colX[col]+(colW[col]-item.rect.width)/2); item.node.y=Math.round(start.y+rowY[row]+(rowH[row]-item.rect.height)/2); });
+        }
+        const wantsPlacement = ['placement_scope','side','anchor_node_id','x','y'].some(key => options[key] !== undefined);
+        if(wantsPlacement){
+            const bounds = smartAgentBounds(ordered), origin = smartAgentPlacementOrigin(ordered, options);
+            if(!origin){ restorePreviousStates(); toast('目标区域没有足够空位'); return []; }
+            const dx=origin.x-bounds.x,dy=origin.y-bounds.y; ordered.forEach(node => { node.x=Math.round(node.x+dx); node.y=Math.round(node.y+dy); });
+        }
+        selectedId = ordered.length === 1 ? ordered[0].id : ''; selectedIds = ordered.length > 1 ? ordered.map(node => node.id) : [];
+        selectedImage = {nodeId:'',index:-1}; render(); scheduleSave();
+        toast(`已由 Agent ${mode === 'grid' ? '宫格' : mode === 'horizontal' ? '横向' : '纵向'}整理 ${ordered.length} 个节点`);
+        return ordered.map(smartAgentNodeSummary);
+    }
+    const ids = new Set(targetNodes.map(node => node.id));
+    const relatedConnections = (canvas?.connections || []).filter(conn => ids.has(conn.from) && ids.has(conn.to));
+    const rects = targetNodes.map(node => ({node, rect:nodeRect(node)}));
+    const minX = Number.isFinite(Number(options.x)) ? Number(options.x) : Math.min(...rects.map(item => item.rect.x));
+    const minY = Number.isFinite(Number(options.y)) ? Number(options.y) : Math.min(...rects.map(item => item.rect.y));
+    const cellX = Number(options.cellX) || Math.max(420, Math.max(...rects.map(item => item.rect.width)) + 110);
+    const cellY = Number(options.cellY) || Math.max(260, Math.max(...rects.map(item => item.rect.height)) + 54);
+    if(relatedConnections.length && mode !== 'layers' && mode !== 'columns'){
+        const incoming = new Map(targetNodes.map(node => [node.id, 0]));
+        const outgoing = new Map(targetNodes.map(node => [node.id, []]));
+        relatedConnections.forEach(conn => {
+            incoming.set(conn.to, (incoming.get(conn.to) || 0) + 1);
+            outgoing.get(conn.from)?.push(conn.to);
+        });
+        const byOriginalPosition = (a, b) => {
+            const na = nodes.find(node => node.id === a);
+            const nb = nodes.find(node => node.id === b);
+            return (Number(na?.y) || 0) - (Number(nb?.y) || 0)
+                || (Number(na?.x) || 0) - (Number(nb?.x) || 0)
+                || String(a).localeCompare(String(b));
+        };
+        const roots = targetNodes
+            .filter(node => (incoming.get(node.id) || 0) === 0)
+            .map(node => node.id)
+            .sort(byOriginalPosition);
+        const queue = roots.length ? roots.slice() : targetNodes.map(node => node.id).sort(byOriginalPosition);
+        const orderedIds = [];
+        const seen = new Set();
+        while(queue.length){
+            const id = queue.shift();
+            if(seen.has(id)) continue;
+            seen.add(id);
+            orderedIds.push(id);
+            const next = (outgoing.get(id) || []).slice().sort(byOriginalPosition);
+            next.forEach(childId => {
+                if(!seen.has(childId)) queue.push(childId);
+            });
+        }
+        targetNodes.map(node => node.id).sort(byOriginalPosition).forEach(id => {
+            if(!seen.has(id)) orderedIds.push(id);
+        });
+        const ordered = orderedIds.map(id => nodes.find(node => node.id === id)).filter(Boolean);
+        const rootNode = ordered[0] || targetNodes[0];
+        const rootRect = nodeRect(rootNode);
+        const baseX = Number.isFinite(Number(options.x)) ? Number(options.x) : rootRect.x;
+        const baseCenterY = Number.isFinite(Number(options.centerY))
+            ? Number(options.centerY)
+            : (Number.isFinite(Number(options.y)) ? Number(options.y) + rootRect.height / 2 : rootRect.y + rootRect.height / 2);
+        const gapX = smartAgentGap(options.gapX, 80);
+        const changes = [];
+        let cursorX = Math.round(baseX);
+        ordered.forEach((node, index) => {
+            const rect = nodeRect(node);
+            const x = index === 0 ? Math.round(baseX) : Math.round(cursorX);
+            const y = Math.round(baseCenterY - rect.height / 2);
+            changes.push({node, x, y});
+            cursorX = x + rect.width + Math.max(gapX, Number(options.minGapX) || 0);
+            if(Number(options.cellX) > 0) cursorX = Math.max(cursorX, Math.round(baseX + (index + 1) * Number(options.cellX)));
+        });
+        if(!changes.length) return [];
+        pushUndo();
+        changes.forEach(({node, x, y}) => {
+            node.x = x;
+            node.y = y;
+        });
+        selectedId = changes.length === 1 ? changes[0].node.id : '';
+        selectedIds = changes.length > 1 ? changes.map(change => change.node.id) : [];
+        selectedImage = {nodeId:'', index:-1};
+        render();
+        scheduleSave();
+        toast(`已由 Agent 横向整理 ${changes.length} 个节点`);
+        return changes.map(change => smartAgentNodeSummary(change.node));
+    }
+    const depth = new Map(targetNodes.map(node => [node.id, 0]));
+    if(relatedConnections.length){
+        const incoming = new Map(targetNodes.map(node => [node.id, 0]));
+        const outgoing = new Map(targetNodes.map(node => [node.id, []]));
+        relatedConnections.forEach(conn => {
+            incoming.set(conn.to, (incoming.get(conn.to) || 0) + 1);
+            outgoing.get(conn.from)?.push(conn.to);
+        });
+        const queue = [...incoming.entries()].filter(([, count]) => count === 0).map(([id]) => id);
+        const visited = new Set(queue);
+        while(queue.length){
+            const id = queue.shift();
+            (outgoing.get(id) || []).forEach(next => {
+                depth.set(next, Math.max(depth.get(next) || 0, (depth.get(id) || 0) + 1));
+                incoming.set(next, (incoming.get(next) || 0) - 1);
+                if((incoming.get(next) || 0) <= 0 && !visited.has(next)){
+                    visited.add(next);
+                    queue.push(next);
+                }
+            });
+        }
+        relatedConnections.forEach(conn => {
+            if((depth.get(conn.to) || 0) <= (depth.get(conn.from) || 0)) {
+                depth.set(conn.to, (depth.get(conn.from) || 0) + 1);
+            }
+        });
+    }
+    const columns = new Map();
+    targetNodes.forEach(node => {
+        const d = depth.get(node.id) || 0;
+        if(!columns.has(d)) columns.set(d, []);
+        columns.get(d).push(node);
+    });
+    const changes = [];
+    [...columns.entries()].sort((a, b) => a[0] - b[0]).forEach(([d, colNodes]) => {
+        colNodes.sort((a, b) => (Number(a.y) || 0) - (Number(b.y) || 0) || String(a.id).localeCompare(String(b.id)));
+        colNodes.forEach((node, row) => {
+            changes.push({node, x:Math.round(minX + d * cellX), y:Math.round(minY + row * cellY)});
+        });
+    });
+    if(!changes.length) return [];
+    pushUndo();
+    changes.forEach(({node, x, y}) => {
+        node.x = x;
+        node.y = y;
+    });
+    selectedId = changes.length === 1 ? changes[0].node.id : '';
+    selectedIds = changes.length > 1 ? changes.map(change => change.node.id) : [];
+    selectedImage = {nodeId:'', index:-1};
+    render();
+    scheduleSave();
+    toast(`已由 Agent 整理 ${changes.length} 个节点`);
+    return changes.map(change => smartAgentNodeSummary(change.node));
+}
+function smartAgentArrangeNodeTree(items=[], options={}){
+    const roots = smartAgentTargetNodes(items, options);
+    if(roots.length !== 1){ toast('节点树整理需要且只能选择一个根节点'); return []; }
+    const root = roots[0], scope = String(options.tree_scope || 'both').toLowerCase();
+    const outgoing = new Map(nodes.map(node => [node.id, []])), incoming = new Map(nodes.map(node => [node.id, []]));
+    (canvas?.connections || []).forEach(conn => { if(outgoing.has(conn.from)&&incoming.has(conn.to)&&conn.from!==conn.to){ outgoing.get(conn.from).push(conn.to); incoming.get(conn.to).push(conn.from); } });
+    const distance = adjacency => { const map=new Map([[root.id,0]]),queue=[root.id]; while(queue.length){ const id=queue.shift(); (adjacency.get(id)||[]).forEach(next => { if(!map.has(next)){ map.set(next,map.get(id)+1); queue.push(next); } }); } return map; };
+    const forward = scope === 'upstream' ? new Map([[root.id,0]]) : distance(outgoing);
+    const backward = scope === 'downstream' ? new Map([[root.id,0]]) : distance(incoming);
+    const longest = (adjacency, included) => {
+        const ids=[...included.keys()],idSet=new Set(ids),indegree=new Map(ids.map(id=>[id,0]));
+        ids.forEach(id=>(adjacency.get(id)||[]).forEach(next=>{if(idSet.has(next))indegree.set(next,(indegree.get(next)||0)+1);}));
+        const queue=ids.filter(id=>(indegree.get(id)||0)===0),result=new Map([[root.id,0]]);
+        while(queue.length){const id=queue.shift();(adjacency.get(id)||[]).forEach(next=>{if(!idSet.has(next))return;if(result.has(id))result.set(next,Math.max(result.get(next)||0,result.get(id)+1));indegree.set(next,(indegree.get(next)||0)-1);if(indegree.get(next)===0)queue.push(next);});}
+        return result;
+    };
+    const forwardLongest=longest(outgoing,forward),backwardLongest=longest(incoming,backward);
+    const ids = new Set([...forward.keys(),...backward.keys()]);
+    if(ids.size <= 1){ toast('选中节点没有可整理的上下游节点'); return []; }
+    const levels = new Map();
+    ids.forEach(id => { if(id===root.id || (forward.has(id)&&backward.has(id))) levels.set(id,0); else if(forward.has(id)) levels.set(id,forwardLongest.get(id) ?? forward.get(id)); else levels.set(id,-(backwardLongest.get(id) ?? backward.get(id))); });
+    const treeNodes = nodes.filter(node => ids.has(node.id)), columns=new Map();
+    treeNodes.forEach(node => { const level=levels.get(node.id)||0; if(!columns.has(level)) columns.set(level,[]); columns.get(level).push(node); });
+    columns.forEach(list => list.sort((a,b)=>(Number(a.y)||0)-(Number(b.y)||0)||(Number(a.x)||0)-(Number(b.x)||0)));
+    const originalPositions=new Map(treeNodes.map(node=>[node.id,{x:node.x,y:node.y}]));
+    const gapX=smartAgentGap(options.gapX,72),gapY=smartAgentGap(options.gapY,42),widths=new Map();
+    columns.forEach((list,level)=>widths.set(level,Math.max(...list.map(node=>nodeRect(node).width))));
+    const xByLevel=new Map([[0,0]]); let cursor=(widths.get(0)||0)+gapX;
+    [...columns.keys()].filter(level=>level>0).sort((a,b)=>a-b).forEach(level=>{xByLevel.set(level,cursor);cursor+=widths.get(level)+gapX;});
+    cursor=-gapX; [...columns.keys()].filter(level=>level<0).sort((a,b)=>b-a).forEach(level=>{cursor-=widths.get(level);xByLevel.set(level,cursor);cursor-=gapX;});
+    columns.forEach((list,level)=>{ const total=list.reduce((sum,node)=>sum+nodeRect(node).height,0)+gapY*Math.max(0,list.length-1); let y=-total/2; list.forEach(node=>{const rect=nodeRect(node);node.x=Math.round((xByLevel.get(level)||0)+((widths.get(level)||0)-rect.width)/2);node.y=Math.round(y);y+=rect.height+gapY;}); });
+    const bounds=smartAgentBounds(treeNodes);
+    const origin=smartAgentNearbyTreeOrigin(treeNodes,root,originalPositions,options);
+    if(!origin){treeNodes.forEach(node=>{const state=originalPositions.get(node.id);node.x=state.x;node.y=state.y;});toast('目标区域没有足够空位');return [];}
+    const plannedPositions=new Map(treeNodes.map(node=>[node.id,{x:node.x,y:node.y}]));
+    treeNodes.forEach(node=>{const state=originalPositions.get(node.id);node.x=state.x;node.y=state.y;});
+    pushUndo();
+    const dx=origin.x-bounds.x,dy=origin.y-bounds.y;
+    treeNodes.forEach(node=>{const planned=plannedPositions.get(node.id);node.x=Math.round(planned.x+dx);node.y=Math.round(planned.y+dy);});
+    selectedId='';selectedIds=treeNodes.map(node=>node.id);selectedImage={nodeId:'',index:-1};render();scheduleSave();
+    toast(`已由 Agent 整理 ${treeNodes.length} 个树节点`);
+    return treeNodes.map(smartAgentNodeSummary);
+}
+function smartAgentMediaItem(item){
+    const source = item || {};
+    const rawUrl = source.url || source.path || source.src || '';
+    const url = String(rawUrl || '').startsWith('/')
+        || String(rawUrl || '').startsWith('http://')
+        || String(rawUrl || '').startsWith('https://')
+        || String(rawUrl || '').startsWith('data:')
+        ? String(rawUrl || '')
+        : `/api/codex-agent/file/view?path=${encodeURIComponent(String(rawUrl || ''))}`;
+    const image = assetNodeImageFromItem({
+        ...source,
+        url,
+        name:source.name || smartImageNameFromUrl(url) || 'asset',
+        kind:source.kind || source.mediaKind || assetMediaKind(source)
+    });
+    if(source.prompt) image.prompt = String(source.prompt || '');
+    return image;
+}
+function smartAgentImageRefs(refs=[]){
+    return (Array.isArray(refs) ? refs : [refs]).map(ref => {
+        if(!ref) return null;
+        if(typeof ref === 'string') {
+            const url = smartAgentLocalAssetUrl(ref);
+            return {url, name:smartImageNameFromUrl(url) || 'reference', kind:'image'};
+        }
+        const url = smartAgentLocalAssetUrl(ref.url || ref.path || ref.src || '');
+        if(!url) return null;
+        return {
+            url,
+            name:ref.name || smartImageNameFromUrl(url) || 'reference',
+            role:ref.role || '',
+            kind:ref.kind || mediaKindForItem(ref) || 'image',
+            mime:ref.mime || '',
+            nodeId:ref.nodeId || ref.node_id || '',
+            imageIndex:ref.imageIndex ?? ref.image_index ?? '',
+            canvasKind:ref.canvasKind || ref.canvas_kind || ''
+        };
+    }).filter(ref => ref?.url).slice(0, SMART_REFERENCE_IMAGE_MAX);
+}
+function smartAgentLocalAssetUrl(value=''){
+    const raw = String(value || '').trim();
+    if(!raw) return '';
+    if(raw.startsWith('/assets/') || raw.startsWith('/output/')) return raw;
+    if(/^https?:\/\//i.test(raw)){
+        try {
+            const u = new URL(raw, window.location.href);
+            if(u.origin === window.location.origin && (u.pathname.startsWith('/assets/') || u.pathname.startsWith('/output/'))){
+                return `${u.pathname}${u.search || ''}`;
+            }
+        } catch {}
+    }
+    return raw;
+}
+function smartAgentConnectReferenceNodes(targetNode, refs=[]){
+    if(!targetNode?.id) return [];
+    const connected = [];
+    const seen = new Set();
+    (Array.isArray(refs) ? refs : [refs]).forEach(ref => {
+        const sourceId = String(ref?.nodeId || ref?.node_id || '').trim();
+        if(!sourceId || sourceId === targetNode.id || seen.has(sourceId)) return;
+        if(connectInputNode(sourceId, targetNode.id)){
+            seen.add(sourceId);
+            connected.push(sourceId);
+        }
+    });
+    return connected;
+}
+function smartAgentRunLog(node, prompt, refs, kind, runSettings, request={}){
+    return {
+        nodeId:node?.id || '',
+        nodeType:node?.type || 'smart-image',
+        kind,
+        settings:JSON.parse(JSON.stringify(runSettings || {})),
+        prompt:prompt || '',
+        refs:(refs || []).map(ref => ({url:ref.url || '', name:ref.name || 'image', kind:ref.kind || ''})).filter(ref => ref.url),
+        size:request.size || ''
+    };
+}
+async function smartAgentSaveNow(){
+    clearTimeout(saveTimer);
+    await saveCanvas();
+}
+function smartAgentProviderOptions(){
+    return imageProviders().map(provider => ({
+        id:provider.id || '',
+        name:provider.name || provider.id || '',
+        protocol:provider.protocol || '',
+        image_models:[...(provider.image_models || [])],
+        primary:Boolean(provider.primary)
+    })).filter(provider => provider.id);
+}
+function smartAgentVideoProviderOptions(){
+    return videoApiProviders().map(provider => ({
+        id:provider.id || '',
+        name:provider.name || provider.id || '',
+        protocol:provider.protocol || '',
+        video_models:[...(provider.video_models || [])],
+        primary:Boolean(provider.primary)
+    })).filter(provider => provider.id);
+}
+function smartAgentResolveProviderId(value=''){
+    const raw = String(value || '').trim();
+    const providers = imageProviders();
+    if(!providers.length) return settings.provider_id || '';
+    if(!raw) return settings.provider_id || providers[0].id || '';
+    const lower = raw.toLowerCase();
+    const exact = providers.find(provider => [provider.id, provider.name].some(text => String(text || '').toLowerCase() === lower));
+    if(exact) return exact.id;
+    const aliasTerms = lower.includes('gpt') || lower.includes('openai') || lower.includes('codex')
+        ? ['gpt', 'openai', 'codex']
+        : lower.includes('即梦') || lower.includes('jimeng')
+        ? ['即梦', 'jimeng']
+        : [lower];
+    const fuzzy = providers.find(provider => {
+        const hay = `${provider.id || ''} ${provider.name || ''} ${provider.protocol || ''} ${(provider.image_models || []).join(' ')}`.toLowerCase();
+        return aliasTerms.some(term => hay.includes(String(term).toLowerCase()));
+    });
+    return fuzzy?.id || raw;
+}
+function smartAgentResolveModel(value='', providerId=''){
+    const provider = apiProviderById(providerId);
+    const models = [...(provider?.image_models || [])];
+    const raw = String(value || '').trim();
+    if(!raw) return settings.provider_id === providerId && settings.model ? settings.model : (models[0] || settings.model || '');
+    if(models.includes(raw)) return raw;
+    const lower = raw.toLowerCase();
+    return models.find(model => String(model).toLowerCase() === lower)
+        || models.find(model => String(model).toLowerCase().includes(lower))
+        || raw;
+}
+function smartAgentResolveVideoProviderId(value=''){
+    const raw = String(value || '').trim();
+    const providers = videoApiProviders();
+    if(!providers.length) return settings.videoProvider || '';
+    if(!raw) return settings.videoProvider || providers[0].id || '';
+    const lower = raw.toLowerCase();
+    const exact = providers.find(provider => [provider.id, provider.name].some(text => String(text || '').toLowerCase() === lower));
+    if(exact) return exact.id;
+    const aliasTerms = lower.includes('即梦') || lower.includes('jimeng')
+        ? ['即梦', 'jimeng']
+        : lower.includes('gpt') || lower.includes('openai') || lower.includes('sora')
+        ? ['gpt', 'openai', 'sora']
+        : [lower];
+    const fuzzy = providers.find(provider => {
+        const hay = `${provider.id || ''} ${provider.name || ''} ${provider.protocol || ''} ${(provider.video_models || []).join(' ')}`.toLowerCase();
+        return aliasTerms.some(term => hay.includes(String(term).toLowerCase()));
+    });
+    return fuzzy?.id || raw;
+}
+function smartAgentResolveVideoModel(value='', providerId=''){
+    const models = [...providerVideoModels(providerId)];
+    const raw = String(value || '').trim();
+    if(!raw) return settings.videoProvider === providerId && settings.videoModel ? settings.videoModel : (models[0] || settings.videoModel || '');
+    if(models.includes(raw)) return raw;
+    const lower = raw.toLowerCase();
+    return models.find(model => String(model).toLowerCase() === lower)
+        || models.find(model => String(model).toLowerCase().includes(lower))
+        || raw;
+}
+function smartAgentVideoAspect(value=''){
+    const text = String(value || '').trim().toLowerCase();
+    if(!text) return settings.videoAspect || '16:9';
+    if(['16:9','wide','横版','横屏'].includes(text)) return '16:9';
+    if(['9:16','story','竖版','竖屏'].includes(text)) return '9:16';
+    if(['1:1','square','正方形'].includes(text)) return '1:1';
+    if(['4:3','landscape43'].includes(text)) return '4:3';
+    if(['3:4','portrait43'].includes(text)) return '3:4';
+    return text;
+}
+function smartAgentVideoResolution(value=''){
+    const text = String(value || '').trim().toLowerCase();
+    if(!text) return settings.videoResolution || '';
+    if(['720p','720','1k','标清'].includes(text)) return '720p';
+    if(['1080p','1080','2k','高清','hd'].includes(text)) return '1080p';
+    return text;
+}
+function smartAgentRatioKey(value=''){
+    const text = String(value || '').trim().toLowerCase();
+    if(!text) return '';
+    if(['1:1','square','正方形'].includes(text)) return 'square';
+    if(['16:9','wide','横版','横屏'].includes(text)) return 'wide';
+    if(['9:16','story','竖版','竖屏'].includes(text)) return 'story';
+    if(['3:2','landscape'].includes(text)) return 'landscape';
+    if(['2:3','portrait'].includes(text)) return 'portrait';
+    if(['4:3','landscape43'].includes(text)) return 'landscape43';
+    if(['3:4','portrait43'].includes(text)) return 'portrait43';
+    if(['21:9','ultrawide'].includes(text)) return 'ultrawide';
+    if(['9:21','ultratall'].includes(text)) return 'ultratall';
+    return '';
+}
+function smartAgentResolutionKey(value=''){
+    const text = String(value || '').trim().toLowerCase();
+    if(!text) return '';
+    if(['auto','自动'].includes(text)) return 'auto';
+    if(['1k','1024','720p','标清'].includes(text)) return '1k';
+    if(['2k','2048','高清','hd'].includes(text)) return '2k';
+    if(['4k','4096','超清','uhd'].includes(text)) return '4k';
+    return '';
+}
+function smartAgentQuality(value=''){
+    const text = String(value || '').trim().toLowerCase();
+    if(!text) return '';
+    if(['auto','自动'].includes(text)) return 'auto';
+    if(['low','低'].includes(text)) return 'low';
+    if(['medium','mid','中'].includes(text)) return 'medium';
+    if(['high','高清','高'].includes(text)) return 'high';
+    return text;
+}
+function smartAgentSizeForItem(item={}, options={}, providerId='', model=''){
+    const explicit = item.size || item.image_size || item.resolutionSize || options.size || options.image_size;
+    if(explicit && /^\d+\s*[xX*]\s*\d+$/.test(String(explicit).trim())) return String(explicit).replace(/\s+/g, '');
+    if(String(explicit || '').trim().toLowerCase() === 'auto') return 'auto';
+    const ratio = smartAgentRatioKey(item.ratio || item.aspect || item.aspect_ratio || options.ratio || options.aspect || options.aspect_ratio || explicit) || settings.ratio || 'square';
+    const resolution = smartAgentResolutionKey(item.resolution || item.quality_size || options.resolution || options.quality_size) || settings.resolution || (isGptImageAutoSizeModel(model) ? 'auto' : '1k');
+    if(resolution === 'custom') return item.customSize || options.customSize || settings.customSize || sizeForRun(settings);
+    return apiImageSize(ratio, resolution, item.customRatio || options.customRatio || settings.customRatio || '', item.customSize || options.customSize || settings.customSize || '') || sizeForRun(settings);
+}
+function smartAgentImageDisplaySettings(item={}, options={}, size=''){
+    const requested = item.ratio || item.aspect || item.aspect_ratio || options.ratio || options.aspect || options.aspect_ratio || '';
+    let ratio = smartAgentRatioKey(requested);
+    const parsed = parseSizeValue(size);
+    if(!ratio && parsed){
+        const width = Number(parsed.width) || 1;
+        const height = Number(parsed.height) || 1;
+        const target = width / height;
+        const candidates = [['square', 1], ['portrait', 2 / 3], ['landscape', 3 / 2], ['portrait43', 3 / 4], ['landscape43', 4 / 3], ['story', 9 / 16], ['wide', 16 / 9], ['ultrawide', 21 / 9], ['ultratall', 9 / 21]];
+        ratio = candidates.reduce((best, entry) => Math.abs(Math.log(target / entry[1])) < Math.abs(Math.log(target / best[1])) ? entry : best, candidates[0])[0];
+    }
+    ratio = ratio || settings.ratio || 'square';
+    const hintedResolution = smartAgentResolutionKey(item.resolution || item.quality_size || options.resolution || options.quality_size);
+    let resolution = hintedResolution || settings.resolution || (isGptImageAutoSizeModel(settings.model) ? 'auto' : '1k');
+    if(parsed && !hintedResolution){
+        const longEdge = Math.max(Number(parsed.width), Number(parsed.height));
+        resolution = longEdge >= 3000 ? '4k' : (longEdge >= 1800 ? '2k' : '1k');
+    }
+    // A fixed Agent size must never be recomputed from the global square
+    // setting when the node is reopened or run again.
+    if(resolution === 'auto') resolution = parsed ? (Math.max(Number(parsed.width), Number(parsed.height)) >= 1800 ? '2k' : '1k') : '1k';
+    return {ratio, resolution};
+}
+function smartAgentCreatePendingNode(prompt, payload, index, total, options={}){
+    const count = Math.max(1, Math.min(8, Number(payload.n || 1)));
+    const parsed = parseSizeValue(payload.size);
+    const pendingBox = parsed ? pendingBoxSize(count, {refs:payload.reference_images || []}) : pendingBoxSize(count, {refs:payload.reference_images || []});
+    if(parsed){
+        const display = displayBoxFromNaturalSize({w:Number(parsed.width) || 1024, h:Number(parsed.height) || 1024});
+        pendingBox.w = count <= 1 ? display.w : pendingBox.w;
+        pendingBox.h = count <= 1 ? display.h : pendingBox.h;
+    }
+    const point = smartAgentGridPoint(index, total, {
+        ...options,
+        reference_images:payload.reference_images || options.reference_images || options.references || options.refs || [],
+        boxWidth:pendingBox.w,
+        boxHeight:pendingBox.h
+    });
+    const node = {
+        id:uid('smart'),
+        type:'smart-image',
+        x:Math.round(point.x - pendingBox.w / 2),
+        y:Math.round(point.y - pendingBox.h / 2),
+        title:options.kind === 'video' ? 'Video' : 'Image',
+        images:[],
+        pending:count,
+        runStartedAt:nowMs(),
+        runTimerHidden:false,
+        w:pendingBox.w,
+        h:pendingBox.h,
+        scale:MEDIA_NODE_DEFAULT_SCALE,
+        agentGenerated:true,
+        created_at:Date.now()
+    };
+    const displaySettings = payload._agentDisplaySettings || smartAgentImageDisplaySettings({}, options, payload.size);
+    const meta = {
+        prompt,
+        displayPrompt:prompt,
+        promptHtml:escapeHtml(prompt),
+        promptText:prompt,
+        promptRefs:payload.reference_images || [],
+        inputRefs:payload.reference_images || [],
+        sourceNodeId:'',
+        settings:{
+            ...cloneSmartSettings(settings),
+            engine:'api',
+            apiKind:options.kind === 'video' ? 'video' : 'image',
+            provider_id:payload.provider_id,
+            model:payload.model,
+            ratio:displaySettings.ratio,
+            resolution:displaySettings.resolution,
+            customRatio:displaySettings.ratio === 'custom' ? (options.customRatio || '') : '',
+            customSize:payload.size,
+            quality:payload.quality,
+            count,
+            videoProvider:payload.provider_id,
+            videoModel:payload.model,
+            videoDuration:payload.duration,
+            videoAspect:payload.aspect_ratio,
+            videoResolution:payload.resolution,
+            videoCameraFixed:payload.camerafixed
+        },
+        createdAt:Date.now()
+    };
+    attachRunMeta(node, meta);
+    nodes.push(node);
+    return {node, meta};
+}
+async function smartAgentGenerateImageItems(items=[], options={}){
+    const list = (Array.isArray(items) ? items : [items]).map(item => typeof item === 'string' ? {prompt:item} : item).filter(item => item && String(item.prompt || item.text || '').trim());
+    if(!list.length) return [];
+    const baseOptions = options || {};
+    pushUndo();
+    const pendingNodes = [];
+    for(let itemIndex = 0; itemIndex < list.length; itemIndex++){
+        const item = list[itemIndex];
+        const prompt = String(item.prompt || item.text || '').trim();
+        const count = Math.max(1, Math.min(8, Number(item.n || item.count || baseOptions.n || baseOptions.count || 1)));
+        const providerId = smartAgentResolveProviderId(item.provider_id || item.providerId || item.provider || baseOptions.provider_id || baseOptions.providerId || baseOptions.provider);
+        const model = smartAgentResolveModel(item.model || baseOptions.model, providerId);
+        if(!providerId || !model) throw new Error(tr('smart.errNoApiModel'));
+        const refs = smartAgentImageRefs(item.reference_images || item.references || item.refs || baseOptions.reference_images || baseOptions.references || baseOptions.refs || []);
+        const payload = {
+            prompt,
+            provider_id:providerId,
+            model,
+            size:smartAgentSizeForItem(item, baseOptions, providerId, model),
+            quality:smartAgentQuality(item.quality || baseOptions.quality) || settings.quality || 'auto',
+            n:count,
+            reference_images:refs
+        };
+        payload._agentDisplaySettings = smartAgentImageDisplaySettings(item, baseOptions, payload.size);
+        const pending = smartAgentCreatePendingNode(prompt, payload, itemIndex, list.length, {...baseOptions, reference_images:refs});
+        smartAgentConnectReferenceNodes(pending.node, refs);
+        const runSettings = {
+            ...cloneSmartSettings(settings),
+            engine:'api',
+            apiKind:'image',
+            provider_id:payload.provider_id,
+            model:payload.model,
+            ratio:payload._agentDisplaySettings.ratio,
+            resolution:payload._agentDisplaySettings.resolution,
+            customRatio:payload._agentDisplaySettings.ratio === 'custom' ? (item.customRatio || baseOptions.customRatio || '') : '',
+            quality:payload.quality,
+            count,
+            customSize:payload.size
+        };
+        const runLog = smartAgentRunLog(pending.node, prompt, refs, 'image', runSettings, {size:payload.size});
+        const runLogStart = nowMs();
+        pendingNodes.push(pending.node.id);
+        selectedId = pending.node.id;
+        selectedIds = pendingNodes.length > 1 ? pendingNodes.slice() : [];
+        selectedImage = {nodeId:'', index:-1};
+        render();
+        scheduleSave();
+        await smartAgentSaveNow();
+        const created = await fetch('/api/canvas-image-tasks', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify(payload)
+        }).then(async r => {
+            if(!r.ok) throw new Error(await r.text());
+            return r.json();
+        });
+        pending.node.pendingTasks = [{taskId:created.task_id, kind:'image', providerId:payload.provider_id, model:payload.model}];
+        render();
+        scheduleSave();
+        await smartAgentSaveNow();
+        (async () => {
+            try {
+                const result = await pollSmartCanvasTask(created.task_id);
+                const outputs = resultMediaUrls(result?.image_items?.length ? result.image_items : (result?.images?.length ? result.images : result));
+                finalizePendingNode(pending.node, outputs, pending.meta, 'image');
+                addSmartGenerationLog({run:runLog, outputs, runMs:nowMs() - runLogStart});
+                render();
+                scheduleSave();
+                await smartAgentSaveNow();
+            } catch(e) {
+                if(handleJimengPendingSignal(pending.node, e)){
+                    await smartAgentSaveNow();
+                    return;
+                }
+                setSmartNodeGenerationError(pending.node, e.message || tr('smart.errRunFailed'), 'image');
+                pending.node.pendingTasks = (pending.node.pendingTasks || []).map(task => task.taskId === created.task_id ? {...task, failed:true, error:e.message || String(e)} : task);
+                addSmartGenerationLog({run:runLog, outputs:[], runMs:nowMs() - runLogStart, error:e.message || String(e)});
+                if(pending.node.generationError) pending.node.generationError.logged = true;
+                toast((e.message || tr('smart.errRunFailed')).slice(0, 160));
+                render();
+                scheduleSave();
+                await smartAgentSaveNow();
+            }
+        })();
+    }
+    return pendingNodes.map(id => nodes.find(n => n.id === id)).filter(Boolean).map(smartAgentNodeSummary);
+}
+async function smartAgentGenerateVideoItems(items=[], options={}){
+    const list = (Array.isArray(items) ? items : [items]).map(item => typeof item === 'string' ? {prompt:item} : item).filter(item => item && String(item.prompt || item.text || '').trim());
+    if(!list.length) return [];
+    const baseOptions = options || {};
+    pushUndo();
+    const pendingNodes = [];
+    for(let itemIndex = 0; itemIndex < list.length; itemIndex++){
+        const item = list[itemIndex];
+        const prompt = String(item.prompt || item.text || '').trim();
+        const providerId = smartAgentResolveVideoProviderId(item.provider_id || item.providerId || item.provider || item.videoProvider || baseOptions.provider_id || baseOptions.providerId || baseOptions.provider || baseOptions.videoProvider);
+        const model = smartAgentResolveVideoModel(item.model || item.videoModel || baseOptions.model || baseOptions.videoModel, providerId);
+        if(!providerId || !model) throw new Error(tr('smart.errNoVideoModel'));
+        const refs = smartAgentImageRefs(item.reference_images || item.references || item.refs || item.images || baseOptions.reference_images || baseOptions.references || baseOptions.refs || []);
+        const duration = Math.max(1, Math.min(60, Number(item.duration || item.seconds || baseOptions.duration || baseOptions.seconds || settings.videoDuration || 5)));
+        const payload = {
+            prompt,
+            provider_id:providerId,
+            model,
+            duration,
+            aspect_ratio:smartAgentVideoAspect(item.aspect_ratio || item.aspect || item.ratio || baseOptions.aspect_ratio || baseOptions.aspect || baseOptions.ratio),
+            resolution:smartAgentVideoResolution(item.resolution || baseOptions.resolution),
+            reference_images:refs,
+            n:1,
+            camerafixed:item.camerafixed ?? item.camera_fixed ?? item.fixed_camera ?? baseOptions.camerafixed ?? baseOptions.camera_fixed ?? settings.videoCameraFixed,
+            generate_audio:item.generate_audio ?? item.audio ?? baseOptions.generate_audio ?? settings.videoGenerateAudio,
+            enhance_prompt:item.enhance_prompt ?? baseOptions.enhance_prompt ?? settings.videoEnhancePrompt,
+            enable_upsample:item.enable_upsample ?? baseOptions.enable_upsample ?? settings.videoEnableUpsample,
+            watermark:item.watermark ?? baseOptions.watermark ?? settings.videoWatermark,
+            multimodal:item.multimodal ?? baseOptions.multimodal ?? settings.videoMultimodal,
+            use_frame_roles:item.use_frame_roles ?? baseOptions.use_frame_roles ?? settings.videoUseFrameRoles
+        };
+        const pending = smartAgentCreatePendingNode(prompt, payload, itemIndex, list.length, {...baseOptions, kind:'video', reference_images:refs});
+        smartAgentConnectReferenceNodes(pending.node, refs);
+        pendingNodes.push(pending.node.id);
+        selectedId = pending.node.id;
+        selectedIds = pendingNodes.length > 1 ? pendingNodes.slice() : [];
+        selectedImage = {nodeId:'', index:-1};
+        render();
+        scheduleSave();
+        await smartAgentSaveNow();
+        const runSettings = {
+            ...cloneSmartSettings(settings),
+            engine:'api',
+            apiKind:'video',
+            videoProvider:payload.provider_id,
+            videoModel:payload.model,
+            videoDuration:payload.duration,
+            videoAspect:payload.aspect_ratio,
+            videoResolution:payload.resolution,
+            videoCameraFixed:Boolean(payload.camerafixed),
+            videoGenerateAudio:Boolean(payload.generate_audio),
+            videoEnhancePrompt:Boolean(payload.enhance_prompt),
+            videoEnableUpsample:Boolean(payload.enable_upsample),
+            videoWatermark:Boolean(payload.watermark),
+            videoMultimodal:Boolean(payload.multimodal),
+            videoUseFrameRoles:Boolean(payload.use_frame_roles)
+        };
+        const runLog = smartAgentRunLog(pending.node, prompt, refs, 'video', runSettings);
+        const runLogStart = nowMs();
+        const videoTaskPayload = {
+            ...payload,
+            images:imageRefsOnly(refs).map((ref, i) => ({
+                url:ref.url,
+                name:ref.name || `图${i + 1}`,
+                role:ref.role || ''
+            })),
+            videos:videoRefsOnly(refs).map(ref => ref.url).filter(Boolean),
+            audios:audioRefsOnly(refs).map(ref => ref.url).filter(Boolean)
+        };
+        const created = await fetch('/api/canvas-video-tasks', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify(videoTaskPayload)
+        }).then(async r => {
+            if(!r.ok) throw new Error(await r.text());
+            return r.json();
+        });
+        pending.node.pendingTasks = [{taskId:created.task_id, kind:'video', providerId:payload.provider_id, model:payload.model}];
+        pending.node.pending = 1;
+        pending.node.running = false;
+        render();
+        scheduleSave();
+        await smartAgentSaveNow();
+        (async () => {
+            try {
+                const result = await pollSmartCanvasTask(created.task_id, 'video');
+                const outputs = resultMediaUrls(result?.videos?.length ? result.videos : result);
+                if(!outputs.length) throw new Error(tr('smart.errNoOutVideos'));
+                finalizeSmartPendingTask(pending.node, created.task_id, outputs, 'video');
+                addSmartGenerationLog({run:runLog, outputs, runMs:nowMs() - runLogStart});
+                render();
+                scheduleSave();
+                await smartAgentSaveNow();
+            } catch(e) {
+                if(handleJimengPendingSignal(pending.node, e)){
+                    await smartAgentSaveNow();
+                    return;
+                }
+                setSmartNodeGenerationError(pending.node, e.message || tr('smart.errRunFailed'), 'video');
+                pending.node.pendingTasks = (pending.node.pendingTasks || []).map(task => task.taskId === created.task_id ? {...task, failed:true, error:e.message || String(e)} : task);
+                addSmartGenerationLog({run:runLog, outputs:[], runMs:nowMs() - runLogStart, error:e.message || String(e)});
+                if(pending.node.generationError) pending.node.generationError.logged = true;
+                toast((e.message || tr('smart.errRunFailed')).slice(0, 160));
+                render();
+                scheduleSave();
+                await smartAgentSaveNow();
+            }
+        })();
+    }
+    return pendingNodes.map(id => nodes.find(n => n.id === id)).filter(Boolean).map(smartAgentNodeSummary);
+}
+function installSmartCanvasAgentApi(){
+    window.SmartCanvasAgentApi = {
+        kind:'smart',
+        getContext(){
+            const scale = safeScale(viewport.scale);
+            const shellW = Math.max(1, shell?.clientWidth || window.innerWidth || 1);
+            const shellH = Math.max(1, shell?.clientHeight || window.innerHeight || 1);
+            const visibleWorld = {
+                x:-viewport.x / scale,
+                y:-viewport.y / scale,
+                width:shellW / scale,
+                height:shellH / scale,
+                centerX:(shellW / 2 - viewport.x) / scale,
+                centerY:(shellH / 2 - viewport.y) / scale,
+                screenWidth:shellW,
+                screenHeight:shellH
+            };
+            return {
+                canvasId,
+                title:canvas?.title || '',
+                capturedAt:Date.now(),
+                viewport:{...viewport},
+                visibleWorld,
+                selectedNodeIds:selectedNodeIds(),
+                selectedImage:{...selectedImage},
+                selectedNodes:selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean).map(smartAgentNodeSummary),
+                allNodes:nodes.map(smartAgentNodeSummary),
+                connections:(canvas?.connections || []).map(conn => ({from:conn.from || '', to:conn.to || '', kind:conn.kind || 'flow'})),
+                imageGeneration:this.getImageGenerationDefaults(),
+                videoGeneration:this.getVideoGenerationDefaults()
+            };
+        },
+        refreshFromServer(){
+            return mergeReloadCanvasNow();
+        },
+        focusNodes(ids=[]){
+            return smartAgentFocusNodes(ids);
+        },
+        getSelectedAssets(){
+            const selected = selectedNodeIds().map(id => nodes.find(n => n.id === id)).filter(Boolean);
+            const refs = [];
+            selected.forEach(node => {
+                if(node.type === 'smart-prompt'){
+                    const text = String(node.text || '').trim();
+                    refs.push({
+                        refId:`ref_${refs.length + 1}`,
+                        name:node.title || '提示词节点',
+                        kind:'prompt',
+                        text,
+                        nodeId:node.id,
+                        imageIndex:'',
+                        nodeTitle:node.title || '',
+                        canvasKind:'smart'
+                    });
+                    return;
+                }
+                (node.images || []).forEach((img, index) => {
+                    if(!img?.url) return;
+                    refs.push({
+                        refId:`ref_${refs.length + 1}`,
+                        url:img.url,
+                        name:img.name || smartImageNameFromUrl(img.url) || `图${refs.length + 1}`,
+                        kind:mediaKindForItem(img),
+                        nodeId:node.id,
+                        imageIndex:index,
+                        nodeTitle:node.title || '',
+                        canvasKind:'smart'
+                    });
+                });
+            });
+            if(selectedImage.nodeId && selectedImage.index >= 0){
+                const node = nodes.find(n => n.id === selectedImage.nodeId);
+                const img = node?.images?.[selectedImage.index];
+                if(img?.url && !refs.some(ref => ref.url === img.url)){
+                    refs.unshift({
+                        refId:'ref_1',
+                        url:img.url,
+                        name:img.name || smartImageNameFromUrl(img.url) || '图1',
+                        kind:mediaKindForItem(img),
+                        nodeId:node.id,
+                        imageIndex:selectedImage.index,
+                        nodeTitle:node.title || '',
+                        canvasKind:'smart'
+                    });
+                }
+            }
+            refs.forEach((ref, index) => { ref.refId = `ref_${index + 1}`; });
+            return refs;
+        },
+        getSelectedNodeCount(){
+            return selectedNodeIds().length;
+        },
+        getAllAssets(){
+            const refs = [];
+            nodes.forEach(node => {
+                (node.images || []).forEach((img, index) => {
+                    if(!img?.url) return;
+                    refs.push({
+                        refId:`ref_${refs.length + 1}`,
+                        url:img.url,
+                        name:img.name || smartImageNameFromUrl(img.url) || `图${refs.length + 1}`,
+                        kind:mediaKindForItem(img),
+                        nodeId:node.id,
+                        imageIndex:index,
+                        nodeTitle:node.title || '',
+                        canvasKind:'smart'
+                    });
+                });
+            });
+            return refs;
+        },
+        addMediaNodes(items=[], options={}){
+            const list = (Array.isArray(items) ? items : [items]).filter(item => item && (item.url || item.path || item.src));
+            if(!list.length) return [];
+            pushUndo();
+            const created = [];
+            list.forEach((item, index) => {
+                const media = smartAgentMediaItem(item);
+                const layout = imageLayout([media], mediaNodeDefaultScale({type:'smart-image', images:[media]}), {type:'smart-image', images:[media]});
+                const refs = smartAgentImageRefs(item.reference_images || item.references || item.refs || options.reference_images || options.references || options.refs || []);
+                const point = smartAgentGridPoint(index, list.length, {...options, reference_images:refs, boxWidth:layout.width, boxHeight:layout.height});
+                const node = createImageNodeAt(point, [media], {skipUndo:true, select:false});
+                if(node) created.push(node);
+            });
+            selectedId = created.length === 1 ? created[0].id : '';
+            selectedIds = created.length > 1 ? created.map(node => node.id) : [];
+            selectedImage = {nodeId:'', index:-1};
+            render();
+            scheduleSave();
+            toast(`已由 Agent 添加 ${created.length} 个素材节点`);
+            return created.map(smartAgentNodeSummary);
+        },
+        addPromptNodes(items=[], options={}){
+            const list = (Array.isArray(items) ? items : [items]).map(item => typeof item === 'string' ? {text:item} : item).filter(item => item && (item.text || item.title));
+            if(!list.length) return [];
+            pushUndo();
+            const created = [];
+            list.forEach((item, index) => {
+                const refs = smartAgentImageRefs(item.reference_images || item.references || item.refs || options.reference_images || options.references || options.refs || []);
+                const point = smartAgentGridPoint(index, list.length, {...options, reference_images:refs, cellX:Number(options.cellX) || 360, cellY:Number(options.cellY) || 280, boxWidth:316, boxHeight:240, returnTopLeft:true});
+                const node = createPromptNode(point.x, point.y, {skipUndo:true, select:false});
+                node.title = item.title || 'Prompt';
+                node.text = String(item.text || '');
+                created.push(node);
+            });
+            selectedId = created.length === 1 ? created[0].id : '';
+            selectedIds = created.length > 1 ? created.map(node => node.id) : [];
+            selectedImage = {nodeId:'', index:-1};
+            render();
+            scheduleSave();
+            toast(`已由 Agent 添加 ${created.length} 个提示词节点`);
+            return created.map(smartAgentNodeSummary);
+        },
+        addLoopNodes(items=[], options={}){
+            const list = (Array.isArray(items) ? items : [items]).map(item => typeof item === 'string' ? {variablePrompt:item} : item).filter(Boolean);
+            if(!list.length) return [];
+            pushUndo();
+            const created = [];
+            list.forEach((item, index) => {
+                const refs = smartAgentImageRefs(item.reference_images || item.references || item.refs || options.reference_images || options.references || options.refs || []);
+                const point = smartAgentGridPoint(index, list.length, {...options, reference_images:refs, cellX:Number(options.cellX) || 380, cellY:Number(options.cellY) || 230, boxWidth:340, boxHeight:168, returnTopLeft:true});
+                const node = createLoopNode(point.x, point.y, {skipUndo:true, select:false});
+                if(item.title) node.title = String(item.title);
+                if(item.count) node.count = Math.max(1, Number(item.count) || 1);
+                if(item.variablePrompt) node.variablePrompt = String(item.variablePrompt);
+                created.push(node);
+            });
+            selectedId = created.length === 1 ? created[0].id : '';
+            selectedIds = created.length > 1 ? created.map(node => node.id) : [];
+            selectedImage = {nodeId:'', index:-1};
+            render();
+            scheduleSave();
+            toast(`已由 Agent 添加 ${created.length} 个循环节点`);
+            return created.map(smartAgentNodeSummary);
+        },
+        renameNodes(items=[], options={}){
+            return smartAgentRenameNodes(items, options);
+        },
+        groupNodes(items=[], options={}){
+            return smartAgentGroupNodes(items, options);
+        },
+        ungroupNodes(items=[], options={}){
+            return smartAgentUngroupNodes(items, options);
+        },
+        moveNodes(items=[], options={}){
+            return smartAgentMoveNodes(items, options);
+        },
+        resizeNodes(items=[], options={}){
+            return smartAgentResizeNodes(items, options);
+        },
+        arrangeNodes(items=[], options={}){
+            return smartAgentArrangeNodes(items, options);
+        },
+        arrangeNodeTree(items=[], options={}){
+            return smartAgentArrangeNodeTree(items, options);
+        },
+        getImageGenerationDefaults(){
+            return {
+                provider_id:settings.provider_id || '',
+                model:settings.model || '',
+                size:sizeForRun(settings),
+                quality:settings.quality || 'auto',
+                count:Math.max(1, Math.min(8, Number(settings.count || 1))),
+                providers:smartAgentProviderOptions()
+            };
+        },
+        getVideoGenerationDefaults(){
+            const providerId = settings.videoProvider || videoApiProviders()[0]?.id || '';
+            const models = providerVideoModels(providerId);
+            return {
+                provider_id:providerId,
+                model:settings.videoModel || models[0] || '',
+                duration:Math.max(1, Math.min(60, Number(settings.videoDuration || 5))),
+                aspect_ratio:settings.videoAspect || '16:9',
+                resolution:settings.videoResolution || '',
+                camerafixed:Boolean(settings.videoCameraFixed),
+                generate_audio:Boolean(settings.videoGenerateAudio),
+                providers:smartAgentVideoProviderOptions()
+            };
+        },
+        async generateImageNodes(items=[], options={}){
+            return await smartAgentGenerateImageItems(items, options);
+        },
+        async generateVideoNodes(items=[], options={}){
+            return await smartAgentGenerateVideoItems(items, options);
+        }
+    };
+}
+installSmartCanvasAgentApi();
 function duplicateForAltDrag(node, preserveConnections=false){
     const ids = (isNodeSelected(node.id) ? selectedNodeIds() : [node.id]);
-    const sourceNodes = ids.map(id => nodes.find(n => n.id === id)).filter(Boolean);
+    const sourceNodes = ids.map(id => nodes.find(n => n.id === id)).filter(node => node && !isSmartAgentTaskNode(node));
     if(!sourceNodes.length) return node;
     pushUndo();
     const idMap = new Map();
@@ -5986,7 +7657,7 @@ function shellPoint(event){
     return {x:event.clientX - rect.left, y:event.clientY - rect.top};
 }
 function renderConnections(){
-    const conns = (canvas?.connections || []).map((conn, index) => ({...conn, index})).filter(c => nodes.some(n => n.id === c.from) && nodes.some(n => n.id === c.to));
+    const conns = (canvas?.connections || []).map((conn, index) => ({...conn, index})).filter(c => nodes.some(n => n.id === c.from) && nodes.some(n => n.id === c.to) && smartAgentTaskConnectionVisible(c));
     const cascadeKeys = cascadeConnectionKeys();
     const activeCascadeCount = (smartCascadeRunPath?.states && Object.values(smartCascadeRunPath.states).filter(state => state && state !== 'done').length) || 0;
     const reduceMotion = activeCascadeCount > 24;
@@ -6056,6 +7727,20 @@ function renderConnections(){
         return `<path class="${cls}" d="${curve}" stroke="${color}" stroke-width="${width}" fill="none" opacity="${opacity}"></path><path class="conn-hit" data-conn-index="${dataIndex}" d="${curve}" stroke="transparent" stroke-width="14" fill="none"></path><circle cx="${tx}" cy="${ty}" r="3.5" fill="${color}" opacity=".66"></circle><g class="conn-cut" data-conn-index="${dataIndex}" transform="translate(${mx} ${my})"><circle r="8" fill="var(--card)" stroke="${color}" stroke-width="1.4"></circle><path d="M-3 -3 L3 3 M3 -3 L-3 3" stroke="${color}" stroke-width="1.5" stroke-linecap="round"></path></g>`;
     }).join('');
     return `<svg class="connection-layer ${reduceMotion ? 'conn-reduce-motion' : ''}" width="6000" height="4000" viewBox="0 0 6000 4000" xmlns="http://www.w3.org/2000/svg">${paths}</svg>`;
+}
+function smartAgentTaskConnectionVisible(conn){
+    const from = nodes.find(node => node.id === conn?.from);
+    const to = nodes.find(node => node.id === conn?.to);
+    const taskId = from?.complexTaskId || to?.complexTaskId || '';
+    if(!taskId) return true;
+    const root = nodes.find(node => isSmartAgentTaskNode(node) && node.complexTaskId === taskId);
+    const visibility = root?.linkVisibility || 'visible';
+    if(visibility === 'hidden') return false;
+    if(visibility === 'main'){
+        if(isSmartAgentTaskNode(from) || isSmartAgentTaskNode(to)) return true;
+        return Boolean(from?.complexTaskStageId && to?.complexTaskStageId && from.complexTaskStageId !== to.complexTaskStageId);
+    }
+    return true;
 }
 function refreshConnectionLayer(){
     connectionLayerRaf = 0;
@@ -7067,6 +8752,7 @@ function smartGroupBodyHtml(node){
     </div>`;
 }
 function nodeBodyHtml(node, layout){
+    if(isSmartAgentTaskNode(node)) return smartAgentTaskBodyHtml(node);
     if(node.type === 'smart-group') return smartGroupBodyHtml(node);
     if(node.type === 'smart-prompt') return promptNodeBodyHtml(node);
     if(node.type === 'smart-loop') return smartLoopBodyHtml(node);
@@ -7077,6 +8763,9 @@ function nodeBodyHtml(node, layout){
     const recoverTask = smartRecoverableImageTask(node);
     if(recoverTask && imgs.length === 0){
         return imageTaskRecoverBodyHtml(node, recoverTask, layout);
+    }
+    if(node.generationError && imgs.length === 0){
+        return generationErrorBodyHtml(node, layout);
     }
     if(node.queued && imgs.length === 0 && !node.pending){
         return `<div class="loading-cell single queued" style="width:${layout.width}px;height:${layout.height}px"></div>`;
@@ -7100,6 +8789,37 @@ function nodeBodyHtml(node, layout){
         <span class="upload-node-sub">拖拽 / 粘贴 / 点击上传</span>
     </div>`;
 }
+function smartAgentTaskStatusLabel(status){
+    return ({draft:'草稿',planned:'已规划',queued:'排队中',running:'执行中',reviewing:'子 Agent 验收',waiting_provider:'等待平台',waiting_user:'等待用户',retrying:'重试中',paused:'已暂停',partially_completed:'部分完成',completed:'已完成',failed:'失败',cancelled:'已取消'})[status] || status || '未知';
+}
+function smartAgentTaskBodyHtml(node){
+    const progress = node.taskProgress || {};
+    const total = Math.max(0, Number(progress.total || 0));
+    const completed = Math.max(0, Number(progress.completed || 0));
+    const failed = Math.max(0, Number(progress.failed || 0));
+    const processed = Math.max(0, Number(progress.processed ?? (completed + failed)));
+    const percent = total ? Math.max(0, Math.min(100, Math.round(processed / total * 100))) : 0;
+    const completedPercent = total ? Math.max(0, Math.min(100, completed / total * 100)) : 0;
+    const failedPercent = total ? Math.max(0, Math.min(100 - completedPercent, failed / total * 100)) : 0;
+    const status = String(node.taskStatus || 'queued');
+    const active = !['completed','partially_completed','failed','cancelled'].includes(status);
+    const message = node.taskQuestion || node.taskError || progress.recent_event || '';
+    const messageClass = node.taskQuestion ? 'smart-agent-task-question' : node.taskError ? 'smart-agent-task-error' : 'smart-agent-task-event';
+    return `<div class="smart-agent-task-card ${escapeAttr(status)}">
+        <div class="smart-agent-task-top"><span class="smart-agent-task-mode">批量队列</span><strong>${escapeHtml(smartAgentTaskStatusLabel(status))}</strong></div>
+        <div class="smart-agent-task-stage">${escapeHtml(progress.current_stage || '等待开始')}</div>
+        <div class="smart-agent-task-progress" role="progressbar" aria-label="批量任务进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><i class="smart-agent-task-progress-success" style="width:${completedPercent}%"></i><i class="smart-agent-task-progress-failed" style="width:${failedPercent}%"></i></div>
+        <div class="smart-agent-task-counts"><span>${completed}/${total} 完成</span><span>${failed} 失败</span><span>${Number(progress.retrying || 0)} 重试</span><span>${Number(progress.waiting || 0)} 等待</span></div>
+        ${node.taskQuestion ? `<button type="button" class="smart-agent-task-message ${messageClass}" data-task-detail="${escapeAttr(node.complexTaskId)}"><i data-lucide="message-circle-question"></i><span>${escapeHtml(message)}</span></button>` : `<div class="smart-agent-task-message ${messageClass}">${message ? escapeHtml(message) : '&nbsp;'}</div>`}
+        <div class="smart-agent-task-actions">
+            <button type="button" data-task-detail="${escapeAttr(node.complexTaskId)}"><i data-lucide="list-tree"></i><span>详情</span></button>
+            ${active && status !== 'paused' ? `<button type="button" data-task-control="pause" data-task-id="${escapeAttr(node.complexTaskId)}"><i data-lucide="pause"></i><span>暂停</span></button>` : ''}
+            ${status === 'paused' ? `<button type="button" data-task-control="resume" data-task-id="${escapeAttr(node.complexTaskId)}"><i data-lucide="play"></i><span>继续</span></button>` : ''}
+            ${active ? `<button type="button" data-task-control="cancel" data-task-id="${escapeAttr(node.complexTaskId)}"><i data-lucide="square"></i><span>取消</span></button>` : ''}
+            <button type="button" data-task-links="${escapeAttr(node.complexTaskId)}"><i data-lucide="git-branch"></i><span>${node.linkVisibility === 'hidden' ? '连线隐藏' : node.linkVisibility === 'main' ? '主干连线' : '全部连线'}</span></button>
+        </div>
+    </div>`;
+}
 function jimengPendingBodyHtml(node, layout){
     const jp = node.jimengPending || {};
     const querying = Boolean(jp.querying);
@@ -7115,6 +8835,17 @@ function jimengPendingBodyHtml(node, layout){
 }
 function smartRecoverableImageTask(node){
     return smartPendingTasks(node).find(task => task.failed && task.recoverTaskId) || null;
+}
+function generationErrorBodyHtml(node, layout){
+    const err = node.generationError || {};
+    const message = String(err.message || tr('smart.errRunFailed'));
+    return `<div class="jimeng-pending-cell loading-cell single" style="width:${layout.width}px;height:${layout.height}px">
+        <div class="jimeng-pending-overlay">
+            <div class="jimeng-pending-spinner"><i data-lucide="circle-alert"></i></div>
+            <div class="jimeng-pending-text">生成失败</div>
+            <div class="jimeng-pending-sub">${escapeHtml(message)}</div>
+        </div>
+    </div>`;
 }
 function imageTaskRecoverBodyHtml(node, task, layout){
     const querying = Boolean(task.querying);
@@ -7332,7 +9063,9 @@ function render(){
         .sort((a, b) => (isSmartGroupNode(a) ? 0 : 1) - (isSmartGroupNode(b) ? 0 : 1))
         .map(node => {
         const imgs = node.images || [];
-        const title = node.type === 'smart-group' ? (node.title === '万能分组' ? '智能分组' : (node.title || '智能分组')) : node.type === 'smart-prompt' ? 'Prompt' : node.type === 'smart-loop' ? 'Loop' : (imgs.length > 1 ? 'Group' : imgs.length ? 'Image' : escapeHtml(tr('smart.createImportNode')));
+        const isAgentTask = isSmartAgentTaskNode(node);
+        const isAgentTaskRunning = isAgentTask && ['queued','running','reviewing','waiting_provider','retrying'].includes(String(node.taskStatus || 'queued'));
+        const title = isAgentTask ? (node.title || '批量任务') : node.type === 'smart-group' ? (node.title === '万能分组' ? '智能分组' : (node.title || '智能分组')) : node.type === 'smart-prompt' ? 'Prompt' : node.type === 'smart-loop' ? 'Loop' : (imgs.length > 1 ? 'Group' : imgs.length ? 'Image' : escapeHtml(tr('smart.createImportNode')));
         const scale = nodeScale(node);
         const layout = imageLayout(imgs, scale, node);
         const isPrompt = node.type === 'smart-prompt';
@@ -7348,16 +9081,16 @@ function render(){
         const isPending = ((node.pending || isQueued || isJimengPending) && imgs.length === 0);
         const body = nodeBodyHtml(node, layout);
         const deleteBtn = isGroup ? '' : `<button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button>`;
-        const hint = isSmartGroup ? '双击添加 · 拖入归组 · 选中后生成' : isPending ? escapeHtml(tr('smart.hintPending')) : (imgs.length > 1 ? escapeHtml(tr('smart.hintMulti')) : imgs.length ? escapeHtml(tr('smart.hintSingle')) : escapeHtml(tr('smart.hintEmpty')));
-        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isCompactMember ? 'smart-group-member-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
+        const hint = isAgentTask ? 'Agent 专用任务节点' : isSmartGroup ? '双击添加 · 拖入归组 · 选中后生成' : isPending ? escapeHtml(tr('smart.hintPending')) : (imgs.length > 1 ? escapeHtml(tr('smart.hintMulti')) : imgs.length ? escapeHtml(tr('smart.hintSingle')) : escapeHtml(tr('smart.hintEmpty')));
+        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isAgentTask ? 'smart-agent-task-node' : ''} ${isAgentTaskRunning ? 'smart-agent-task-running' : ''} ${isCompactMember ? 'smart-group-member-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
             <div class="node-head"><div class="node-title">${title}</div><div class="node-actions">${deleteBtn}</div></div>
-            ${!isEmpty && !isGroup ? `<div class="floating-node-actions"><button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button></div>` : ''}
+            ${!isEmpty && !isGroup && !isAgentTask ? `<div class="floating-node-actions"><button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button></div>` : ''}
             ${smartNodeToolbarHtml(node)}${smartGroupToolbarHtml(node)}
             ${runTimePillHtml(node)}
             <div class="node-body">${body}</div>
             ${isCompactMember && (isPrompt || isLoop) ? '<div class="smart-group-member-grab" title="拖动移出分组"></div>' : ''}
             <div class="node-hint">${hint}</div>
-            ${imgs.length || node.pending || isQueued || isJimengPending || isPrompt || isLoop || isSmartGroup ? '<div class="node-resize-handle" data-resize="1"></div>' : ''}
+            ${imgs.length || node.pending || isQueued || isJimengPending || isPrompt || isLoop || isSmartGroup || isAgentTask ? '<div class="node-resize-handle" data-resize="1"></div>' : ''}
             <div class="node-port port-in" data-port="in" title="input"></div>
             <div class="node-port port-out" data-port="out" title="output"></div>
         </div>`;
@@ -7955,12 +9688,57 @@ function pickMediaForSmartNode(nodeId){
     document.body.appendChild(input);
     input.click();
 }
+async function smartAgentControlComplexTask(taskId, action){
+    const response = await fetch(`/api/codex-agent/complex-tasks/${encodeURIComponent(taskId)}/control`, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action})
+    });
+    if(!response.ok) throw new Error(await response.text());
+    const data = await response.json();
+    await mergeReloadCanvasNow();
+    return data.task || null;
+}
+function smartAgentOpenComplexTask(taskId){
+    if(!taskId) return;
+    if(window.InfiniteCanvasAgentPanel?.openComplexTask){
+        window.InfiniteCanvasAgentPanel.openComplexTask(taskId);
+        return;
+    }
+    window.dispatchEvent(new CustomEvent('infinite-canvas:open-complex-task', {detail:{taskId}}));
+}
+function bindSmartAgentTaskControls(el, node){
+    el.querySelectorAll('[data-task-detail]').forEach(btn => {
+        btn.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); }, true);
+        btn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); smartAgentOpenComplexTask(btn.dataset.taskDetail || node.complexTaskId); });
+    });
+    el.querySelectorAll('[data-task-control]').forEach(btn => {
+        btn.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); }, true);
+        btn.addEventListener('click', async e => {
+            e.preventDefault(); e.stopPropagation();
+            const action = btn.dataset.taskControl;
+            if(action === 'cancel' && !window.confirm('确定取消这个批量任务吗？已经提交平台的项目会继续回收结果。')) return;
+            btn.disabled = true;
+            try { await smartAgentControlComplexTask(btn.dataset.taskId || node.complexTaskId, action); }
+            catch(err){ toast((err.message || '批量任务操作失败').slice(0, 160)); }
+            finally { btn.disabled = false; }
+        });
+    });
+    el.querySelectorAll('[data-task-links]').forEach(btn => {
+        btn.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); }, true);
+        btn.addEventListener('click', async e => {
+            e.preventDefault(); e.stopPropagation();
+            const next = node.linkVisibility === 'visible' ? 'main' : node.linkVisibility === 'main' ? 'hidden' : 'visible';
+            try { await smartAgentControlComplexTask(node.complexTaskId, `links_${next}`); }
+            catch(err){ toast((err.message || '修改连线显示失败').slice(0, 160)); }
+        });
+    });
+}
 function bindNodeEvents(){
     world.querySelectorAll('.image-node').forEach(el => {
         const id = el.dataset.id;
         const nodeForControls = nodes.find(n => n.id === id);
         if(nodeForControls?.type === 'smart-prompt') bindPromptNodeControls(el, nodeForControls);
         if(nodeForControls?.type === 'smart-loop') bindLoopNodeControls(el, nodeForControls);
+        if(isSmartAgentTaskNode(nodeForControls)) bindSmartAgentTaskControls(el, nodeForControls);
         if(nodeForControls?.type === 'smart-group') {
             el.ondblclick = e => {
                 e.preventDefault();
@@ -8166,7 +9944,7 @@ function bindNodeEvents(){
                 selectedImage = {nodeId:target.targetNodeId, index:target.imageIndex};
                     if(smartCascadeAnyRunning()) smartCascadeSilentSelection = false;
                     syncSelectionUi();
-                    updateComposer();
+                    scheduleComposerUpdate(180);
                 }, 220);
             });
         item.addEventListener('dblclick', e => {
@@ -8353,6 +10131,7 @@ function deleteNode(id){
     nodes.forEach(node => {
         if(isHistoryGroupNode(node) && node.historyFor === id) deleteIds.add(node.id);
     });
+    deleteIds.forEach(nodeId => smartDeletedNodeIds.add(nodeId));
     nodes = nodes.filter(node => !deleteIds.has(node.id));
     if(canvas) canvas.connections = (canvas.connections || []).filter(c => !deleteIds.has(c.from) && !deleteIds.has(c.to));
     nodes.forEach(node => {
@@ -8363,7 +10142,9 @@ function deleteNode(id){
     selectedIds = selectedIds.filter(selected => !deleteIds.has(selected));
     if(deleteIds.has(selectedImage.nodeId)) selectedImage = {nodeId:'', index:-1};
     render();
-    scheduleSave();
+    // A delete should not wait behind the normal typing/layout debounce. It
+    // must win over a concurrent task-status broadcast before a page refresh.
+    scheduleSave(0);
 }
 function clearNodeMediaBeforeDelete(id){
     const node = nodes.find(n => n.id === id);
@@ -8390,6 +10171,19 @@ function clearNodeMediaBeforeDelete(id){
     return true;
 }
 function deleteNodeFromButton(id){
+    const node = nodes.find(n => n.id === id);
+    if(isSmartAgentTaskNode(node)){
+        const active = !['completed','partially_completed','failed','cancelled'].includes(String(node.taskStatus || ''));
+        if(active && !window.confirm('删除运行中的批量任务节点会取消所有未提交项目；已经提交平台的任务仍会继续回收结果。确定删除吗？')) return;
+        (async () => {
+            if(active && node.complexTaskId){
+                try { await smartAgentControlComplexTask(node.complexTaskId, 'cancel'); }
+                catch(e){ toast((e.message || '取消批量任务失败').slice(0, 160)); return; }
+            }
+            deleteNode(id);
+        })();
+        return;
+    }
     if(clearNodeMediaBeforeDelete(id)) return;
     deleteNode(id);
 }
@@ -11189,7 +12983,26 @@ function positionComposerForNode(node){
     composer.style.left = `${rect.x + rect.width / 2 - cardW / 2}px`;
     composer.style.top = `${rect.y + rect.height + gap}px`;
 }
+let composerUpdateTimer = 0;
+let composerUpdateSeq = 0;
+function scheduleComposerUpdate(delay=120){
+    if(composerUpdateTimer){
+        clearTimeout(composerUpdateTimer);
+        composerUpdateTimer = 0;
+    }
+    const seq = ++composerUpdateSeq;
+    composerUpdateTimer = setTimeout(() => {
+        composerUpdateTimer = 0;
+        if(seq !== composerUpdateSeq) return;
+        updateComposer();
+    }, Math.max(0, Number(delay) || 0));
+}
 function updateComposer(){
+    if(composerUpdateTimer){
+        clearTimeout(composerUpdateTimer);
+        composerUpdateTimer = 0;
+    }
+    composerUpdateSeq++;
     const node = selectedNode();
     syncRunButtonState(node);
     if(smartCascadeSilentSelection && !activeComposerSubject){
@@ -11230,7 +13043,7 @@ function updateComposer(){
     renderInputThumbsRow(node);
     renderInputPromptPreview(node);
     syncCascadeRunButton(node);
-    updateProviderModels();
+    scheduleDynamicParamsRefresh(140);
 }
 function renderInputPromptPreview(node){
     if(!inputPromptPreview) return;
@@ -11822,7 +13635,7 @@ async function handleSmartImageDropPayload(payload, targetId='', opts={}){
 }
 function sizeForRun(sourceSettings=settings){
     const fallbackResolution = sourceSettings.engine === 'api' && isGptImageAutoSizeModel(sourceSettings.model)
-        ? 'auto'
+        ? defaultSmartApiResolution(sourceSettings.model)
         : '1k';
     return apiImageSize(sourceSettings.ratio || 'square', sourceSettings.resolution || fallbackResolution, sourceSettings.customRatio || '', sourceSettings.customSize || '') || '1024x1024';
 }
@@ -12073,6 +13886,11 @@ function clearDetachedRunInputRefs(node){
     if(!node) return;
     const hasUpstream = Boolean((canvas?.connections || []).some(conn => conn.to === node.id && ['input','flow'].includes(conn.kind || 'flow')));
     if(hasUpstream || (!canvasUsesConnections && Array.isArray(node.inputNodeIds) && node.inputNodeIds.some(id => nodes.some(n => n.id === id)))) return;
+    // Agent “引用模式” deliberately stores the source media on the generated
+    // node without creating graph edges. Those refs are run configuration, not
+    // stale detached inputs, and must survive save/reload so the composer can
+    // still render its 上游输入 thumbnails.
+    if(node.agentGenerated && Array.isArray(node.runInputRefs) && node.runInputRefs.some(ref => ref?.url)) return;
     delete node.runInputRefs;
     delete node.runPromptRefs;
     delete node.sourceNodeId;
@@ -12300,6 +14118,14 @@ function manualReferenceImagesFor(node){
         manualAdded:true
     }));
 }
+function isAgentGeneratedNode(node){
+    if(!node) return false;
+    if(node.agentGenerated) return true;
+    const runSettings = node.runSettings || {};
+    return Boolean(Array.isArray(node.runInputRefs) && node.runInputRefs.length
+        && runSettings.engine === 'api'
+        && ['image', 'video'].includes(runSettings.apiKind || ''));
+}
 function isInputRefBlocked(node, img){
     if(!node || !img?.url) return false;
     return blockedInputRefKeys(node).has(inputRefKey(img));
@@ -12325,7 +14151,9 @@ function defaultReferenceImagesFor(node, consume=false, ctx=smartLoopContext){
     const self = selfReferenceImagesForNode(node, consume, ctx).filter(img => img?.url);
     const upstream = (smartImageUsesWorkflowInput(node, ctx) ? workflowInputImagesFor(node, consume, ctx) : inputImagesFor(node, consume, ctx))
         .filter(img => img?.url);
+    const savedInputs = Array.isArray(node.runInputRefs) ? node.runInputRefs.filter(img => img?.url) : [];
     const manual = manualReferenceImagesFor(node);
+    if(isAgentGeneratedNode(node) && savedInputs.length) return uniqueReferenceImages([...savedInputs, ...upstream, ...manual, ...self]);
     if(smartImageUsesWorkflowInput(node, ctx)) return uniqueReferenceImages([...upstream, ...manual]);
     if(self.length) return uniqueReferenceImages([...self, ...upstream, ...manual]);
     return uniqueReferenceImages([...upstream, ...manual]);
@@ -12412,7 +14240,8 @@ function uniqueReferenceImages(images){
 }
 function visibleReferenceImagesFor(node){
     const base = defaultReferenceImagesFor(node);
-    return uniqueReferenceImages([...base, ...collectMentionedImagesFromPrompt()]);
+    return uniqueReferenceImages([...base, ...collectMentionedImagesFromPrompt()])
+        .filter(img => !isSelfReferenceForNode(node, img));
 }
 function inputMentionCandidateImages(node){
     const current = node ? [...lineImagesFor(node), ...manualReferenceImagesFor(node)] : [];
@@ -13662,6 +15491,17 @@ function buildPromptRequestForNode(node, defaultImages, ctx=smartLoopContext){
 async function generateUrlsForCurrentSettings(node, prompt, refs, runSettings=settings){
     const activeSettings = runSettings || settings;
     if(activeSettings.engine === 'comfy') return generateComfyUrlsWithSettings(activeSettings, prompt, refs);
+    if(activeSettings.engine === 'runninghub' && runningHubSelectedModel(activeSettings)){
+        const taskResult = await runApiGeneration(prompt, refs, runningHubModelApiSettings(activeSettings));
+        const taskIds = Array.isArray(taskResult?.taskIds) ? taskResult.taskIds : [];
+        if(taskIds.length){
+            const settled = await Promise.all(taskIds.map(taskId => pollSmartCanvasTask(taskId)));
+            const urls = settled.flatMap(result => resultMediaUrls(result?.image_items?.length ? result.image_items : (result?.images?.length ? result.images : result))).filter(Boolean);
+            return {urls, kind:mediaKindForUrls(urls, 'image')};
+        }
+        const urls = resultMediaUrls(taskResult);
+        return {urls, kind:mediaKindForUrls(urls, 'image')};
+    }
     if(isApiLikeEngine(activeSettings.engine) && activeSettings.apiKind === 'video'){
         return {urls:await runApiVideoGeneration(prompt, refs, activeSettings), kind:'video'};
     }
@@ -14257,6 +16097,11 @@ async function runGeneration(){
         toast(tr('smart.toastNeedPrompt'));
         return;
     }
+    // A retry is a new run. Clear the terminal failure before painting the
+    // pending/running state so the old error card cannot cover live progress.
+    delete node.generationError;
+    delete node.runFinishedAt;
+    delete node.runElapsedMs;
     const outpaintSize = node?.outpaintSize && Number(node.outpaintSize.width) > 0 && Number(node.outpaintSize.height) > 0
         ? {width:Math.round(Number(node.outpaintSize.width)), height:Math.round(Number(node.outpaintSize.height))}
         : null;
@@ -14340,12 +16185,15 @@ async function runGeneration(){
             scheduleSave();
             return;
         }
-        const outImages = settings.engine === 'runninghub'
-            ? await runRunningHubGeneration(prompt, refs)
-            : settings.engine === 'modelscope'
+        const rhModelMode = settings.engine === 'runninghub' && Boolean(runningHubSelectedModel(settings));
+        const outImages = rhModelMode
+            ? await runApiGeneration(prompt, refs, runningHubModelApiSettings(settings))
+            : settings.engine === 'runninghub'
+                ? await runRunningHubGeneration(prompt, refs)
+                : settings.engine === 'modelscope'
                 ? await runModelscopeGeneration(prompt, refs)
                 : await runApiGeneration(prompt, refs);
-        if(isApiLikeEngine(settings.engine)){
+        if(isApiLikeEngine(settings.engine) || rhModelMode){
             const taskIds = Array.isArray(outImages?.taskIds) ? outImages.taskIds : [];
             if(!taskIds.length) throw new Error(tr('smart.errRunFailed'));
             pendingNode.pendingTasks = taskIds.map(taskId => ({taskId, kind:'image', providerId:outImages.providerId, model:outImages.model}));
@@ -14785,6 +16633,7 @@ function setNodeJimengPending(node, signal){
     node.running = false;
     node.pending = 0;
     delete node.pendingTasks;
+    delete node.generationError;
     if(!node.runStartedAt) node.runStartedAt = node.jimengPending.startedAt;
     delete node.runFinishedAt;
     delete node.runElapsedMs;
@@ -14801,6 +16650,7 @@ function handleJimengPendingSignal(node, e){
 }
 function finalizeJimengPending(node, urls, kind='image'){
     if(!node) return false;
+    const runStartedAt = Number(node.runStartedAt || node.jimengPending?.startedAt || nowMs());
     const ext = kind === 'video' ? 'mp4' : kind === 'audio' ? 'mp3' : kind === 'text' ? 'txt' : 'png';
     const additions = (urls || []).map((item, i) => {
         const url = typeof item === 'string' ? item : item?.url || '';
@@ -14809,6 +16659,7 @@ function finalizeJimengPending(node, urls, kind='image'){
     }).filter(item => item.url);
     if(!additions.length) return false;
     delete node.jimengPending;
+    delete node.generationError;
     replaceOutputsToNodeWithHistory(node, additions, kind, null, {skipShift:true});
     node.running = false;
     node.pending = 0;
@@ -14816,6 +16667,9 @@ function finalizeJimengPending(node, urls, kind='image'){
     if(!node.runStartedAt) node.runStartedAt = node.runFinishedAt;
     node.runElapsedMs = Math.max(0, node.runFinishedAt - Number(node.runStartedAt || node.runFinishedAt));
     node.runTimerHidden = false;
+    const runSettings = cloneSmartSettings(node.runSettings || {});
+    const runLog = smartAgentRunLog(node, node.runPrompt || node.runModelPrompt || '', node.runInputRefs || [], kind, runSettings, {size:sizeForRun(runSettings)});
+    addSmartGenerationLog({run:runLog, outputs:additions, runMs:Math.max(0, node.runFinishedAt - runStartedAt)});
     render();
     scheduleSave();
     return true;
@@ -14827,9 +16681,14 @@ function applyJimengQueryResult(node, data){
         return finalizeJimengPending(node, data.urls || [], kind);
     }
     if(data.status === 'failed'){
+        const kind = data.kind || node.jimengPending?.kind || 'image';
+        const runStartedAt = Number(node.runStartedAt || node.jimengPending?.startedAt || nowMs());
+        const runSettings = cloneSmartSettings(node.runSettings || {});
+        const runLog = smartAgentRunLog(node, node.runPrompt || node.runModelPrompt || '', node.runInputRefs || [], kind, runSettings, {size:sizeForRun(runSettings)});
         delete node.jimengPending;
-        node.running = false;
-        node.pending = 0;
+        setSmartNodeGenerationError(node, data.error || '即梦任务失败', kind);
+        addSmartGenerationLog({run:runLog, outputs:[], runMs:Math.max(0, nowMs() - runStartedAt), error:data.error || '即梦任务失败'});
+        if(node.generationError) node.generationError.logged = true;
         toast((data.error || '即梦任务失败').slice(0, 160));
         render();
         scheduleSave();
@@ -14955,13 +16814,16 @@ function resumeJimengPendingNodes(){
         startJimengPoll(n);
     });
 }
-async function pollSmartCanvasTask(taskId){
+async function pollSmartCanvasTask(taskId, taskKind='image'){
     if(!taskId) throw new Error(tr('smart.errRunFailed'));
     if(activeSmartTaskPolls.has(taskId)) return activeSmartTaskPolls.get(taskId);
     const promise = (async () => {
         for(let i = 0; i < 900; i++){
             await new Promise(resolve => setTimeout(resolve, 2000));
-            const task = await fetch(`/api/canvas-image-tasks/${encodeURIComponent(taskId)}`).then(async r => {
+            const endpoint = String(taskId).startsWith('canvas_vid_') || taskKind === 'video'
+                ? `/api/canvas-video-tasks/${encodeURIComponent(taskId)}`
+                : `/api/canvas-image-tasks/${encodeURIComponent(taskId)}`;
+            const task = await fetch(endpoint).then(async r => {
                 if(!r.ok) throw new Error(await r.text());
                 return r.json();
             });
@@ -15004,6 +16866,7 @@ function finalizeSmartPendingTask(node, taskId, images, kind='image'){
     if(additions.length) node.outputKind = kind;
     if(!node.pending && smartPendingTasks(node).length === 0){
         delete node.pendingTasks;
+        delete node.generationError;
         node.runFinishedAt = nowMs();
         if(!node.runStartedAt) node.runStartedAt = node.runFinishedAt;
         node.runElapsedMs = Math.max(0, node.runFinishedAt - Number(node.runStartedAt || node.runFinishedAt));
@@ -15020,14 +16883,25 @@ async function resumeSmartPendingNode(node, logContext={}){
     const tasks = smartPendingTasks(node);
     if(!node || !tasks.length) return;
     const logTaskFailure = (message, task) => {
-        if(!logContext?.run || !message) return;
-        const runMs = Math.max(0, nowMs() - Number(logContext.runLogStart || nowMs()));
+        if(!message || node.generationError?.logged) return;
+        const kind = task?.kind || node.outputKind || 'image';
+        const run = logContext?.run || smartAgentRunLog(
+            node,
+            node.runPrompt || node.runModelPrompt || '',
+            node.runInputRefs || [],
+            kind,
+            cloneSmartSettings(node.runSettings || {}),
+            {size:sizeForRun(node.runSettings || settings)}
+        );
+        const startedAt = Number(logContext.runLogStart || node.runStartedAt || nowMs());
+        const runMs = Math.max(0, nowMs() - startedAt);
         addSmartGenerationLog({
-            run:logContext.run,
+            run,
             outputs:[],
             runMs,
             error:message
         });
+        if(node.generationError) node.generationError.logged = true;
     };
     node.pending = Math.max(tasks.length, Number(node.pending || 0) || tasks.length);
     node.running = false;
@@ -15066,11 +16940,8 @@ async function resumeSmartPendingNode(node, logContext={}){
             node.pending = Math.max(0, Number(node.pending || 0) - 1);
             if(!node.pending && smartPendingTasks(node).length === 0){
                 delete node.pendingTasks;
-                node.running = false;
-                if(!(node.images || []).length){
-                    delete node.w;
-                    delete node.h;
-                }
+                if(!(node.images || []).length) setSmartNodeGenerationError(node, e.message || tr('smart.errRunFailed'), task.kind || 'image');
+                else node.running = false;
             }
             failures.push(e);
             logTaskFailure(e.message || tr('smart.errRunFailed'), task);
@@ -15526,8 +17397,8 @@ window.onmousemove = e => {
         if(!node) return;
         const dx = (e.clientX - resizeState.startX) / viewport.scale;
         const dy = (e.clientY - resizeState.startY) / viewport.scale;
-        const minW = node.type === 'smart-prompt' ? 260 : node.type === 'smart-loop' ? 252 : node.type === 'smart-group' ? SMART_GROUP_MIN_WIDTH : 48;
-        const minH = node.type === 'smart-prompt' ? 170 : node.type === 'smart-loop' ? 132 : node.type === 'smart-group' ? SMART_GROUP_MIN_HEIGHT : 48;
+        const minW = node.type === 'smart-agent-task' ? 260 : node.type === 'smart-prompt' ? 260 : node.type === 'smart-loop' ? 252 : node.type === 'smart-group' ? SMART_GROUP_MIN_WIDTH : 48;
+        const minH = node.type === 'smart-agent-task' ? 170 : node.type === 'smart-prompt' ? 170 : node.type === 'smart-loop' ? 132 : node.type === 'smart-group' ? SMART_GROUP_MIN_HEIGHT : 48;
         if(node.type === 'smart-group' && smartGroupImageRefs(node).some(ref => ref.item?.url)){
             // 图片分组：和普通节点一样直接改 w/h，缩略图网格按新尺寸实时重排。不要走下面的“成员缩放”那套，
             // 否则拖动过程里会按成员包围盒/缩放比例收缩，松手才回到拖动宽度（用户反馈的“变宽时先缩小”）。
@@ -15975,6 +17846,10 @@ window.addEventListener('keydown', e => {
     if((e.key === 'Delete' || e.key === 'Backspace') && (selectedId || selectedIds.length) && !isEditableTarget(e.target)){
         e.preventDefault();
         const ids = selectedIds.length ? selectedIds.slice() : [selectedId];
+        if(ids.some(id => isSmartAgentTaskNode(nodes.find(node => node.id === id)))){
+            ids.forEach(id => deleteNodeFromButton(id));
+            return;
+        }
         pushUndo();
         ids.forEach(id => { undoSuppressed = true; deleteNode(id); undoSuppressed = false; });
         render();

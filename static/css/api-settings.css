@@ -5847,6 +5847,15 @@ html.studio-theme-dark body .recommend-tag.recommend-free-tag svg {
     box-sizing:border-box !important;
 }
 
+.recommend-inline-card .recommend-key-hint {
+    margin-top:4px;
+    color:var(--muted);
+    font-size:9.5px;
+    line-height:1.35;
+    font-style:normal;
+    font-weight:750;
+}
+
 .recommend-inline-card .recommend-guide-key-btn,
 .recommend-inline-card .recommend-guide-save-btn {
     width:100% !important;

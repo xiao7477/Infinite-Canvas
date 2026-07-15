@@ -154,8 +154,6 @@
         "api.recommendKeyPlaceholder": { zh: "粘贴 {name} API Key", en: "Paste {name} API Key" },
         "api.enterApiKey": { zh: "请输入 API Key", en: "Please enter an API Key" },
         "api.recommendSaved": { zh: "已保存 {name}，当前显示该平台配置。", en: "{name} saved. Showing that provider's settings now." },
-        "api.recommendAccountTitle": { zh: "GPT / Codex / Claude 账号订阅", en: "GPT / Codex / Claude Account Subscriptions" },
-        "api.recommendAccountDesc": { zh: "独立订阅、成品账号等选择，适合想直充自己账户的人。", en: "Independent subscriptions and ready-to-use accounts for users who want direct account access." },
         "api.viewPlans": { zh: "查看方案", en: "View Plans" },
         "api.recommendExellomeSummary": { zh: "稳定输出 GPT-Image2 和 Nano Banana 的 2K/4K。", en: "Stable 2K/4K output for GPT-Image2 and Nano Banana." },
         "api.recommendExellome2k4k": { zh: "2K/4K", en: "2K/4K" },
